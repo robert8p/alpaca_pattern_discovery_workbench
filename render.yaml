@@ -1,0 +1,51 @@
+services:
+  - type: web
+    name: alpaca-pattern-workbench-web
+    runtime: python
+    region: frankfurt
+    plan: starter
+    buildCommand: "python --version && python -m pip install --upgrade pip && python -m pip install --only-binary=:all: -r requirements.txt"
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_USERNAME
+        value: admin
+      - key: APP_PASSWORD
+        sync: false
+      - key: AUTO_MIGRATE
+        value: "true"
+      - key: DATABASE_STATEMENT_TIMEOUT_SECONDS
+        value: "1800"
+      - key: LOG_LEVEL
+        value: INFO
+
+  - type: worker
+    name: alpaca-pattern-workbench-worker
+    runtime: python
+    region: frankfurt
+    plan: standard
+    buildCommand: "python --version && python -m pip install --upgrade pip && python -m pip install --only-binary=:all: -r requirements.txt"
+    startCommand: python -m app.worker
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        sync: false
+      - key: AUTO_MIGRATE
+        value: "true"
+      - key: WORKER_POLL_SECONDS
+        value: "3"
+      - key: WORKER_STALE_SECONDS
+        value: "300"
+      - key: MAX_JOB_ATTEMPTS
+        value: "3"
+      - key: DATABASE_STATEMENT_TIMEOUT_SECONDS
+        value: "1800"
+      - key: LOG_LEVEL
+        value: INFO

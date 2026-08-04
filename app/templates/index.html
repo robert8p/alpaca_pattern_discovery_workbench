@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Alpaca Pattern Discovery Workbench</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">PW</div><div><strong>Pattern Workbench</strong><span>Alpaca research pipeline</span></div></div>
+    <nav>
+      <button class="nav-item active" data-view="overview"><span>◫</span> Overview</button>
+      <button class="nav-item" data-view="quality"><span>✓</span> Data quality</button>
+      <button class="nav-item" data-view="universe"><span>◎</span> Universe</button>
+      <button class="nav-item" data-view="features"><span>⌘</span> Features</button>
+      <button class="nav-item" data-view="discovery"><span>◇</span> Discovery</button>
+      <button class="nav-item" data-view="candidates"><span>★</span> Candidates</button>
+      <button class="nav-item" data-view="jobs"><span>↻</span> Jobs</button>
+      <button class="nav-item" data-view="system"><span>⚙</span> System</button>
+    </nav>
+    <div class="sidebar-foot"><div class="status-dot" id="worker-dot"></div><div><strong id="worker-label">Checking worker</strong><span id="worker-age">—</span></div></div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div><h1 id="page-title">Overview</h1><p id="page-subtitle">Button-driven feature engineering, discovery and validation.</p></div>
+      <div class="top-actions"><button class="ghost" id="refresh-btn">Refresh</button><button class="primary" data-jump="quality">Start workflow</button></div>
+    </header>
+
+    <section class="view active" id="view-overview">
+      <div class="readonly-banner">Raw-data protection: the workbench reads <b>rd_</b> tables and writes only to its own <b>ra_</b> analysis tables.</div>
+      <div class="metric-grid">
+        <article class="metric"><span>Active jobs</span><strong id="metric-active">—</strong><small>Queued or running analysis</small></article>
+        <article class="metric"><span>Feature rows</span><strong id="metric-feature-rows">—</strong><small>Reusable intraday observations</small></article>
+        <article class="metric"><span>Candidates</span><strong id="metric-candidates">—</strong><small>Retained interpretable rules</small></article>
+        <article class="metric"><span>Shortlisted</span><strong id="metric-shortlisted">—</strong><small>Selected for deeper validation</small></article>
+      </div>
+      <div class="workflow-grid">
+        <article class="workflow-card"><em>1</em><strong>Verify the data</strong><span>Check sessions, dates, completeness and malformed OHLC bars.</span></article>
+        <article class="workflow-card"><em>2</em><strong>Freeze a universe</strong><span>Rank symbols by coverage and median daily dollar volume.</span></article>
+        <article class="workflow-card"><em>3</em><strong>Build features</strong><span>Create leakage-aware return, VWAP, volume and prior-day variables.</span></article>
+        <article class="workflow-card"><em>4</em><strong>Discover and validate</strong><span>Scan transparent rule families, then promote candidates to sealed tests.</span></article>
+      </div>
+      <div class="split-grid">
+        <article class="panel"><div class="panel-head"><div><h2>Recent jobs</h2><p>Live background activity</p></div><button class="text-btn" data-jump="jobs">View all</button></div><div id="overview-jobs" class="job-list">Loading…</div></article>
+        <article class="panel"><div class="panel-head"><div><h2>Latest assets</h2><p>Analysis layers available</p></div></div><div id="overview-assets" class="result-stack">Loading…</div></article>
+      </div>
+    </section>
+
+    <section class="view" id="view-quality">
+      <div class="section-grid">
+        <form class="panel" id="quality-form">
+          <div class="step-title"><b>1</b><div><h2>Data-quality scan</h2><p>Verify the selected raw-data slice before analysing it.</p></div></div>
+          <div class="two-col"><label>Name<input id="quality-name" value="July 2026 one-minute quality scan"></label><label>Session<select id="quality-session"><option value="regular">Regular</option><option value="premarket">Premarket</option><option value="postmarket">Postmarket</option><option value="overnight">Overnight</option><option value="all">All sessions</option></select></label></div>
+          <div class="two-col"><label>Start date<input id="quality-start" type="date" required></label><label>End date<input id="quality-end" type="date" required></label></div>
+          <div class="three-col"><label>Timeframe<select id="quality-timeframe"><option>1Min</option><option>5Min</option><option>15Min</option><option>30Min</option><option>1Hour</option></select></label><label>Feed<select id="quality-feed"><option value="sip">SIP</option><option value="iex">IEX</option><option value="boats">BOATS</option><option value="otc">OTC</option></select></label><label>Adjustment<select id="quality-adjustment"><option value="raw">Raw</option><option value="split">Split</option><option value="dividend">Dividend</option><option value="all">All</option></select></label></div>
+          <div class="two-col"><label>Complete-day tolerance (%)<input id="quality-tolerance" type="number" min="50" max="100" step="1" value="95"></label><label>Minimum symbol days<input id="quality-min-days" type="number" min="1" value="5"></label></div>
+          <div class="action-row"><button class="primary" type="submit">Run quality scan</button></div><p class="form-message" id="quality-message"></p>
+        </form>
+        <article class="panel sticky-panel"><div class="panel-head"><div><h2>Latest report</h2><p>Coverage and anomaly summary</p></div></div><div id="quality-results" class="result-stack"><div class="empty-state">Run a quality scan to populate this panel.</div></div></article>
+      </div>
+    </section>
+
+    <section class="view" id="view-universe">
+      <div class="section-grid">
+        <form class="panel" id="universe-form">
+          <div class="step-title"><b>2</b><div><h2>Build analysis universe</h2><p>Replace alphabetical sampling with liquidity and coverage ranking.</p></div></div>
+          <div class="two-col"><label>Name<input id="universe-name" value="Liquid one-minute universe"></label><label>Session<select id="universe-session"><option value="regular">Regular</option><option value="all">All sessions</option><option value="premarket">Premarket</option><option value="postmarket">Postmarket</option></select></label></div>
+          <div class="two-col"><label>Start date<input id="universe-start" type="date" required></label><label>End date<input id="universe-end" type="date" required></label></div>
+          <div class="three-col"><label>Timeframe<select id="universe-timeframe"><option>1Min</option><option>5Min</option><option>15Min</option><option>30Min</option><option>1Hour</option></select></label><label>Feed<select id="universe-feed"><option value="sip">SIP</option><option value="iex">IEX</option></select></label><label>Adjustment<select id="universe-adjustment"><option value="raw">Raw</option><option value="split">Split</option><option value="all">All</option></select></label></div>
+          <div class="form-section"><h3>Eligibility</h3><div class="three-col"><label>Minimum trading days<input id="universe-min-days" type="number" value="15"></label><label>Minimum average bars/day<input id="universe-min-bars" type="number" value="300"></label><label>Minimum median price (US$)<input id="universe-min-price" type="number" step="0.1" value="1"></label></div><div class="two-col"><label>Minimum median daily dollar volume<input id="universe-min-dollar" type="number" value="5000000"></label><label>Maximum included symbols<input id="universe-max-symbols" type="number" value="1500"></label></div><div class="two-col"><label>Include symbol regex<input id="universe-include-regex" placeholder="Optional"></label><label>Exclude symbol regex<input id="universe-exclude-regex" value="[/]"></label></div><label class="checkline"><input id="universe-exclude-funds" type="checkbox" checked><span>Exclude likely funds and exchange-traded products using asset-name heuristics</span></label></div>
+          <div class="form-section"><h3>Tier thresholds</h3><div class="three-col"><label>Tier A bars/day<input id="tier-a-bars" type="number" value="380"></label><label>Tier A dollar volume<input id="tier-a-dollar" type="number" value="100000000"></label><span></span><label>Tier B bars/day<input id="tier-b-bars" type="number" value="350"></label><label>Tier B dollar volume<input id="tier-b-dollar" type="number" value="20000000"></label><span></span><label>Tier C bars/day<input id="tier-c-bars" type="number" value="300"></label><label>Tier C dollar volume<input id="tier-c-dollar" type="number" value="5000000"></label></div></div>
+          <div class="action-row"><button class="primary" type="submit">Build analysis universe</button></div><p class="form-message" id="universe-message"></p>
+        </form>
+        <article class="panel sticky-panel"><div class="panel-head"><div><h2>Universe runs</h2><p>Frozen, reproducible symbol sets</p></div></div><div id="universe-results" class="result-stack">Loading…</div></article>
+      </div>
+    </section>
+
+    <section class="view" id="view-features">
+      <div class="section-grid">
+        <form class="panel" id="feature-form">
+          <div class="step-title"><b>3</b><div><h2>Generate intraday features</h2><p>Create one research row per selected bar.</p></div></div>
+          <label>Name<input id="feature-name" value="July 2026 regular-session features"></label>
+          <label>Analysis universe<select id="feature-universe" required></select></label>
+          <div class="two-col"><label>Start date<input id="feature-start" type="date" required></label><label>End date<input id="feature-end" type="date" required></label></div>
+          <div class="three-col"><label>Timeframe<select id="feature-timeframe"><option>1Min</option><option>5Min</option><option>15Min</option><option>30Min</option><option>1Hour</option></select></label><label>Feed<select id="feature-feed"><option value="sip">SIP</option><option value="iex">IEX</option></select></label><label>Adjustment<select id="feature-adjustment"><option value="raw">Raw</option><option value="split">Split</option><option value="all">All</option></select></label></div>
+          <div class="two-col"><label>Session<select id="feature-session"><option value="regular">Regular</option><option value="premarket">Premarket</option><option value="postmarket">Postmarket</option><option value="overnight">Overnight</option><option value="all">All</option></select></label><label>Date chunk size<input id="feature-chunk-days" type="number" min="1" max="31" value="3"></label></div>
+          <div class="form-section"><h3>Liquidity tiers</h3><div class="chip-grid" id="feature-tier-chips"><label class="chip selected"><input type="checkbox" value="A" checked>A</label><label class="chip selected"><input type="checkbox" value="B" checked>B</label><label class="chip"><input type="checkbox" value="C">C</label><label class="chip"><input type="checkbox" value="D">D</label></div></div>
+          <div class="form-section"><h3>Predictor horizons</h3><div class="chip-grid" id="predictor-horizons"><label class="chip selected"><input type="checkbox" value="1" checked>1m</label><label class="chip selected"><input type="checkbox" value="5" checked>5m</label><label class="chip selected"><input type="checkbox" value="15" checked>15m</label><label class="chip selected"><input type="checkbox" value="30" checked>30m</label><label class="chip selected"><input type="checkbox" value="60" checked>60m</label></div><h3>Outcome horizons</h3><div class="chip-grid" id="outcome-horizons"><label class="chip selected"><input type="checkbox" value="5" checked>5m</label><label class="chip selected"><input type="checkbox" value="15" checked>15m</label><label class="chip selected"><input type="checkbox" value="30" checked>30m</label><label class="chip selected"><input type="checkbox" value="60" checked>60m</label></div></div>
+          <div class="two-col"><label>Time-of-day baseline days<input id="feature-baseline-days" type="number" min="2" max="60" value="10"></label><label>Existing rows<select id="feature-conflict"><option value="replace_slice">Rebuild selected slices</option><option value="skip_existing">Skip existing rows</option></select></label></div>
+          <div class="estimate-box"><div><span>Symbols</span><strong id="feature-est-symbols">—</strong></div><div><span>Feature rows</span><strong id="feature-est-rows">—</strong></div><div><span>Chunks</span><strong id="feature-est-chunks">—</strong></div><div><span>Estimated storage</span><strong id="feature-est-storage">—</strong></div></div>
+          <div class="action-row"><button class="ghost" type="button" id="feature-estimate-btn">Estimate</button><button class="primary" type="submit">Queue feature build</button></div><p class="form-message" id="feature-message"></p>
+        </form>
+        <article class="panel sticky-panel"><div class="panel-head"><div><h2>Feature sets</h2><p>Versioned reusable analysis datasets</p></div></div><div id="feature-results" class="result-stack">Loading…</div></article>
+      </div>
+    </section>
+
+    <section class="view" id="view-discovery">
+      <div class="section-grid">
+        <form class="panel" id="discovery-form">
+          <div class="step-title"><b>4</b><div><h2>Run pattern discovery</h2><p>Scan transparent condition families and measure validation degradation.</p></div></div>
+          <label>Name<input id="discovery-name" value="Initial interpretable rule scan"></label>
+          <label>Completed feature set<select id="discovery-feature-set" required></select></label>
+          <div class="form-section"><h3>Discovery period</h3><div class="two-col"><label>Start<input id="discovery-start" type="date" required></label><label>End<input id="discovery-end" type="date" required></label></div><h3>Validation period</h3><div class="two-col"><label>Start<input id="validation-start" type="date"></label><label>End<input id="validation-end" type="date"></label></div></div>
+          <div class="form-section"><h3>Rule families</h3><div class="check-grid" id="family-checks">
+            <label class="check-card"><input type="checkbox" value="time_of_day" checked><span><strong>Time of day</strong><span>Session window and weekday effects</span></span></label>
+            <label class="check-card"><input type="checkbox" value="oversold_reversal" checked><span><strong>Oversold reversal</strong><span>Prior fall, below VWAP and volume</span></span></label>
+            <label class="check-card"><input type="checkbox" value="momentum_continuation" checked><span><strong>Momentum</strong><span>Prior rise, range position and volume</span></span></label>
+            <label class="check-card"><input type="checkbox" value="vwap_reversion" checked><span><strong>VWAP reversion</strong><span>Large VWAP deviations and range position</span></span></label>
+            <label class="check-card"><input type="checkbox" value="gap_behavior" checked><span><strong>Gap behaviour</strong><span>Opening gap and previous-day return</span></span></label>
+            <label class="check-card"><input type="checkbox" value="volume_shock" checked><span><strong>Volume shocks</strong><span>Relative volume and short-term movement</span></span></label>
+          </div></div>
+          <div class="form-section"><h3>Trade directions and holding periods</h3><div class="two-col"><div><div class="chip-grid" id="direction-chips"><label class="chip selected"><input type="checkbox" value="long" checked>Long</label><label class="chip selected"><input type="checkbox" value="short" checked>Short</label></div></div><div><div class="chip-grid" id="holding-chips"><label class="chip"><input type="checkbox" value="5">5m</label><label class="chip"><input type="checkbox" value="15">15m</label><label class="chip selected"><input type="checkbox" value="30" checked>30m</label><label class="chip selected"><input type="checkbox" value="60" checked>60m</label></div></div></div></div>
+          <div class="form-section"><h3>Evidence thresholds</h3><div class="three-col"><label>Round-trip cost (bps)<input id="discovery-cost" type="number" step="1" value="20"></label><label>Minimum observations<input id="discovery-min-obs" type="number" value="250"></label><label>Minimum symbols<input id="discovery-min-symbols" type="number" value="20"></label></div><div class="three-col"><label>Minimum dates<input id="discovery-min-dates" type="number" value="10"></label><label>Max symbol concentration (%)<input id="discovery-max-symbol" type="number" value="15"></label><label>Max date concentration (%)<input id="discovery-max-date" type="number" value="20"></label></div><label>Top candidates per family/direction/horizon<input id="discovery-top" type="number" value="30"></label></div>
+          <div class="callout warning"><strong>Sealed period is intentionally absent</strong><span>Discovery and validation can be configured here. A sealed result is calculated only after a candidate is promoted from the leaderboard.</span></div>
+          <div class="action-row"><button class="primary" type="submit">Start discovery scan</button></div><p class="form-message" id="discovery-message"></p>
+        </form>
+        <article class="panel sticky-panel"><div class="panel-head"><div><h2>Discovery runs</h2><p>Test counts and retained rules</p></div></div><div id="discovery-results" class="result-stack">Loading…</div></article>
+      </div>
+    </section>
+
+    <section class="view" id="view-candidates">
+      <article class="panel"><div class="panel-head"><div><h2>Candidate leaderboard</h2><p>Discovery, validation and sealed outcomes remain separate.</p></div><div class="top-actions"><select id="candidate-run-filter"><option value="">All discovery runs</option></select><select id="candidate-status-filter"><option value="">All statuses</option><option value="new">New</option><option value="shortlisted">Shortlisted</option><option value="rejected">Rejected</option><option value="sealed_tested">Sealed tested</option></select></div></div><div id="candidate-list" class="candidate-list">Loading…</div></article>
+    </section>
+
+    <section class="view" id="view-jobs">
+      <article class="panel"><div class="panel-head"><div><h2>Analysis jobs</h2><p>Pause, resume, retry, cancel or inspect.</p></div></div><div class="table-wrap"><table><thead><tr><th>Job</th><th>Type</th><th>Status</th><th>Progress</th><th>Created</th><th></th></tr></thead><tbody id="jobs-table"></tbody></table></div></article>
+    </section>
+
+    <section class="view" id="view-system">
+      <div class="split-grid"><article class="panel"><div class="panel-head"><div><h2>Dependencies</h2><p>Database, loader tables and access policy</p></div><button class="ghost" id="test-deps">Run checks</button></div><div id="dependency-results" class="system-results">Not tested in this session.</div></article><article class="panel"><div class="panel-head"><div><h2>Source inventory</h2><p>Raw datasets available from the loader</p></div></div><div id="source-inventory" class="system-results">Loading…</div></article></div>
+      <article class="panel"><div class="panel-head"><div><h2>Operating principles</h2><p>Controls built into this workbench</p></div></div><div class="notes-grid"><div><b>Raw data remains intact</b><span>Analysis code only reads rd_ tables.</span></div><div><b>Universes are frozen</b><span>Every feature set points to a reproducible symbol selection.</span></div><div><b>Feature sets are versioned</b><span>Calculations can evolve without silently mixing definitions.</span></div><div><b>Sealed testing is explicit</b><span>No final holdout metrics appear until promotion.</span></div></div></article>
+    </section>
+  </main>
+</div>
+
+<dialog id="detail-dialog"><div class="dialog-head"><div><h2 id="detail-title">Details</h2><p id="detail-subtitle"></p></div><button id="detail-close" class="icon-btn">×</button></div><div id="detail-body" class="dialog-body">Loading…</div></dialog>
+<dialog id="sealed-dialog"><div class="dialog-head"><div><h2>Promote to sealed test</h2><p id="sealed-rule"></p></div><button id="sealed-close" class="icon-btn">×</button></div><form id="sealed-form" class="dialog-body"><input type="hidden" id="sealed-candidate-id"><div class="two-col"><label>Sealed start<input id="sealed-start" type="date" required></label><label>Sealed end<input id="sealed-end" type="date" required></label></div><div class="callout warning"><strong>This reveals the final holdout</strong><span>Do not change the candidate conditions after seeing the result.</span></div><div class="action-row"><button class="primary" type="submit">Queue sealed evaluation</button></div></form></dialog>
+<div id="toast" role="status"></div>
+<script>window.APP_VERSION="{{ version }}";</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

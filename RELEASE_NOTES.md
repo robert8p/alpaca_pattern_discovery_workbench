@@ -1,0 +1,16 @@
+# Release notes
+
+## 1.0.0
+
+Initial release of the Alpaca Pattern Discovery Workbench.
+
+- Button-driven data-quality reports
+- Liquidity-ranked and frozen research universes
+- Date-chunked, resumable intraday feature generation
+- Interpretable discovery families
+- Discovery and validation metrics stored separately
+- Explicit candidate shortlisting and rejection
+- Separate sealed-evaluation jobs
+- Family/direction/horizon discovery checkpoints
+- Raw `rd_` tables protected by application-level read-only policy
+- Render Blueprint with Python 3.12.7 pinned
