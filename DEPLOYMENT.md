@@ -274,3 +274,7 @@ PYTHON_VERSION=3.12.7
 ```
 
 Then choose **Clear build cache & deploy**.
+
+### Universe build fails with `could not determine data type of parameter $18`
+
+Upgrade to version 1.0.1 or later. Version 1.0.0 did not explicitly type a blank optional include-regex parameter. After redeploying, open the failed job and click **Retry**. No schema migration is needed.

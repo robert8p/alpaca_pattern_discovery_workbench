@@ -78,8 +78,8 @@ def build_universe(job_id: str, config: UniverseBuildConfig) -> dict[str, Any]:
                             WHEN s.average_bars_per_day < %s THEN 'insufficient bars per day'
                             WHEN s.median_daily_dollar_volume < %s THEN 'insufficient dollar volume'
                             WHEN s.median_close < %s THEN 'price below minimum'
-                            WHEN %s IS NOT NULL AND NOT (s.symbol ~ %s) THEN 'does not match include regex'
-                            WHEN %s IS NOT NULL AND s.symbol ~ %s THEN 'matches exclude regex'
+                            WHEN %s::text IS NOT NULL AND NOT (s.symbol ~ %s::text) THEN 'does not match include regex'
+                            WHEN %s::text IS NOT NULL AND s.symbol ~ %s::text THEN 'matches exclude regex'
                             WHEN %s AND COALESCE(a.name,'') ~* %s THEN 'likely fund or exchange-traded product'
                             ELSE NULL END AS exclusion_reason
                     FROM stats s
