@@ -52,21 +52,80 @@ def create_job(job_type: str, name: str, config: dict[str, Any]) -> dict[str, An
 
 
 def recover_stale_jobs() -> int:
+    """Recover jobs whose prior worker no longer owns an active process.
+
+    A restart can occur after the web service has changed a running job to
+    pause_requested/cancel_requested. Those control states must be reconciled
+    as well as ordinary running jobs, otherwise they remain stranded forever.
+    This function is called only when a worker process starts, when any query
+    owned by the previous process has already been disconnected.
+    """
     stale = get_settings().worker_stale_seconds
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE ra_jobs SET status='queued',claimed_by=NULL,
+                UPDATE ra_jobs SET status='queued',phase='recovered',claimed_by=NULL,
                     error=COALESCE(error,'Recovered after a stale worker heartbeat')
                 WHERE status='running'
                   AND (heartbeat_at IS NULL OR heartbeat_at < now() - (%s * interval '1 second'))
                 """,
                 (stale,),
             )
-            count = cur.rowcount or 0
+            running_count = cur.rowcount or 0
+
+            cur.execute(
+                """
+                UPDATE ra_jobs SET status='paused',phase='paused',claimed_by=NULL,
+                    heartbeat_at=now()
+                WHERE status='pause_requested'
+                  AND (heartbeat_at IS NULL OR heartbeat_at < now() - (%s * interval '1 second'))
+                """,
+                (stale,),
+            )
+            paused_count = cur.rowcount or 0
+
+            cur.execute(
+                """
+                UPDATE ra_jobs SET status='cancelled',phase='cancelled',claimed_by=NULL,
+                    heartbeat_at=now(),completed_at=COALESCE(completed_at,now())
+                WHERE status='cancel_requested'
+                  AND (heartbeat_at IS NULL OR heartbeat_at < now() - (%s * interval '1 second'))
+                RETURNING id,job_type
+                """,
+                (stale,),
+            )
+            cancelled = cur.fetchall()
+            for row in cancelled:
+                if row['job_type'] == 'feature_build':
+                    cur.execute("UPDATE ra_feature_sets SET status='cancelled' WHERE job_id=%s", (row['id'],))
+                    cur.execute(
+                        """
+                        UPDATE ra_feature_chunks SET status='cancelled'
+                        WHERE feature_set_id IN (SELECT id FROM ra_feature_sets WHERE job_id=%s)
+                          AND status IN ('pending','running','failed')
+                        """,
+                        (row['id'],),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE ra_feature_batches SET status='cancelled'
+                        WHERE feature_chunk_id IN (
+                            SELECT c.id FROM ra_feature_chunks c
+                            JOIN ra_feature_sets f ON f.id=c.feature_set_id
+                            WHERE f.job_id=%s
+                        ) AND status IN ('pending','running','failed')
+                        """,
+                        (row['id'],),
+                    )
+                elif row['job_type'] == 'discovery_scan':
+                    cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (row['id'],))
+                    cur.execute(
+                        "UPDATE ra_discovery_tasks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','running','failed')",
+                        (row['id'],),
+                    )
         conn.commit()
-    return count
+    return running_count + paused_count + len(cancelled)
 
 
 def claim_next_job(worker_id: str) -> dict[str, Any] | None:

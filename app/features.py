@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, time, timedelta
+import threading
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -8,12 +9,12 @@ from psycopg.types.json import Jsonb
 
 from app.config import get_settings
 from app.db import connection
-from app.jobs import add_event, check_control, set_progress
+from app.jobs import JobInterrupted, add_event, check_control, set_progress
 from app.models import FeatureBuildConfig, timeframe_minutes
 from app.utils import json_safe
 
 FIXED_HORIZONS = (1, 5, 15, 30, 60)
-FEATURE_VERSION = "1.0.2"
+FEATURE_VERSION = "1.0.4"
 NY = ZoneInfo("America/New_York")
 
 
@@ -402,7 +403,7 @@ def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date,
     return sql, params
 
 
-def _build_batch(feature_set_id: str, chunk: dict[str, Any], batch: dict[str, Any], config: FeatureBuildConfig) -> int:
+def _build_batch(job_id: str, feature_set_id: str, chunk: dict[str, Any], batch: dict[str, Any], config: FeatureBuildConfig) -> int:
     timeout = get_settings().database_statement_timeout_seconds
     chunk_start, chunk_end = chunk["chunk_start"], chunk["chunk_end"]
     symbols = list(batch["symbols"])
@@ -411,23 +412,56 @@ def _build_batch(feature_set_id: str, chunk: dict[str, Any], batch: dict[str, An
     params[-3] = feature_set_id
 
     with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"SET LOCAL statement_timeout = '{int(timeout)}s'")
-            cur.execute("SELECT ra_ensure_feature_partitions(%s,%s)", (chunk_start - timedelta(days=1), chunk_end + timedelta(days=1)))
-            if config.conflict_policy == "replace_slice":
-                cur.execute(
-                    """
-                    DELETE FROM ra_intraday_features
-                    WHERE feature_set_id=%s AND trade_date BETWEEN %s AND %s
-                      AND symbol=ANY(%s::text[])
-                    """,
-                    (feature_set_id, chunk_start, chunk_end, symbols),
-                )
-            cur.execute(sql, tuple(params))
-            rows = max(cur.rowcount or 0, 0)
-        conn.commit()
-    return rows
+        stop_monitor = threading.Event()
+        interrupted: dict[str, str | None] = {"action": None}
 
+        def monitor_control() -> None:
+            # psycopg/libpq permits cancellation from another thread. Polling is
+            # intentionally lightweight and uses a separate pooled connection.
+            while not stop_monitor.wait(2.0):
+                try:
+                    with connection() as control_conn:
+                        with control_conn.cursor() as control_cur:
+                            control_cur.execute("SELECT status FROM ra_jobs WHERE id=%s", (job_id,))
+                            row = control_cur.fetchone()
+                        control_conn.rollback()
+                    status = row["status"] if row else "cancel_requested"
+                    if status in {"pause_requested", "cancel_requested"}:
+                        interrupted["action"] = "pause" if status == "pause_requested" else "cancel"
+                        conn.cancel()
+                        return
+                except Exception:
+                    # A transient monitor failure must not abort the data build;
+                    # statement_timeout remains the final safety boundary.
+                    continue
+
+        monitor = threading.Thread(target=monitor_control, name=f"feature-control-{batch['id']}", daemon=True)
+        monitor.start()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SET LOCAL statement_timeout = '{int(timeout)}s'")
+                cur.execute("SELECT ra_ensure_feature_partitions(%s,%s)", (chunk_start - timedelta(days=1), chunk_end + timedelta(days=1)))
+                if config.conflict_policy == "replace_slice":
+                    cur.execute(
+                        """
+                        DELETE FROM ra_intraday_features
+                        WHERE feature_set_id=%s AND symbol=ANY(%s::text[])
+                          AND trade_date BETWEEN %s AND %s
+                        """,
+                        (feature_set_id, symbols, chunk_start, chunk_end),
+                    )
+                cur.execute(sql, tuple(params))
+                rows = max(cur.rowcount or 0, 0)
+            conn.commit()
+            return rows
+        except Exception as exc:
+            conn.rollback()
+            if interrupted["action"]:
+                raise JobInterrupted(interrupted["action"]) from exc
+            raise
+        finally:
+            stop_monitor.set()
+            monitor.join(timeout=3.0)
 
 def _is_statement_timeout(exc: Exception) -> bool:
     message = str(exc).lower()
@@ -514,7 +548,7 @@ def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]
                         )
                     conn.commit()
                 try:
-                    rows = _build_batch(feature_set_id, chunk, batch, config)
+                    rows = _build_batch(job_id, feature_set_id, chunk, batch, config)
                     with connection() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
@@ -522,6 +556,12 @@ def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]
                                 (rows, batch["id"]),
                             )
                         conn.commit()
+                except JobInterrupted:
+                    with connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("UPDATE ra_feature_batches SET status='pending',error=NULL WHERE id=%s", (batch["id"],))
+                        conn.commit()
+                    raise
                 except Exception as exc:
                     if _is_statement_timeout(exc) and _split_feature_batch(job_id, batch):
                         continue
@@ -546,6 +586,13 @@ def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]
             completed += 1
             set_progress(job_id, f"completed {chunk['chunk_start']} to {chunk['chunk_end']}", completed, total)
             add_event(job_id, "feature_chunk_completed", f"Built {rows:,} feature rows for {chunk['chunk_start']} to {chunk['chunk_end']}.")
+        except JobInterrupted:
+            with connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE ra_feature_chunks SET status='pending',error=NULL WHERE id=%s", (chunk["id"],))
+                    cur.execute("UPDATE ra_feature_sets SET status='building' WHERE id=%s", (feature_set_id,))
+                conn.commit()
+            raise
         except Exception as exc:
             with connection() as conn:
                 with conn.cursor() as cur:

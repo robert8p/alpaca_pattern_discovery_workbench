@@ -1,5 +1,13 @@
 # Release notes
 
+## 1.0.4 — Responsive pause and stale-control recovery
+
+- Cancels an in-flight PostgreSQL feature batch when Pause or Cancel is requested.
+- Returns the interrupted symbol batch and date chunk to `pending`, preserving completed work.
+- Reconciles stale `pause_requested` jobs to `paused` after a worker restart.
+- Reconciles stale `cancel_requested` jobs to `cancelled` after a worker restart.
+- Bumps the feature definition version to 1.0.4; no database migration is required.
+
 ## 1.0.3 — Writable-primary connection recovery
 
 - Rejects Supabase transaction-pooler URLs on port 6543 for this persistent worker.
