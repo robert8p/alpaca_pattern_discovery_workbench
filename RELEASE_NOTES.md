@@ -1,5 +1,17 @@
 # Release notes
 
+## 1.0.3 — Writable-primary connection recovery
+
+- Rejects Supabase transaction-pooler URLs on port 6543 for this persistent worker.
+- Resets leaked `default_transaction_read_only` session state when PostgreSQL connections are opened.
+- Explicitly starts workbench transactions in read-write mode.
+- Detects Supabase read-replica endpoints and returns a precise configuration error.
+- Adds credential-free database target and read/write diagnostics to Health and System checks.
+- Removes the unnecessary `CREATE EXTENSION pgcrypto` startup statement.
+- Preserves all v1.0.2 feature chunks and symbol-batch checkpoints.
+
+No data migration or feature rebuild is required.
+
 ## 1.0.2 — Resumable symbol-batched feature generation
 
 - Splits every feature date chunk into configurable symbol batches (default 100 symbols).

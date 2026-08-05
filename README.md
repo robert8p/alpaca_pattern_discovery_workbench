@@ -1,3 +1,7 @@
+## Database connection requirement
+
+Both services must use a writable Supabase **Primary** connection. For Render, use the Shared Pooler in **Session mode on port 5432**. Version 1.0.3 rejects transaction-pooler URLs on port 6543, detects read-replica endpoints, and resets leaked session-level read-only state before work begins.
+
 # Alpaca Pattern Discovery Workbench
 
 A separate, button-driven companion to the **Alpaca Rapid Discovery Loader**.

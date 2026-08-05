@@ -1,6 +1,4 @@
 SELECT pg_advisory_xact_lock(hashtext('alpaca_pattern_discovery_workbench_schema_v1'));
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
 CREATE TABLE IF NOT EXISTS ra_jobs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     job_type text NOT NULL CHECK (job_type IN (

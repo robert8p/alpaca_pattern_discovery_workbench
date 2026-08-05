@@ -14,7 +14,7 @@ from fastapi.templating import Jinja2Templates
 from psycopg.types.json import Jsonb
 
 from app.config import get_settings
-from app.db import close_pool, connection, execute_schema
+from app.db import close_pool, connection, database_diagnostics, database_target, execute_schema
 from app.features import estimate_feature_build
 from app.jobs import create_job
 from app.models import (
@@ -23,7 +23,7 @@ from app.models import (
 )
 from app.utils import json_safe
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -61,14 +61,15 @@ def parse_uuid(value: str) -> UUID:
 @app.get("/health")
 def health() -> dict[str, Any]:
     try:
-        with connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT now() AS db_time,to_regclass('public.rd_bars') AS rd_bars,to_regclass('public.ra_jobs') AS ra_jobs")
-                row = cur.fetchone()
-            conn.rollback()
-        return {"status": "ok" if row["rd_bars"] else "degraded", "version": VERSION, **row}
+        row = database_diagnostics()
+        writable_primary = not row["is_replica"] and row["transaction_read_only"] == "off"
+        return {
+            "status": "ok" if row["rd_bars"] and row["ra_jobs"] and writable_primary else "degraded",
+            "version": VERSION,
+            **row,
+        }
     except Exception as exc:
-        return {"status": "degraded", "version": VERSION, "error": str(exc)}
+        return {"status": "degraded", "version": VERSION, "database_target": database_target(), "error": str(exc)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -384,11 +385,15 @@ def queue_sealed(candidate_id: str, payload: dict[str, Any], _: str = Depends(re
 
 @app.get("/api/dependencies")
 def dependencies(_: str = Depends(require_auth)) -> dict[str, Any]:
+    database = database_diagnostics()
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT current_database() AS database,current_user AS user,now() AS checked_at,to_regclass('public.rd_bars') AS rd_bars,to_regclass('public.rd_assets') AS rd_assets,to_regclass('public.ra_jobs') AS ra_jobs")
-            database = cur.fetchone()
             cur.execute("SELECT worker_id,status,current_job_id,version,heartbeat_at,EXTRACT(EPOCH FROM (now()-heartbeat_at))::integer AS heartbeat_age_seconds FROM ra_workers ORDER BY heartbeat_at DESC")
             workers = cur.fetchall()
         conn.rollback()
-    return json_safe({"database": database, "workers": workers, "auth_warning": settings.app_password == "change-me", "raw_write_policy": "Application code only SELECTs from rd_ tables."})
+    return json_safe({
+        "database": database,
+        "workers": workers,
+        "auth_warning": settings.app_password == "change-me",
+        "raw_write_policy": "Application code only SELECTs from rd_ tables.",
+    })

@@ -17,6 +17,10 @@ if "psycopg" not in sys.modules:
     psycopg.Connection = object
     rows = types.ModuleType("psycopg.rows")
     rows.dict_row = object()
+    errors = types.ModuleType("psycopg.errors")
+    class ReadOnlySqlTransaction(Exception):
+        pass
+    errors.ReadOnlySqlTransaction = ReadOnlySqlTransaction
     types_pkg = types.ModuleType("psycopg.types")
     json_pkg = types.ModuleType("psycopg.types.json")
     class Jsonb:
@@ -25,6 +29,7 @@ if "psycopg" not in sys.modules:
     sys.modules.update({
         "psycopg": psycopg,
         "psycopg.rows": rows,
+        "psycopg.errors": errors,
         "psycopg.types": types_pkg,
         "psycopg.types.json": json_pkg,
     })
