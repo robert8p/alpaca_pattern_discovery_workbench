@@ -23,7 +23,7 @@ from app.models import (
 )
 from app.utils import json_safe
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -193,7 +193,21 @@ def job_detail(job_id: str, _: str = Depends(require_auth)) -> dict[str, Any]:
             events = cur.fetchall()
             chunks = []
             if job["job_type"] == "feature_build":
-                cur.execute("SELECT chunk_start,chunk_end,status,rows_written,attempts,error,started_at,completed_at FROM ra_feature_chunks WHERE feature_set_id IN (SELECT id FROM ra_feature_sets WHERE job_id=%s) ORDER BY chunk_start", (jid,))
+                cur.execute(
+                    """
+                    SELECT c.chunk_start,c.chunk_end,c.status,c.rows_written,c.attempts,c.error,
+                        c.started_at,c.completed_at,
+                        count(b.id) AS symbol_batches,
+                        count(b.id) FILTER (WHERE b.status='completed') AS completed_symbol_batches,
+                        count(b.id) FILTER (WHERE b.status='failed') AS failed_symbol_batches
+                    FROM ra_feature_chunks c
+                    LEFT JOIN ra_feature_batches b ON b.feature_chunk_id=c.id
+                    WHERE c.feature_set_id IN (SELECT id FROM ra_feature_sets WHERE job_id=%s)
+                    GROUP BY c.id
+                    ORDER BY c.chunk_start
+                    """,
+                    (jid,),
+                )
                 chunks = cur.fetchall()
             elif job["job_type"] == "discovery_scan":
                 cur.execute(
@@ -240,6 +254,18 @@ def job_action(job_id: str, action: str, _: str = Depends(require_auth)) -> dict
             if target == "cancelled" and row["job_type"] == "feature_build":
                 cur.execute("UPDATE ra_feature_sets SET status='cancelled' WHERE job_id=%s", (jid,))
                 cur.execute("UPDATE ra_feature_chunks SET status='cancelled' WHERE feature_set_id IN (SELECT id FROM ra_feature_sets WHERE job_id=%s) AND status IN ('pending','failed')", (jid,))
+                cur.execute(
+                    """
+                    UPDATE ra_feature_batches SET status='cancelled'
+                    WHERE feature_chunk_id IN (
+                        SELECT c.id
+                        FROM ra_feature_chunks c
+                        JOIN ra_feature_sets f ON f.id=c.feature_set_id
+                        WHERE f.job_id=%s
+                    ) AND status IN ('pending','failed')
+                    """,
+                    (jid,),
+                )
             elif target == "cancelled" and row["job_type"] == "discovery_scan":
                 cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (jid,))
                 cur.execute("UPDATE ra_discovery_tasks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','failed')", (jid,))

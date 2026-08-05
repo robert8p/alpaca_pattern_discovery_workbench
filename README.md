@@ -4,6 +4,10 @@ A separate, button-driven companion to the **Alpaca Rapid Discovery Loader**.
 
 The loader acquires and stores market data in `rd_` tables. This workbench reads those tables and creates independent `ra_` analysis assets for quality checks, universe selection, feature engineering, interpretable pattern discovery, validation and sealed tests.
 
+## Large feature builds
+
+Feature generation is resumable at two levels: date chunks and symbol batches. The default of 100 symbols per SQL batch prevents a broad one-minute universe from placing the full lookback period into one PostgreSQL statement. Existing feature jobs created before v1.0.2 receive the default automatically when retried.
+
 ## Core safety boundary
 
 Application code only issues `SELECT` statements against `rd_` tables. It writes exclusively to `ra_` tables.

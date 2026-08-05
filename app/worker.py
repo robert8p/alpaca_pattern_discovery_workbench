@@ -17,7 +17,7 @@ from app.models import DiscoveryConfig, FeatureBuildConfig, QualityScanConfig, S
 from app.quality import run_quality_scan
 from app.universe import build_universe
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
@@ -29,6 +29,18 @@ def _mark_related(job: dict[str, Any], status: str) -> None:
                 cur.execute("UPDATE ra_feature_sets SET status=%s WHERE job_id=%s", ("cancelled" if status == "cancelled" else "building", job["id"]))
                 if status == "cancelled":
                     cur.execute("UPDATE ra_feature_chunks SET status='cancelled' WHERE feature_set_id IN (SELECT id FROM ra_feature_sets WHERE job_id=%s) AND status IN ('pending','failed')", (job["id"],))
+                    cur.execute(
+                        """
+                        UPDATE ra_feature_batches SET status='cancelled'
+                        WHERE feature_chunk_id IN (
+                            SELECT c.id
+                            FROM ra_feature_chunks c
+                            JOIN ra_feature_sets f ON f.id=c.feature_set_id
+                            WHERE f.job_id=%s
+                        ) AND status IN ('pending','failed')
+                        """,
+                        (job["id"],),
+                    )
             elif job["job_type"] == "discovery_scan" and status == "cancelled":
                 cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (job["id"],))
                 cur.execute("UPDATE ra_discovery_tasks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','failed')", (job["id"],))

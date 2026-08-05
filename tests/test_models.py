@@ -40,3 +40,11 @@ def test_universe_regex_is_validated():
             name="Bad regex", start_date="2026-07-01", end_date="2026-07-02",
             include_symbol_regex="[",
         )
+
+
+def test_feature_symbol_batch_size_defaults_for_legacy_jobs():
+    config = FeatureBuildConfig(
+        name="Legacy feature job", universe_run_id=uuid4(), start_date="2026-07-01",
+        end_date="2026-07-02", timeframe="1Min",
+    )
+    assert config.symbol_batch_size == 100

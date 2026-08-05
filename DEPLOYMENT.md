@@ -255,7 +255,7 @@ The worker is absent or its heartbeat is stale. Open **System** and inspect the 
 
 ### Feature query times out
 
-Reduce **Date chunk size** to one day and retry the failed job. Completed chunks are preserved.
+Use version 1.0.2 or later. Feature work is split by both date and symbol batch, and timed-out symbol batches automatically divide into smaller batches down to ten symbols. After deployment, click **Retry** on the existing job. Completed date chunks and completed symbol batches are preserved.
 
 ### Discovery job fails on one combination
 

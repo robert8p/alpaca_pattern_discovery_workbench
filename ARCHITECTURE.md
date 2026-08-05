@@ -18,7 +18,7 @@ Pattern Workbench worker
         │
         ├── quality reports
         ├── liquidity-ranked universes
-        ├── date-chunked feature generation
+        ├── date- and symbol-batched feature generation
         ├── checkpointed discovery scans
         └── explicit sealed evaluations
         │
@@ -41,7 +41,7 @@ Supabase ra_* analysis tables
 - Claims one queued job at a time
 - Executes database-intensive work
 - Records heartbeat and events
-- Preserves completed feature chunks and discovery tasks
+- Preserves completed feature chunks, symbol batches and discovery tasks
 - Respects pause/cancel between durable units of work
 
 ### Supabase

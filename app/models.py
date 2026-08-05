@@ -68,6 +68,7 @@ class FeatureBuildConfig(SourceSelection):
     universe_run_id: UUID
     liquidity_tiers: list[Literal["A", "B", "C", "D"]] = Field(default_factory=lambda: ["A", "B"])
     date_chunk_days: int = Field(default=3, ge=1, le=31)
+    symbol_batch_size: int = Field(default=100, ge=10, le=500)
     time_of_day_baseline_days: int = Field(default=10, ge=2, le=60)
     predictor_horizons_minutes: list[int] = Field(default_factory=lambda: [1, 5, 15, 30, 60])
     outcome_horizons_minutes: list[int] = Field(default_factory=lambda: [5, 15, 30, 60])

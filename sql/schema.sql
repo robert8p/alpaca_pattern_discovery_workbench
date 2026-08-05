@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS ra_feature_sets (
     universe_run_id uuid NOT NULL REFERENCES ra_universe_runs(id) ON DELETE CASCADE,
     name text NOT NULL,
     config jsonb NOT NULL,
-    feature_version text NOT NULL DEFAULT '1.0.0',
+    feature_version text NOT NULL DEFAULT '1.0.2',
     status text NOT NULL DEFAULT 'building' CHECK (status IN ('building','completed','failed','cancelled')),
     symbol_count integer NOT NULL DEFAULT 0,
     row_count bigint NOT NULL DEFAULT 0,
@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS ra_feature_sets (
     created_at timestamptz NOT NULL DEFAULT now(),
     completed_at timestamptz
 );
+
+ALTER TABLE ra_feature_sets ALTER COLUMN feature_version SET DEFAULT '1.0.2';
 
 CREATE TABLE IF NOT EXISTS ra_feature_chunks (
     id bigserial PRIMARY KEY,
@@ -128,6 +130,23 @@ CREATE TABLE IF NOT EXISTS ra_feature_chunks (
     UNIQUE(feature_set_id, chunk_start, chunk_end)
 );
 CREATE INDEX IF NOT EXISTS ra_feature_chunks_status_idx ON ra_feature_chunks(feature_set_id, status, chunk_start);
+
+CREATE TABLE IF NOT EXISTS ra_feature_batches (
+    id bigserial PRIMARY KEY,
+    feature_chunk_id bigint NOT NULL REFERENCES ra_feature_chunks(id) ON DELETE CASCADE,
+    batch_number integer NOT NULL,
+    symbols text[] NOT NULL,
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','cancelled')),
+    rows_written bigint NOT NULL DEFAULT 0,
+    attempts integer NOT NULL DEFAULT 0,
+    error text,
+    started_at timestamptz,
+    completed_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(feature_chunk_id, batch_number)
+);
+CREATE INDEX IF NOT EXISTS ra_feature_batches_status_idx
+    ON ra_feature_batches(feature_chunk_id, status, batch_number);
 
 CREATE TABLE IF NOT EXISTS ra_intraday_features (
     feature_set_id uuid NOT NULL REFERENCES ra_feature_sets(id) ON DELETE CASCADE,
@@ -329,6 +348,10 @@ FOR EACH ROW EXECUTE FUNCTION ra_set_updated_at();
 
 DROP TRIGGER IF EXISTS ra_feature_chunks_updated_at ON ra_feature_chunks;
 CREATE TRIGGER ra_feature_chunks_updated_at BEFORE UPDATE ON ra_feature_chunks
+FOR EACH ROW EXECUTE FUNCTION ra_set_updated_at();
+
+DROP TRIGGER IF EXISTS ra_feature_batches_updated_at ON ra_feature_batches;
+CREATE TRIGGER ra_feature_batches_updated_at BEFORE UPDATE ON ra_feature_batches
 FOR EACH ROW EXECUTE FUNCTION ra_set_updated_at();
 
 DROP TRIGGER IF EXISTS ra_discovery_tasks_updated_at ON ra_discovery_tasks;

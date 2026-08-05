@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
 
@@ -12,6 +13,8 @@ from app.models import FeatureBuildConfig, timeframe_minutes
 from app.utils import json_safe
 
 FIXED_HORIZONS = (1, 5, 15, 30, 60)
+FEATURE_VERSION = "1.0.2"
+NY = ZoneInfo("America/New_York")
 
 
 def date_chunks(start: date, end: date, days: int) -> list[tuple[date, date]]:
@@ -25,6 +28,7 @@ def date_chunks(start: date, end: date, days: int) -> list[tuple[date, date]]:
 
 
 def estimate_feature_build(config: FeatureBuildConfig) -> dict[str, Any]:
+    start_ts, end_ts = _utc_bounds(config.start_date, config.end_date)
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -44,12 +48,12 @@ def estimate_feature_build(config: FeatureBuildConfig) -> dict[str, Any]:
                 WHERE u.universe_run_id=%s AND u.included AND u.liquidity_tier=ANY(%s)
                   AND b.timeframe=%s AND b.feed=%s AND b.adjustment=%s
                   AND (%s='all' OR b.session_label=%s)
-                  AND (b.bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                  AND b.bar_ts >= %s AND b.bar_ts < %s
                 """,
                 (
                     config.universe_run_id, config.liquidity_tiers,
                     config.timeframe, config.feed, config.adjustment,
-                    config.session, config.session, config.start_date, config.end_date,
+                    config.session, config.session, start_ts, end_ts,
                 ),
             )
             bars = int(cur.fetchone()["bars"])
@@ -59,6 +63,8 @@ def estimate_feature_build(config: FeatureBuildConfig) -> dict[str, Any]:
         "symbols": symbols,
         "estimated_feature_rows": bars,
         "chunks": len(chunks),
+        "symbol_batches_per_chunk": (symbols + config.symbol_batch_size - 1) // config.symbol_batch_size if symbols else 0,
+        "estimated_sql_batches": len(chunks) * ((symbols + config.symbol_batch_size - 1) // config.symbol_batch_size if symbols else 0),
         "estimated_table_bytes": bars * 420,
     }
 
@@ -70,9 +76,23 @@ def _ensure_feature_set(job_id: str, config: FeatureBuildConfig) -> tuple[str, l
             existing = cur.fetchone()
             if existing:
                 feature_set_id = existing["id"]
-                cur.execute("UPDATE ra_feature_sets SET status='building',completed_at=NULL WHERE id=%s", (feature_set_id,))
+                cur.execute(
+                    """
+                    UPDATE ra_feature_sets SET status='building',completed_at=NULL,
+                        config=%s,feature_version=%s WHERE id=%s
+                    """,
+                    (Jsonb(config.model_dump(mode="json")), FEATURE_VERSION, feature_set_id),
+                )
                 cur.execute(
                     "UPDATE ra_feature_chunks SET status='pending',error=NULL WHERE feature_set_id=%s AND status IN ('running','failed','cancelled')",
+                    (feature_set_id,),
+                )
+                cur.execute(
+                    """
+                    UPDATE ra_feature_batches SET status='pending',error=NULL
+                    WHERE feature_chunk_id IN (SELECT id FROM ra_feature_chunks WHERE feature_set_id=%s)
+                      AND status IN ('running','failed','cancelled')
+                    """,
                     (feature_set_id,),
                 )
             else:
@@ -88,12 +108,12 @@ def _ensure_feature_set(job_id: str, config: FeatureBuildConfig) -> tuple[str, l
                     raise RuntimeError("The selected universe and tiers contain no included symbols")
                 cur.execute(
                     """
-                    INSERT INTO ra_feature_sets(job_id,universe_run_id,name,config,symbol_count,min_trade_date,max_trade_date)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                    INSERT INTO ra_feature_sets(job_id,universe_run_id,name,config,feature_version,symbol_count,min_trade_date,max_trade_date)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
                     """,
                     (
                         job_id, config.universe_run_id, config.name,
-                        Jsonb(config.model_dump(mode="json")), symbol_count,
+                        Jsonb(config.model_dump(mode="json")), FEATURE_VERSION, symbol_count,
                         config.start_date, config.end_date,
                     ),
                 )
@@ -109,6 +129,57 @@ def _ensure_feature_set(job_id: str, config: FeatureBuildConfig) -> tuple[str, l
             chunks = cur.fetchall()
         conn.commit()
     return str(feature_set_id), [dict(row) for row in chunks]
+
+
+def _selected_symbols(config: FeatureBuildConfig) -> list[str]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT symbol
+                FROM ra_analysis_universe
+                WHERE universe_run_id=%s AND included AND liquidity_tier=ANY(%s)
+                ORDER BY rank_by_liquidity NULLS LAST, symbol
+                """,
+                (config.universe_run_id, config.liquidity_tiers),
+            )
+            rows = cur.fetchall()
+        conn.rollback()
+    return [row["symbol"] for row in rows]
+
+
+def _ensure_feature_batches(chunks: list[dict[str, Any]], config: FeatureBuildConfig) -> None:
+    symbols = _selected_symbols(config)
+    if not symbols:
+        raise RuntimeError("The selected universe and tiers contain no included symbols")
+    symbol_batches = [symbols[i:i + config.symbol_batch_size] for i in range(0, len(symbols), config.symbol_batch_size)]
+    with connection() as conn:
+        with conn.cursor() as cur:
+            for chunk in chunks:
+                if chunk["status"] == "completed":
+                    continue
+                cur.execute("SELECT count(*) AS batches FROM ra_feature_batches WHERE feature_chunk_id=%s", (chunk["id"],))
+                if int(cur.fetchone()["batches"]) == 0:
+                    cur.executemany(
+                        "INSERT INTO ra_feature_batches(feature_chunk_id,batch_number,symbols) VALUES (%s,%s,%s)",
+                        [(chunk["id"], number, batch) for number, batch in enumerate(symbol_batches, start=1)],
+                    )
+        conn.commit()
+
+
+def _chunk_batches(chunk_id: int) -> list[dict[str, Any]]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ra_feature_batches WHERE feature_chunk_id=%s ORDER BY batch_number", (chunk_id,))
+            rows = cur.fetchall()
+        conn.rollback()
+    return [dict(row) for row in rows]
+
+
+def _utc_bounds(start_date: date, end_date: date) -> tuple[datetime, datetime]:
+    start = datetime.combine(start_date, time.min, tzinfo=NY).astimezone(UTC)
+    end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=NY).astimezone(UTC)
+    return start, end
 
 
 def _lag_columns(base_minutes: int, predictors: set[int], outcomes: set[int]) -> tuple[str, str, str]:
@@ -158,7 +229,7 @@ def _lag_columns(base_minutes: int, predictors: set[int], outcomes: set[int]) ->
     return ",\n                    ".join(window_parts), ",\n                    ".join(derived_parts), ",".join(insert_select_parts)
 
 
-def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date) -> tuple[str, tuple[Any, ...]]:
+def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date, symbols: list[str]) -> tuple[str, tuple[Any, ...]]:
     base_minutes = timeframe_minutes(config.timeframe)
     predictors = set(config.predictor_horizons_minutes)
     outcomes = set(config.outcome_horizons_minutes)
@@ -177,6 +248,8 @@ def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date)
         mae = "NULL::double precision"
 
     lookback_start = chunk_start - timedelta(days=config.time_of_day_baseline_days * 2 + 10)
+    source_start_ts, source_end_ts = _utc_bounds(lookback_start, chunk_end)
+    daily_start_ts, daily_end_ts = _utc_bounds(lookback_start - timedelta(days=7), chunk_end)
     conflict = "DO NOTHING" if config.conflict_policy == "skip_existing" else "DO UPDATE SET built_at=excluded.built_at"
 
     sql = f"""
@@ -191,7 +264,8 @@ def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date)
             WHERE u.universe_run_id=%s AND u.included AND u.liquidity_tier=ANY(%s)
               AND b.timeframe=%s AND b.feed=%s AND b.adjustment=%s
               AND (%s='all' OR b.session_label=%s)
-              AND (b.bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+              AND b.symbol=ANY(%s::text[])
+              AND b.bar_ts >= %s AND b.bar_ts < %s
         ), windowed AS (
             SELECT s.*,
                 (row_number() OVER w_ord)::integer AS session_bar_number,
@@ -254,7 +328,8 @@ def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date)
                 JOIN ra_analysis_universe u ON u.symbol=x.symbol
                 WHERE u.universe_run_id=%s AND u.included AND u.liquidity_tier=ANY(%s)
                   AND x.timeframe=%s AND x.feed=%s AND x.adjustment=%s AND x.session_label='regular'
-                  AND (x.bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                  AND x.symbol=ANY(%s::text[])
+                  AND x.bar_ts >= %s AND x.bar_ts < %s
             ) b
             GROUP BY b.symbol,(b.bar_ts AT TIME ZONE 'America/New_York')::date
         ), daily_context AS (
@@ -317,20 +392,21 @@ def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date)
     params = (
         config.universe_run_id, config.liquidity_tiers,
         config.timeframe, config.feed, config.adjustment, config.session, config.session,
-        lookback_start, chunk_end,
+        symbols, source_start_ts, source_end_ts,
         config.universe_run_id, config.liquidity_tiers,
         config.timeframe, config.feed, config.adjustment,
-        lookback_start - timedelta(days=7), chunk_end,
+        symbols, daily_start_ts, daily_end_ts,
         None,  # replaced by feature_set_id in caller
         chunk_start, chunk_end,
     )
     return sql, params
 
 
-def _build_chunk(feature_set_id: str, chunk: dict[str, Any], config: FeatureBuildConfig) -> int:
+def _build_batch(feature_set_id: str, chunk: dict[str, Any], batch: dict[str, Any], config: FeatureBuildConfig) -> int:
     timeout = get_settings().database_statement_timeout_seconds
     chunk_start, chunk_end = chunk["chunk_start"], chunk["chunk_end"]
-    sql, params = _feature_sql(config, chunk_start, chunk_end)
+    symbols = list(batch["symbols"])
+    sql, params = _feature_sql(config, chunk_start, chunk_end, symbols)
     params = list(params)
     params[-3] = feature_set_id
 
@@ -340,8 +416,12 @@ def _build_chunk(feature_set_id: str, chunk: dict[str, Any], config: FeatureBuil
             cur.execute("SELECT ra_ensure_feature_partitions(%s,%s)", (chunk_start - timedelta(days=1), chunk_end + timedelta(days=1)))
             if config.conflict_policy == "replace_slice":
                 cur.execute(
-                    "DELETE FROM ra_intraday_features WHERE feature_set_id=%s AND trade_date BETWEEN %s AND %s",
-                    (feature_set_id, chunk_start, chunk_end),
+                    """
+                    DELETE FROM ra_intraday_features
+                    WHERE feature_set_id=%s AND trade_date BETWEEN %s AND %s
+                      AND symbol=ANY(%s::text[])
+                    """,
+                    (feature_set_id, chunk_start, chunk_end, symbols),
                 )
             cur.execute(sql, tuple(params))
             rows = max(cur.rowcount or 0, 0)
@@ -349,17 +429,61 @@ def _build_chunk(feature_set_id: str, chunk: dict[str, Any], config: FeatureBuil
     return rows
 
 
+def _is_statement_timeout(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "statement timeout" in message or "canceling statement due to statement timeout" in message
+
+
+def _split_feature_batch(job_id: str, batch: dict[str, Any]) -> bool:
+    symbols = list(batch["symbols"])
+    if len(symbols) <= 10:
+        return False
+    midpoint = len(symbols) // 2
+    left, right = symbols[:midpoint], symbols[midpoint:]
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(max(batch_number),0)+1 AS next_number FROM ra_feature_batches WHERE feature_chunk_id=%s",
+                (batch["feature_chunk_id"],),
+            )
+            next_number = int(cur.fetchone()["next_number"])
+            cur.execute(
+                "UPDATE ra_feature_batches SET symbols=%s,status='pending',error=NULL WHERE id=%s",
+                (left, batch["id"]),
+            )
+            cur.execute(
+                "INSERT INTO ra_feature_batches(feature_chunk_id,batch_number,symbols) VALUES (%s,%s,%s)",
+                (batch["feature_chunk_id"], next_number, right),
+            )
+        conn.commit()
+    add_event(
+        job_id,
+        "feature_batch_split",
+        f"A timed-out batch of {len(symbols)} symbols was split into {len(left)} and {len(right)} symbols.",
+        level="warning",
+        details={"feature_chunk_id": batch["feature_chunk_id"], "original_batch_id": batch["id"]},
+    )
+    return True
+
+
 def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]:
     feature_set_id, chunks = _ensure_feature_set(job_id, config)
+    _ensure_feature_batches(chunks, config)
     total = len(chunks)
     completed = sum(1 for chunk in chunks if chunk["status"] == "completed")
     set_progress(job_id, "building feature chunks", completed, total, result={"feature_set_id": feature_set_id})
-    add_event(job_id, "feature_set_ready", f"Feature set planned in {total} date chunks.", details={"feature_set_id": feature_set_id})
+    add_event(
+        job_id,
+        "feature_set_ready",
+        f"Feature set planned in {total} date chunks with up to {config.symbol_batch_size} symbols per SQL batch.",
+        details={"feature_set_id": feature_set_id, "symbol_batch_size": config.symbol_batch_size},
+    )
 
-    for chunk in chunks:
+    for chunk_number, chunk in enumerate(chunks, start=1):
         if chunk["status"] == "completed":
             continue
         check_control(job_id)
+        batches = _chunk_batches(chunk["id"])
         with connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -367,10 +491,53 @@ def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]
                     (chunk["id"],),
                 )
             conn.commit()
+
         try:
-            rows = _build_chunk(feature_set_id, chunk, config)
+            while True:
+                batches = _chunk_batches(chunk["id"])
+                pending = [(index, batch) for index, batch in enumerate(batches, start=1) if batch["status"] != "completed"]
+                if not pending:
+                    break
+                batch_index, batch = pending[0]
+                check_control(job_id)
+                set_progress(
+                    job_id,
+                    f"chunk {chunk_number}/{total} · symbols {batch_index}/{len(batches)} · {chunk['chunk_start']} to {chunk['chunk_end']}",
+                    completed,
+                    total,
+                )
+                with connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE ra_feature_batches SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,now()),error=NULL WHERE id=%s",
+                            (batch["id"],),
+                        )
+                    conn.commit()
+                try:
+                    rows = _build_batch(feature_set_id, chunk, batch, config)
+                    with connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE ra_feature_batches SET status='completed',rows_written=%s,completed_at=now(),error=NULL WHERE id=%s",
+                                (rows, batch["id"]),
+                            )
+                        conn.commit()
+                except Exception as exc:
+                    if _is_statement_timeout(exc) and _split_feature_batch(job_id, batch):
+                        continue
+                    with connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("UPDATE ra_feature_batches SET status='failed',error=%s WHERE id=%s", (str(exc), batch["id"]))
+                        conn.commit()
+                    raise
+
             with connection() as conn:
                 with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COALESCE(sum(rows_written),0) AS rows FROM ra_feature_batches WHERE feature_chunk_id=%s",
+                        (chunk["id"],),
+                    )
+                    rows = int(cur.fetchone()["rows"])
                     cur.execute(
                         "UPDATE ra_feature_chunks SET status='completed',rows_written=%s,completed_at=now(),error=NULL WHERE id=%s",
                         (rows, chunk["id"]),
@@ -403,3 +570,4 @@ def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]
     result = {"feature_set_id": feature_set_id, **dict(summary)}
     add_event(job_id, "feature_set_completed", f"Feature set contains {summary['rows']:,} rows across {summary['symbols']:,} symbols.", details=result)
     return json_safe(result)
+
