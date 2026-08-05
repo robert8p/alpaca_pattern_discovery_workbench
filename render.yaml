@@ -20,7 +20,13 @@ services:
       - key: AUTO_MIGRATE
         value: "true"
       - key: DATABASE_STATEMENT_TIMEOUT_SECONDS
-        value: "1800"
+        value: "600"
+      - key: FEATURE_BATCH_WALL_TIMEOUT_SECONDS
+        value: "660"
+      - key: FEATURE_MIN_SYMBOL_BATCH_SIZE
+        value: "1"
+      - key: FEATURE_CANCEL_GRACE_SECONDS
+        value: "15"
       - key: LOG_LEVEL
         value: INFO
 
@@ -46,6 +52,12 @@ services:
       - key: MAX_JOB_ATTEMPTS
         value: "3"
       - key: DATABASE_STATEMENT_TIMEOUT_SECONDS
-        value: "1800"
+        value: "600"
+      - key: FEATURE_BATCH_WALL_TIMEOUT_SECONDS
+        value: "660"
+      - key: FEATURE_MIN_SYMBOL_BATCH_SIZE
+        value: "1"
+      - key: FEATURE_CANCEL_GRACE_SECONDS
+        value: "15"
       - key: LOG_LEVEL
         value: INFO

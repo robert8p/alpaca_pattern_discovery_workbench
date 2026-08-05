@@ -1,5 +1,19 @@
 # Release notes
 
+## 1.0.5 — Hard feature-batch watchdog
+
+- Adds an independent 11-minute wall-clock watchdog for every feature SQL batch.
+- Keeps job and feature-batch heartbeats fresh while PostgreSQL is working.
+- Cancels and automatically splits a batch when the wall-clock deadline is exceeded.
+- Force-terminates only the stuck worker backend if ordinary cancellation does not return within 15 seconds.
+- Allows timed-out batches to split down to one symbol when necessary.
+- Reduces the server-side statement timeout to 10 minutes and adds a 60-second lock timeout.
+- Makes stale attempt 3 recoverable after a worker restart.
+- Resuming a paused job now resets its claim-attempt counter safely.
+- Completed date chunks and completed symbol batches remain unchanged.
+
+No database migration is required.
+
 ## 1.0.4 — Responsive pause and stale-control recovery
 
 - Cancels an in-flight PostgreSQL feature batch when Pause or Cancel is requested.

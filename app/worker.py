@@ -17,7 +17,7 @@ from app.models import DiscoveryConfig, FeatureBuildConfig, QualityScanConfig, S
 from app.quality import run_quality_scan
 from app.universe import build_universe
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 

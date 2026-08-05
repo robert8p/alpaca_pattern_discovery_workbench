@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, time, timedelta
 import threading
+import time as clock
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,8 +15,12 @@ from app.models import FeatureBuildConfig, timeframe_minutes
 from app.utils import json_safe
 
 FIXED_HORIZONS = (1, 5, 15, 30, 60)
-FEATURE_VERSION = "1.0.4"
+FEATURE_VERSION = "1.0.5"
 NY = ZoneInfo("America/New_York")
+
+class FeatureBatchTimeout(RuntimeError):
+    """Raised when a feature SQL batch exceeds the client-side wall-clock deadline."""
+
 
 
 def date_chunks(start: date, end: date, days: int) -> list[tuple[date, date]]:
@@ -404,7 +409,10 @@ def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date,
 
 
 def _build_batch(job_id: str, feature_set_id: str, chunk: dict[str, Any], batch: dict[str, Any], config: FeatureBuildConfig) -> int:
-    timeout = get_settings().database_statement_timeout_seconds
+    settings = get_settings()
+    statement_timeout = max(30, int(settings.database_statement_timeout_seconds))
+    wall_timeout = max(statement_timeout + 5, int(settings.feature_batch_wall_timeout_seconds))
+    cancel_grace = max(3, int(settings.feature_cancel_grace_seconds))
     chunk_start, chunk_end = chunk["chunk_start"], chunk["chunk_end"]
     symbols = list(batch["symbols"])
     sql, params = _feature_sql(config, chunk_start, chunk_end, symbols)
@@ -412,34 +420,74 @@ def _build_batch(job_id: str, feature_set_id: str, chunk: dict[str, Any], batch:
     params[-3] = feature_set_id
 
     with connection() as conn:
+        with conn.cursor() as pid_cur:
+            pid_cur.execute("SELECT pg_backend_pid() AS pid")
+            backend_pid = int(pid_cur.fetchone()["pid"])
+
         stop_monitor = threading.Event()
         interrupted: dict[str, str | None] = {"action": None}
+        started_monotonic = clock.monotonic()
+
+        def cancel_or_terminate(action: str) -> None:
+            interrupted["action"] = action
+            try:
+                conn.cancel()
+            except Exception:
+                pass
+            # If libpq cancellation or the server-side timeout does not return
+            # control promptly (for example during a stalled commit), terminate
+            # only this worker's own backend after a short grace period.
+            if not stop_monitor.wait(cancel_grace):
+                try:
+                    with connection() as kill_conn:
+                        with kill_conn.cursor() as kill_cur:
+                            kill_cur.execute("SELECT pg_terminate_backend(%s)", (backend_pid,))
+                        kill_conn.commit()
+                except Exception:
+                    pass
 
         def monitor_control() -> None:
-            # psycopg/libpq permits cancellation from another thread. Polling is
-            # intentionally lightweight and uses a separate pooled connection.
+            # This monitor is deliberately independent of PostgreSQL's own
+            # statement_timeout. It keeps the job heartbeat fresh, observes
+            # Pause/Cancel, and cancels a batch that exceeds the hard wall clock.
             while not stop_monitor.wait(2.0):
+                elapsed = clock.monotonic() - started_monotonic
                 try:
                     with connection() as control_conn:
                         with control_conn.cursor() as control_cur:
-                            control_cur.execute("SELECT status FROM ra_jobs WHERE id=%s", (job_id,))
+                            control_cur.execute(
+                                """
+                                UPDATE ra_jobs SET heartbeat_at=now()
+                                WHERE id=%s
+                                RETURNING status
+                                """,
+                                (job_id,),
+                            )
                             row = control_cur.fetchone()
-                        control_conn.rollback()
+                            control_cur.execute(
+                                "UPDATE ra_feature_batches SET updated_at=now() WHERE id=%s AND status='running'",
+                                (batch["id"],),
+                            )
+                        control_conn.commit()
                     status = row["status"] if row else "cancel_requested"
                     if status in {"pause_requested", "cancel_requested"}:
-                        interrupted["action"] = "pause" if status == "pause_requested" else "cancel"
-                        conn.cancel()
+                        cancel_or_terminate("pause" if status == "pause_requested" else "cancel")
                         return
                 except Exception:
-                    # A transient monitor failure must not abort the data build;
-                    # statement_timeout remains the final safety boundary.
-                    continue
+                    # A transient heartbeat/control failure must not abort the
+                    # build. The hard wall clock below remains authoritative.
+                    pass
+
+                if elapsed >= wall_timeout:
+                    cancel_or_terminate("timeout")
+                    return
 
         monitor = threading.Thread(target=monitor_control, name=f"feature-control-{batch['id']}", daemon=True)
         monitor.start()
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SET LOCAL statement_timeout = '{int(timeout)}s'")
+                cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}s'")
+                cur.execute("SET LOCAL lock_timeout = '60s'")
                 cur.execute("SELECT ra_ensure_feature_partitions(%s,%s)", (chunk_start - timedelta(days=1), chunk_end + timedelta(days=1)))
                 if config.conflict_policy == "replace_slice":
                     cur.execute(
@@ -456,21 +504,32 @@ def _build_batch(job_id: str, feature_set_id: str, chunk: dict[str, Any], batch:
             return rows
         except Exception as exc:
             conn.rollback()
-            if interrupted["action"]:
+            if interrupted["action"] in {"pause", "cancel"}:
                 raise JobInterrupted(interrupted["action"]) from exc
+            if interrupted["action"] == "timeout":
+                raise FeatureBatchTimeout(
+                    f"Feature SQL batch exceeded the {wall_timeout}-second wall-clock limit"
+                ) from exc
             raise
         finally:
             stop_monitor.set()
             monitor.join(timeout=3.0)
 
 def _is_statement_timeout(exc: Exception) -> bool:
+    if isinstance(exc, FeatureBatchTimeout):
+        return True
     message = str(exc).lower()
-    return "statement timeout" in message or "canceling statement due to statement timeout" in message
+    return (
+        "statement timeout" in message
+        or "canceling statement due to statement timeout" in message
+        or "wall-clock limit" in message
+    )
 
 
 def _split_feature_batch(job_id: str, batch: dict[str, Any]) -> bool:
     symbols = list(batch["symbols"])
-    if len(symbols) <= 10:
+    minimum = max(1, int(get_settings().feature_min_symbol_batch_size))
+    if len(symbols) <= minimum:
         return False
     midpoint = len(symbols) // 2
     left, right = symbols[:midpoint], symbols[midpoint:]
@@ -536,7 +595,8 @@ def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]
                 check_control(job_id)
                 set_progress(
                     job_id,
-                    f"chunk {chunk_number}/{total} · symbols {batch_index}/{len(batches)} · {chunk['chunk_start']} to {chunk['chunk_end']}",
+                    f"chunk {chunk_number}/{total} · symbols {batch_index}/{len(batches)} "
+                    f"· {len(batch['symbols'])} tickers · {chunk['chunk_start']} to {chunk['chunk_end']}",
                     completed,
                     total,
                 )

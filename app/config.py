@@ -16,7 +16,10 @@ class Settings(BaseSettings):
     worker_poll_seconds: float = Field(default=3.0, alias="WORKER_POLL_SECONDS")
     worker_stale_seconds: int = Field(default=300, alias="WORKER_STALE_SECONDS")
     max_job_attempts: int = Field(default=3, alias="MAX_JOB_ATTEMPTS")
-    database_statement_timeout_seconds: int = Field(default=1800, alias="DATABASE_STATEMENT_TIMEOUT_SECONDS")
+    database_statement_timeout_seconds: int = Field(default=600, alias="DATABASE_STATEMENT_TIMEOUT_SECONDS")
+    feature_batch_wall_timeout_seconds: int = Field(default=660, alias="FEATURE_BATCH_WALL_TIMEOUT_SECONDS")
+    feature_min_symbol_batch_size: int = Field(default=1, alias="FEATURE_MIN_SYMBOL_BATCH_SIZE")
+    feature_cancel_grace_seconds: int = Field(default=15, alias="FEATURE_CANCEL_GRACE_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
 

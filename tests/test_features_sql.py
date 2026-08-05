@@ -1,7 +1,7 @@
 from datetime import date
 from uuid import uuid4
 
-from app.features import _feature_sql, _is_statement_timeout
+from app.features import FeatureBatchTimeout, _feature_sql, _is_statement_timeout
 from app.models import FeatureBuildConfig
 
 
@@ -34,4 +34,5 @@ def test_feature_sql_uses_symbol_batches_and_timestamp_bounds():
 
 def test_statement_timeout_detection():
     assert _is_statement_timeout(RuntimeError("canceling statement due to statement timeout"))
+    assert _is_statement_timeout(FeatureBatchTimeout("Feature SQL batch exceeded the wall-clock limit"))
     assert not _is_statement_timeout(RuntimeError("connection refused"))

@@ -66,6 +66,7 @@ def recover_stale_jobs() -> int:
             cur.execute(
                 """
                 UPDATE ra_jobs SET status='queued',phase='recovered',claimed_by=NULL,
+                    attempts=GREATEST(attempts-1,0),
                     error=COALESCE(error,'Recovered after a stale worker heartbeat')
                 WHERE status='running'
                   AND (heartbeat_at IS NULL OR heartbeat_at < now() - (%s * interval '1 second'))

@@ -278,3 +278,17 @@ Then choose **Clear build cache & deploy**.
 ### Universe build fails with `could not determine data type of parameter $18`
 
 Upgrade to version 1.0.1 or later. Version 1.0.0 did not explicitly type a blank optional include-regex parameter. After redeploying, open the failed job and click **Retry**. No schema migration is needed.
+
+
+## Feature batch timeout controls
+
+The Blueprint sets:
+
+```text
+DATABASE_STATEMENT_TIMEOUT_SECONDS=600
+FEATURE_BATCH_WALL_TIMEOUT_SECONDS=660
+FEATURE_MIN_SYMBOL_BATCH_SIZE=1
+FEATURE_CANCEL_GRACE_SECONDS=15
+```
+
+The database cancels a long SQL statement after ten minutes. The independent worker watchdog cancels it after eleven minutes if the server-side timeout does not return control. The batch is then split automatically and retried.

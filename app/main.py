@@ -23,7 +23,7 @@ from app.models import (
 )
 from app.utils import json_safe
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -240,6 +240,7 @@ def job_action(job_id: str, action: str, _: str = Depends(require_auth)) -> dict
                 target = "pause_requested"
             elif action == "resume" and current == "paused":
                 target = "queued"
+                cur.execute("UPDATE ra_jobs SET error=NULL,completed_at=NULL,attempts=0 WHERE id=%s", (jid,))
             elif action == "cancel" and current in {"queued", "running", "pause_requested", "paused", "failed"}:
                 target = "cancel_requested" if current in {"running", "pause_requested"} else "cancelled"
             elif action == "retry" and current in {"failed", "cancelled"}:
