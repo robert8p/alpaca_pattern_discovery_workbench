@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     feature_batch_wall_timeout_seconds: int = Field(default=660, alias="FEATURE_BATCH_WALL_TIMEOUT_SECONDS")
     feature_min_symbol_batch_size: int = Field(default=1, alias="FEATURE_MIN_SYMBOL_BATCH_SIZE")
     feature_cancel_grace_seconds: int = Field(default=15, alias="FEATURE_CANCEL_GRACE_SECONDS")
+    feature_db_conflict_retries: int = Field(default=5, alias="FEATURE_DB_CONFLICT_RETRIES")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
 

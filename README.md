@@ -126,3 +126,7 @@ pytest -q
 ## Deployment
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+## Deadlock-safe startup
+
+From v1.0.6, startup checks and records schema compatibility rather than replaying all idempotent DDL on every web/worker deploy. Feature partition DDL runs once per date chunk, and transient PostgreSQL lock conflicts are retried automatically.

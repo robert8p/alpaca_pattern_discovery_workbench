@@ -15,6 +15,8 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
+SCHEMA_VERSION = "1.0.6"
+SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
 class DatabaseConfigurationError(RuntimeError):
@@ -139,12 +141,77 @@ def database_diagnostics() -> dict[str, Any]:
     return {**target, **row}
 
 
+def _schema_is_compatible(cur: Any) -> bool:
+    """Return True when the installed v1 schema already has every object v1.0.6 needs.
+
+    Earlier releases reran the entire idempotent schema on every web and worker
+    start. During a rolling deploy that DDL could overlap an active feature
+    transaction and deadlock with its foreign-key/partition locks. v1.0.6
+    records schema state and skips table/index/trigger DDL when no migration is
+    required.
+    """
+    cur.execute(
+        """
+        SELECT
+            to_regclass('public.ra_jobs') IS NOT NULL AS jobs_ok,
+            to_regclass('public.ra_feature_batches') IS NOT NULL AS batches_ok,
+            to_regclass('public.ra_intraday_features') IS NOT NULL AS features_ok,
+            to_regprocedure('public.ra_ensure_feature_partitions(date,date)') IS NOT NULL AS partition_fn_ok,
+            EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='ra_feature_batches' AND column_name='symbols'
+            ) AS batch_symbols_ok,
+            EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='ra_jobs' AND column_name='heartbeat_at'
+            ) AS heartbeat_ok
+        """
+    )
+    row = cur.fetchone()
+    return bool(row and all(row.values()))
+
+
 def execute_schema() -> None:
     schema_path = Path(__file__).resolve().parent.parent / "sql" / "schema.sql"
     try:
         with connection() as conn:
             with conn.cursor() as cur:
+                # Serialize startup migration decisions across web/worker instances.
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA_MIGRATION_LOCK,))
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ra_schema_versions (
+                        version text PRIMARY KEY,
+                        app_version text NOT NULL,
+                        applied_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cur.execute("SELECT 1 FROM ra_schema_versions WHERE version=%s", (SCHEMA_VERSION,))
+                already_applied = cur.fetchone() is not None
+                if already_applied:
+                    conn.commit()
+                    logger.info("Pattern Discovery Workbench schema %s already installed; startup DDL skipped", SCHEMA_VERSION)
+                    return
+
+                if _schema_is_compatible(cur):
+                    # v1.0.6 changes transaction orchestration only; the v1.0.5
+                    # database objects are already fully compatible. Mark them
+                    # without touching active analysis tables.
+                    cur.execute(
+                        "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                        (SCHEMA_VERSION, SCHEMA_VERSION),
+                    )
+                    conn.commit()
+                    logger.info("Existing workbench schema marked compatible with %s; startup DDL skipped", SCHEMA_VERSION)
+                    return
+
+                # Fresh or incomplete database: install the full schema once.
                 cur.execute(schema_path.read_text(encoding="utf-8"))
+                cur.execute(
+                    "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                    (SCHEMA_VERSION, SCHEMA_VERSION),
+                )
             conn.commit()
     except ReadOnlySqlTransaction as exc:
         target = database_target()
@@ -153,7 +220,7 @@ def execute_schema() -> None:
             "Primary Session pooler on port 5432 for DATABASE_URL. "
             f"Configured target: {target['host']}:{target['port']} ({target['mode']})."
         ) from exc
-    logger.info("Pattern Discovery Workbench schema is ready")
+    logger.info("Pattern Discovery Workbench schema %s is ready", SCHEMA_VERSION)
 
 
 def close_pool() -> None:

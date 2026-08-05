@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, time, timedelta
+import random
 import threading
 import time as clock
 from typing import Any
@@ -15,7 +16,7 @@ from app.models import FeatureBuildConfig, timeframe_minutes
 from app.utils import json_safe
 
 FIXED_HORIZONS = (1, 5, 15, 30, 60)
-FEATURE_VERSION = "1.0.5"
+FEATURE_VERSION = "1.0.6"
 NY = ZoneInfo("America/New_York")
 
 class FeatureBatchTimeout(RuntimeError):
@@ -408,6 +409,49 @@ def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date,
     return sql, params
 
 
+def _ensure_partitions_for_chunk(chunk: dict[str, Any]) -> None:
+    """Create required monthly partitions once per date chunk, never per symbol batch.
+
+    Repeating partition DDL inside every long-running batch magnified lock
+    contention during deploys. A dedicated advisory lock serializes the rare
+    partition-creation transaction across all workbench workers.
+    """
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout = '30s'")
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('ra_feature_partition_ddl'))")
+            cur.execute(
+                "SELECT ra_ensure_feature_partitions(%s,%s)",
+                (chunk["chunk_start"] - timedelta(days=1), chunk["chunk_end"] + timedelta(days=1)),
+            )
+        conn.commit()
+
+
+def _exception_sqlstate(exc: Exception) -> str | None:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = getattr(current, "sqlstate", None) or getattr(current, "pgcode", None)
+        if code:
+            return str(code)
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _is_transient_database_conflict(exc: Exception) -> bool:
+    """Deadlocks/lock timeouts are transaction conflicts, not bad feature data."""
+    if _exception_sqlstate(exc) in {"40P01", "40001", "55P03"}:
+        return True
+    message = str(exc).lower()
+    return any(token in message for token in (
+        "deadlock detected",
+        "could not serialize access",
+        "canceling statement due to lock timeout",
+        "lock timeout",
+    ))
+
+
 def _build_batch(job_id: str, feature_set_id: str, chunk: dict[str, Any], batch: dict[str, Any], config: FeatureBuildConfig) -> int:
     settings = get_settings()
     statement_timeout = max(30, int(settings.database_statement_timeout_seconds))
@@ -488,7 +532,9 @@ def _build_batch(job_id: str, feature_set_id: str, chunk: dict[str, Any], batch:
             with conn.cursor() as cur:
                 cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}s'")
                 cur.execute("SET LOCAL lock_timeout = '60s'")
-                cur.execute("SELECT ra_ensure_feature_partitions(%s,%s)", (chunk_start - timedelta(days=1), chunk_end + timedelta(days=1)))
+                # Prevent duplicate workers from writing the same feature set
+                # concurrently after a stale-heartbeat recovery or rolling deploy.
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"ra_feature_set:{feature_set_id}",))
                 if config.conflict_policy == "replace_slice":
                     cur.execute(
                         """
@@ -576,6 +622,7 @@ def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]
         if chunk["status"] == "completed":
             continue
         check_control(job_id)
+        _ensure_partitions_for_chunk(chunk)
         batches = _chunk_batches(chunk["id"])
         with connection() as conn:
             with conn.cursor() as cur:
@@ -623,6 +670,30 @@ def build_feature_set(job_id: str, config: FeatureBuildConfig) -> dict[str, Any]
                         conn.commit()
                     raise
                 except Exception as exc:
+                    current_attempt = int(batch.get("attempts") or 0) + 1
+                    if _is_transient_database_conflict(exc) and current_attempt <= get_settings().feature_db_conflict_retries:
+                        delay = min(30.0, (2 ** max(0, current_attempt - 1)) + random.uniform(0.25, 1.25))
+                        with connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE ra_feature_batches SET status='pending',error=%s WHERE id=%s",
+                                    (f"Transient database conflict; retrying: {exc}", batch["id"]),
+                                )
+                            conn.commit()
+                        add_event(
+                            job_id,
+                            "feature_batch_lock_retry",
+                            f"A transient database lock conflict occurred; retrying this symbol batch after {delay:.1f}s.",
+                            level="warning",
+                            details={
+                                "feature_chunk_id": batch["feature_chunk_id"],
+                                "batch_id": batch["id"],
+                                "attempt": current_attempt,
+                                "sqlstate": _exception_sqlstate(exc),
+                            },
+                        )
+                        clock.sleep(delay)
+                        continue
                     if _is_statement_timeout(exc) and _split_feature_batch(job_id, batch):
                         continue
                     with connection() as conn:

@@ -1,5 +1,16 @@
 # Release notes
 
+## 1.0.6 — Deadlock-safe startup and feature writes
+
+- Stops rerunning the full table/index/trigger schema on every web and worker startup once the installed schema is compatible.
+- Records the installed schema version in `ra_schema_versions`.
+- Creates feature partitions once per date chunk instead of once per symbol batch.
+- Serializes writes to the same feature set with a PostgreSQL advisory transaction lock.
+- Automatically retries deadlocks, lock timeouts and serialization conflicts with jittered backoff.
+- Preserves completed chunks and batches when retrying the existing failed feature job.
+
+No feature-table rebuild is required.
+
 ## 1.0.5 — Hard feature-batch watchdog
 
 - Adds an independent 11-minute wall-clock watchdog for every feature SQL batch.

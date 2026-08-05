@@ -292,3 +292,19 @@ FEATURE_CANCEL_GRACE_SECONDS=15
 ```
 
 The database cancels a long SQL statement after ten minutes. The independent worker watchdog cancels it after eleven minutes if the server-side timeout does not return control. The batch is then split automatically and retried.
+
+### `deadlock detected` during a feature build
+
+Deploy v1.0.6 or later and click **Retry**. The worker preserves completed chunks/batches, skips unnecessary startup DDL, and automatically retries transient PostgreSQL lock conflicts. Do not delete the feature job.
+
+## v1.0.5 deadlock recovery
+
+If a feature job failed with `deadlock detected` while deploying v1.0.5:
+
+1. Deploy v1.0.6 to both services.
+2. Confirm both services report v1.0.6.
+3. Click **Retry** on the existing failed feature job.
+
+Completed date chunks and symbol batches remain intact. The failed batch is retried. Do not delete or recreate the job.
+
+As a temporary pre-v1.0.6 workaround only, set `AUTO_MIGRATE=false` on both web and worker after the schema has already been installed. v1.0.6 can safely retain `AUTO_MIGRATE=true` because it skips full startup DDL when the schema is compatible.
