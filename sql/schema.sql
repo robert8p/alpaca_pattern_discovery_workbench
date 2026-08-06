@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS ra_feature_sets (
     universe_run_id uuid NOT NULL REFERENCES ra_universe_runs(id) ON DELETE CASCADE,
     name text NOT NULL,
     config jsonb NOT NULL,
-    feature_version text NOT NULL DEFAULT '1.0.2',
+    feature_version text NOT NULL DEFAULT '1.1.0',
     status text NOT NULL DEFAULT 'building' CHECK (status IN ('building','completed','failed','cancelled')),
     symbol_count integer NOT NULL DEFAULT 0,
     row_count bigint NOT NULL DEFAULT 0,
@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS ra_feature_sets (
     completed_at timestamptz
 );
 
-ALTER TABLE ra_feature_sets ALTER COLUMN feature_version SET DEFAULT '1.0.2';
+ALTER TABLE ra_feature_sets ALTER COLUMN feature_version SET DEFAULT '1.1.0';
 
 CREATE TABLE IF NOT EXISTS ra_feature_chunks (
     id bigserial PRIMARY KEY,
@@ -331,6 +331,19 @@ CREATE INDEX IF NOT EXISTS ra_candidate_rules_leaderboard_idx
     ON ra_candidate_rules(discovery_run_id, workflow_status, rank_score DESC);
 CREATE INDEX IF NOT EXISTS ra_candidate_rules_feature_idx
     ON ra_candidate_rules(feature_set_id, created_at DESC);
+
+-- Audited methodology fields freeze the exact entry-sampling and bucket
+-- definition used by discovery, validation and sealed evaluation. Existing
+-- candidates are explicitly marked legacy and cannot be promoted to a new
+-- sealed test without rerunning discovery.
+ALTER TABLE ra_candidate_rules
+    ADD COLUMN IF NOT EXISTS entry_sampling_mode text NOT NULL DEFAULT 'legacy';
+ALTER TABLE ra_candidate_rules
+    ADD COLUMN IF NOT EXISTS entry_stride_minutes integer NOT NULL DEFAULT 1;
+ALTER TABLE ra_candidate_rules
+    ADD COLUMN IF NOT EXISTS entry_anchor_minute integer NOT NULL DEFAULT 570;
+ALTER TABLE ra_candidate_rules
+    ADD COLUMN IF NOT EXISTS rule_definition_version text NOT NULL DEFAULT 'legacy';
 
 CREATE OR REPLACE FUNCTION ra_set_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$

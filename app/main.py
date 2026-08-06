@@ -17,13 +17,14 @@ from app.config import get_settings
 from app.db import close_pool, connection, database_diagnostics, database_target, execute_schema
 from app.features import estimate_feature_build
 from app.jobs import create_job
+from app.preflight import database_sql_preflight, local_sql_preflight
 from app.models import (
     DiscoveryConfig, FeatureBuildConfig, FeatureEstimateRequest, JobCreateRequest,
     QualityScanConfig, SealedEvaluationConfig, UniverseBuildConfig,
 )
 from app.utils import json_safe
 
-VERSION = "1.0.7"
+VERSION = "1.1.0"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -154,6 +155,11 @@ def queue_job(payload: JobCreateRequest, _: str = Depends(require_auth)) -> dict
         "sealed_evaluation": SealedEvaluationConfig,
     }
     model = validators[payload.job_type].model_validate(payload.config)
+    if payload.job_type in {"discovery_scan", "sealed_evaluation"}:
+        try:
+            database_sql_preflight()
+        except Exception as exc:
+            raise HTTPException(503, f"Analysis SQL preflight failed: {exc}") from exc
     name = getattr(model, "name", f"Sealed evaluation {getattr(model, 'candidate_id', '')}")
     return json_safe(create_job(payload.job_type, name, model.model_dump(mode="json")))
 
@@ -247,6 +253,30 @@ def job_action(job_id: str, action: str, _: str = Depends(require_auth)) -> dict
                 target = "queued"
                 cur.execute("UPDATE ra_jobs SET error=NULL,completed_at=NULL,attempts=0 WHERE id=%s", (jid,))
             elif action == "delete" and current in {"completed", "failed", "cancelled"}:
+                if row["job_type"] == "universe_build":
+                    cur.execute(
+                        "SELECT count(*) AS n FROM ra_feature_sets WHERE universe_run_id IN "
+                        "(SELECT id FROM ra_universe_runs WHERE job_id=%s)",
+                        (jid,),
+                    )
+                    if int(cur.fetchone()["n"]):
+                        raise HTTPException(409, "Cannot delete this universe because feature sets depend on it")
+                elif row["job_type"] == "feature_build":
+                    cur.execute(
+                        "SELECT count(*) AS n FROM ra_discovery_runs WHERE feature_set_id IN "
+                        "(SELECT id FROM ra_feature_sets WHERE job_id=%s)",
+                        (jid,),
+                    )
+                    if int(cur.fetchone()["n"]):
+                        raise HTTPException(409, "Cannot delete this feature set because discovery runs depend on it")
+                elif row["job_type"] == "discovery_scan":
+                    cur.execute(
+                        "SELECT count(*) AS n FROM ra_candidate_rules WHERE discovery_run_id IN "
+                        "(SELECT id FROM ra_discovery_runs WHERE job_id=%s)",
+                        (jid,),
+                    )
+                    if int(cur.fetchone()["n"]):
+                        raise HTTPException(409, "Cannot delete this discovery run while it contains candidate rules")
                 cur.execute("DELETE FROM ra_jobs WHERE id=%s", (jid,))
                 conn.commit()
                 return {"ok": True, "status": "deleted"}
@@ -392,9 +422,11 @@ def dependencies(_: str = Depends(require_auth)) -> dict[str, Any]:
             cur.execute("SELECT worker_id,status,current_job_id,version,heartbeat_at,EXTRACT(EPOCH FROM (now()-heartbeat_at))::integer AS heartbeat_age_seconds FROM ra_workers ORDER BY heartbeat_at DESC")
             workers = cur.fetchall()
         conn.rollback()
+    preflight = database_sql_preflight(force=True)
     return json_safe({
         "database": database,
         "workers": workers,
+        "preflight": preflight,
         "auth_warning": settings.app_password == "change-me",
         "raw_write_policy": "Application code only SELECTs from rd_ tables.",
     })

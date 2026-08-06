@@ -15,7 +15,7 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
-SCHEMA_VERSION = "1.0.7"
+SCHEMA_VERSION = "1.1.0"
 SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
@@ -141,15 +141,7 @@ def database_diagnostics() -> dict[str, Any]:
     return {**target, **row}
 
 
-def _schema_is_compatible(cur: Any) -> bool:
-    """Return True when the installed v1 schema already has every object v1.0.7 needs.
-
-    Earlier releases reran the entire idempotent schema on every web and worker
-    start. During a rolling deploy that DDL could overlap an active feature
-    transaction and deadlock with its foreign-key/partition locks. v1.0.7
-    records schema state and skips table/index/trigger DDL when no migration is
-    required.
-    """
+def _schema_state(cur: Any) -> dict[str, bool]:
     cur.execute(
         """
         SELECT
@@ -164,11 +156,32 @@ def _schema_is_compatible(cur: Any) -> bool:
             EXISTS (
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='ra_jobs' AND column_name='heartbeat_at'
-            ) AS heartbeat_ok
+            ) AS heartbeat_ok,
+            EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='ra_candidate_rules'
+                  AND column_name='entry_stride_minutes'
+            ) AS methodology_ok
         """
     )
     row = cur.fetchone()
-    return bool(row and all(row.values()))
+    return dict(row) if row else {}
+
+
+def _schema_is_compatible(cur: Any) -> bool:
+    state = _schema_state(cur)
+    return bool(state and all(state.values()))
+
+
+def _core_schema_is_compatible(state: dict[str, bool]) -> bool:
+    return bool(state and all(value for key, value in state.items() if key != "methodology_ok"))
+
+
+def _apply_v110_methodology_migration(cur: Any) -> None:
+    cur.execute("ALTER TABLE ra_candidate_rules ADD COLUMN IF NOT EXISTS entry_sampling_mode text NOT NULL DEFAULT 'legacy'")
+    cur.execute("ALTER TABLE ra_candidate_rules ADD COLUMN IF NOT EXISTS entry_stride_minutes integer NOT NULL DEFAULT 1")
+    cur.execute("ALTER TABLE ra_candidate_rules ADD COLUMN IF NOT EXISTS entry_anchor_minute integer NOT NULL DEFAULT 570")
+    cur.execute("ALTER TABLE ra_candidate_rules ADD COLUMN IF NOT EXISTS rule_definition_version text NOT NULL DEFAULT 'legacy'")
 
 
 def execute_schema() -> None:
@@ -189,15 +202,18 @@ def execute_schema() -> None:
                 )
                 cur.execute("SELECT 1 FROM ra_schema_versions WHERE version=%s", (SCHEMA_VERSION,))
                 already_applied = cur.fetchone() is not None
-                if already_applied:
+                if already_applied and _schema_is_compatible(cur):
                     conn.commit()
-                    logger.info("Pattern Discovery Workbench schema %s already installed; startup DDL skipped", SCHEMA_VERSION)
+                    logger.info("Pattern Discovery Workbench schema %s already installed and compatible; startup DDL skipped", SCHEMA_VERSION)
                     return
+                if already_applied:
+                    logger.warning(
+                        "Schema version %s is recorded but compatibility checks failed; repairing the incomplete migration",
+                        SCHEMA_VERSION,
+                    )
 
-                if _schema_is_compatible(cur):
-                    # v1.0.7 changes discovery execution only; the v1.0.5
-                    # database objects are already fully compatible. Mark them
-                    # without touching active analysis tables.
+                state = _schema_state(cur)
+                if state and all(state.values()):
                     cur.execute(
                         "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                         (SCHEMA_VERSION, SCHEMA_VERSION),
@@ -206,8 +222,13 @@ def execute_schema() -> None:
                     logger.info("Existing workbench schema marked compatible with %s; startup DDL skipped", SCHEMA_VERSION)
                     return
 
-                # Fresh or incomplete database: install the full schema once.
-                cur.execute(schema_path.read_text(encoding="utf-8"))
+                if _core_schema_is_compatible(state):
+                    # Existing v1 schema: apply only the four metadata columns.
+                    # Do not replay table/index/trigger DDL against feature jobs.
+                    _apply_v110_methodology_migration(cur)
+                else:
+                    # Fresh or materially incomplete database: install the full schema once.
+                    cur.execute(schema_path.read_text(encoding="utf-8"))
                 cur.execute(
                     "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                     (SCHEMA_VERSION, SCHEMA_VERSION),

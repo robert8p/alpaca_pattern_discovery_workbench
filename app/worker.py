@@ -15,9 +15,10 @@ from app.jobs import (
 )
 from app.models import DiscoveryConfig, FeatureBuildConfig, QualityScanConfig, SealedEvaluationConfig, UniverseBuildConfig
 from app.quality import run_quality_scan
+from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "1.0.7"
+VERSION = "1.1.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
@@ -68,6 +69,11 @@ async def run_worker() -> None:
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if settings.auto_migrate:
         execute_schema()
+    preflight = local_sql_preflight()
+    logger.info(
+        "Discovery SQL preflight passed: %s checks, definition %s",
+        preflight["checks"], preflight["definition_hash"][:12],
+    )
     worker_id = make_worker_id()
     recovered = recover_stale_jobs()
     worker_heartbeat(worker_id, VERSION, "idle", details={"recovered_jobs": recovered})

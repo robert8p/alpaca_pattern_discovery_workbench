@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 
 def json_safe(value: Any) -> Any:
@@ -29,3 +30,12 @@ def finite_or_none(value: Any) -> float | None:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+NY = ZoneInfo("America/New_York")
+
+def market_date_bounds(start_date: date, end_date: date) -> tuple[datetime, datetime]:
+    """Return UTC timestamps covering inclusive New York calendar dates."""
+    start = datetime.combine(start_date, time.min, tzinfo=NY).astimezone(UTC)
+    end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=NY).astimezone(UTC)
+    return start, end

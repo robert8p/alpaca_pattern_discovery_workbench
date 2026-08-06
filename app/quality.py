@@ -8,7 +8,8 @@ from app.config import get_settings
 from app.db import connection
 from app.jobs import add_event, set_progress
 from app.models import QualityScanConfig, timeframe_minutes
-from app.utils import json_safe
+from app.sql_validation import validate_sql_bindings
+from app.utils import json_safe, market_date_bounds
 
 
 def _expected_bars(config: QualityScanConfig) -> int:
@@ -26,7 +27,8 @@ def _expected_bars(config: QualityScanConfig) -> int:
 def run_quality_scan(job_id: str, config: QualityScanConfig) -> dict[str, Any]:
     timeout = get_settings().database_statement_timeout_seconds
     start, end = config.start_date, config.end_date
-    common = (config.timeframe, config.feed, config.adjustment, config.session, config.session, start, end)
+    start_ts, end_ts = market_date_bounds(start, end)
+    common = (config.timeframe, config.feed, config.adjustment, config.session, config.session, start_ts, end_ts)
     set_progress(job_id, "checking source tables", 0, 5)
 
     with connection() as conn:
@@ -57,7 +59,7 @@ def run_quality_scan(job_id: str, config: QualityScanConfig) -> dict[str, Any]:
                 FROM rd_bars
                 WHERE timeframe=%s AND feed=%s AND adjustment=%s
                   AND (%s='all' OR session_label=%s)
-                  AND (bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                  AND bar_ts >= %s AND bar_ts < %s
                 GROUP BY session_label ORDER BY session_label
                 """,
                 (config.timeframe, config.feed, config.adjustment, config.session, config.session, start, end),
@@ -77,7 +79,7 @@ def run_quality_scan(job_id: str, config: QualityScanConfig) -> dict[str, Any]:
                 FROM rd_bars
                 WHERE timeframe=%s AND feed=%s AND adjustment=%s
                   AND (%s='all' OR session_label=%s)
-                  AND (bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                  AND bar_ts >= %s AND bar_ts < %s
                 GROUP BY 1 ORDER BY 1
                 """,
                 common,
@@ -99,7 +101,7 @@ def run_quality_scan(job_id: str, config: QualityScanConfig) -> dict[str, Any]:
                     FROM rd_bars
                     WHERE timeframe=%s AND feed=%s AND adjustment=%s
                       AND (%s='all' OR session_label=%s)
-                      AND (bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                      AND bar_ts >= %s AND bar_ts < %s
                     GROUP BY symbol,2
                 )
                 SELECT CASE
@@ -130,7 +132,7 @@ def run_quality_scan(job_id: str, config: QualityScanConfig) -> dict[str, Any]:
                 FROM rd_bars
                 WHERE timeframe=%s AND feed=%s AND adjustment=%s
                   AND (%s='all' OR session_label=%s)
-                  AND (bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                  AND bar_ts >= %s AND bar_ts < %s
                 """,
                 common,
             )
@@ -142,7 +144,7 @@ def run_quality_scan(job_id: str, config: QualityScanConfig) -> dict[str, Any]:
                     FROM rd_bars
                     WHERE timeframe=%s AND feed=%s AND adjustment=%s
                       AND (%s='all' OR session_label=%s)
-                      AND (bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                      AND bar_ts >= %s AND bar_ts < %s
                     GROUP BY symbol
                 )
                 SELECT count(*) FILTER (WHERE n<%s) AS symbols_below_minimum_days FROM days

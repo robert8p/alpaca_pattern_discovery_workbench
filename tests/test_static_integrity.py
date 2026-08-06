@@ -2,6 +2,8 @@ import ast
 import re
 from pathlib import Path
 
+from app.sql_validation import SqlBindingError, inspect_psycopg_placeholders
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -15,12 +17,16 @@ def test_literal_sql_placeholder_counts_match_literal_parameter_tuples():
             if node.func.attr not in {"execute", "executemany"} or len(node.args) < 2:
                 continue
             query, params = node.args[0], node.args[1]
-            if not isinstance(query, ast.Constant) or not isinstance(query.value, str) or not isinstance(params, ast.Tuple):
+            if not isinstance(query, ast.Constant) or not isinstance(query.value, str):
                 continue
-            if any(isinstance(item, ast.Starred) for item in params.elts):
+            try:
+                report = inspect_psycopg_placeholders(query.value)
+            except SqlBindingError as exc:
+                issues.append((path.name, node.lineno, str(exc)))
                 continue
-            if query.value.count("%s") != len(params.elts):
-                issues.append((path.name, node.lineno, query.value.count("%s"), len(params.elts)))
+            if isinstance(params, ast.Tuple) and not any(isinstance(item, ast.Starred) for item in params.elts):
+                if report.placeholder_count != len(params.elts):
+                    issues.append((path.name, node.lineno, report.placeholder_count, len(params.elts)))
     assert not issues
 
 

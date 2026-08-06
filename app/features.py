@@ -13,10 +13,11 @@ from app.config import get_settings
 from app.db import connection
 from app.jobs import JobInterrupted, add_event, check_control, set_progress
 from app.models import FeatureBuildConfig, timeframe_minutes
+from app.sql_validation import validate_sql_bindings
 from app.utils import json_safe
 
 FIXED_HORIZONS = (1, 5, 15, 30, 60)
-FEATURE_VERSION = "1.0.6"
+FEATURE_VERSION = "1.1.0"
 NY = ZoneInfo("America/New_York")
 
 class FeatureBatchTimeout(RuntimeError):
@@ -406,6 +407,7 @@ def _feature_sql(config: FeatureBuildConfig, chunk_start: date, chunk_end: date,
         None,  # replaced by feature_set_id in caller
         chunk_start, chunk_end,
     )
+    validate_sql_bindings(sql, params, name="feature-build SQL")
     return sql, params
 
 
@@ -462,6 +464,7 @@ def _build_batch(job_id: str, feature_set_id: str, chunk: dict[str, Any], batch:
     sql, params = _feature_sql(config, chunk_start, chunk_end, symbols)
     params = list(params)
     params[-3] = feature_set_id
+    validate_sql_bindings(sql, params, name=f"feature batch {batch['id']}")
 
     with connection() as conn:
         with conn.cursor() as pid_cur:

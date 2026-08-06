@@ -1,323 +1,172 @@
-# Step-by-step deployment
+# Deployment and upgrade guide — v1.1.0
 
-This is a **new Render application and new GitHub repository**, but it deliberately uses the **same Supabase database** as the Alpaca Rapid Discovery Loader.
+This is a separate Render application and GitHub repository, but it uses the **same Supabase database** as the Alpaca Rapid Discovery Loader.
 
-Do not create a second Supabase project for this workbench unless you intentionally want an isolated copy of the raw market data.
+## 1. Replace the repository
 
-## 1. Extract the archive
-
-Extract the project directory locally.
-
-The extracted directory should contain:
-
-```text
-app/
-sql/
-scripts/
-tests/
-render.yaml
-requirements.txt
-```
-
-## 2. Create a separate GitHub repository
-
-1. Sign in to GitHub.
-2. Create a new repository, for example:
-
-   ```text
-   alpaca-pattern-discovery-workbench
-   ```
-
-3. Keep it private.
-4. Upload all extracted files, including hidden files:
+1. Extract `alpaca_pattern_discovery_workbench_v1.1.0.zip`.
+2. Replace the contents of the existing workbench repository.
+3. Include hidden paths:
    - `.python-version`
    - `.gitignore`
    - `.env.example`
-5. Commit the files.
+   - `.github/workflows/ci.yml`
+4. Do not upload `.env` or any credentials.
+5. Commit and push.
 
-Do not upload a real `.env` file or credentials.
+## 2. Require the GitHub release gate
 
-## 3. Obtain the existing database URL
+Open the repository's **Actions** tab and wait for `release-gate` to pass.
 
-Use the **same `DATABASE_URL`** configured on the Rapid Discovery Loader.
+It runs:
 
-The URL should point to the Supabase **Session pooler** on port 5432 and resemble:
+- Python compilation
+- JavaScript syntax validation
+- Unit and static-integrity tests
+- PostgreSQL 16 synthetic end-to-end integration
+- Exhaustive PostgreSQL planning of 194 generated production queries
+- Release audit, raw-table write scan and version consistency checks
 
-```text
-postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres?sslmode=require
-```
+Do not deploy a commit whose workflow is red.
 
-You can copy the value from either loader service in Render:
+## 3. Database connection
 
-1. Open `alpaca-rapid-discovery-web` or its worker.
-2. Open **Environment**.
-3. Copy `DATABASE_URL` securely.
-
-The web and worker services for this workbench must use the same value.
-
-## 4. Create a Render Blueprint
-
-1. Open Render.
-2. Select **New → Blueprint**.
-3. Connect the new GitHub repository.
-4. Render detects `render.yaml`.
-5. Confirm two services:
-   - `alpaca-pattern-workbench-web`
-   - `alpaca-pattern-workbench-worker`
-6. Confirm both services explicitly show:
-
-   ```text
-   PYTHON_VERSION=3.12.7
-   ```
-
-The workbench worker does not need a persistent disk because all durable state is stored in Supabase.
-
-## 5. Enter environment variables
-
-### Web service
-
-Set:
+Both Render services must use the same writable Supabase **Primary Session pooler** URL on port 5432:
 
 ```text
-DATABASE_URL=<same value as loader>
-APP_USERNAME=admin
-APP_PASSWORD=<new long unique password>
-AUTO_MIGRATE=true
-DATABASE_STATEMENT_TIMEOUT_SECONDS=1800
+postgresql://postgres.PROJECT_REF:YOUR_PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres?sslmode=require
 ```
 
-### Worker service
+Do not use:
 
-Set:
+- Port 6543 transaction pooling
+- A read replica
+- A role that cannot create/update `ra_` objects
 
-```text
-DATABASE_URL=<same value as loader>
-AUTO_MIGRATE=true
-WORKER_POLL_SECONDS=3
-WORKER_STALE_SECONDS=300
-MAX_JOB_ATTEMPTS=3
-DATABASE_STATEMENT_TIMEOUT_SECONDS=1800
-```
+## 4. Render services
 
-No Alpaca credentials are needed. This app reads the data already loaded into Supabase.
+The Blueprint defines:
 
-## 6. Deploy
+- `alpaca-pattern-workbench-web`
+- `alpaca-pattern-workbench-worker`
 
-Deploy both services.
-
-Successful build logs should begin with:
-
-```text
-Python 3.12.7
-```
-
-Both services run the schema migration safely under a PostgreSQL advisory lock. The migration creates only `ra_` objects.
-
-## 7. Verify health
-
-Open the web-service URL and sign in using `APP_USERNAME` and `APP_PASSWORD`.
-
-Open **System** and click **Run checks**.
-
-Confirm:
-
-- Supabase database connected
-- `rd_bars` found
-- Workbench `ra_jobs` schema ready
-- Worker heartbeat is recent
-
-If `rd_bars` is missing, the workbench is pointing at the wrong Supabase database.
-
-## 8. First acceptance test
-
-Use a deliberately small universe before building the full feature table.
-
-### A. Data quality
-
-Use:
-
-```text
-Start:       2026-07-04
-End:         2026-08-03
-Timeframe:   1Min
-Feed:        SIP
-Adjustment:  Raw
-Session:     Regular
-Tolerance:   95%
-```
-
-Click **Run quality scan**.
-
-Confirm:
-
-- The job completes.
-- Invalid OHLC and nonpositive-price counts are zero or understood.
-- Regular-session dates and symbols are credible.
-
-### B. Small analysis universe
-
-Use the same source settings, but initially set:
-
-```text
-Maximum included symbols: 25
-Minimum trading days:      15
-Minimum bars/day:          300
-Minimum dollar volume:     US$5,000,000
-```
-
-Click **Build analysis universe**.
-
-Inspect the symbols and confirm they are sensible liquid equities.
-
-### C. Small feature set
-
-Use:
-
-```text
-Universe:        the 25-symbol test universe
-Start:           2026-07-04
-End:             2026-08-03
-Timeframe:       1Min
-Feed:            SIP
-Adjustment:      Raw
-Session:         Regular
-Tiers:           A and B
-Chunk size:      1 day for acceptance testing
-Baseline days:   10
-Existing rows:   Rebuild selected slices
-```
-
-Click **Estimate**, then **Queue feature build**.
-
-Inspect the job and confirm every date chunk completes.
-
-### D. Small discovery scan
-
-Use:
-
-```text
-Discovery:   2026-07-06 to 2026-07-17
-Validation:  2026-07-20 to 2026-07-24
-Sealed:      leave untouched for now
-Directions:  Long and short
-Hold:        30 and 60 minutes
-Costs:       20 bps round trip
-```
-
-For a 25-symbol acceptance test, temporarily lower evidence thresholds if needed. The purpose of this run is to verify workflow behaviour, not establish a valid trading rule.
-
-### E. Sealed test
-
-After shortlisting a candidate, promote it with:
-
-```text
-Sealed start: 2026-07-27
-Sealed end:   2026-08-03
-```
-
-The app will reject sealed dates that overlap discovery/validation or fall outside the feature set.
-
-## 9. Scale to the substantive first run
-
-After the acceptance test succeeds:
-
-1. Build a new universe with **500–1,500 symbols**, ranked by dollar volume.
-2. Review the included symbols and heuristic fund exclusions.
-3. Build an A+B feature set using three-day chunks.
-4. Retain the discovery/validation/sealed separation above.
-5. Increase cost assumptions for less liquid tiers.
-
-Supabase compute, not the Render worker, is likely to become the main constraint because feature engineering is executed inside PostgreSQL. If queries time out, reduce the feature chunk from three days to one day before increasing database compute.
-
-## 10. Normal operation
-
-You should not need to open the Supabase SQL editor.
-
-Use the dashboard to:
-
-- Run quality checks
-- Build and inspect universes
-- Estimate and build feature sets
-- Pause, resume, cancel or retry jobs
-- Run discovery scans
-- Shortlist or reject candidates
-- Promote a frozen candidate to a sealed test
-
-## 11. Troubleshooting
-
-### Worker does not appear
-
-Check the worker logs and confirm its `DATABASE_URL` matches the web service exactly.
-
-### Job is queued indefinitely
-
-The worker is absent or its heartbeat is stale. Open **System** and inspect the heartbeat.
-
-### Feature query times out
-
-Use version 1.0.2 or later. Feature work is split by both date and symbol batch, and timed-out symbol batches automatically divide into smaller batches down to ten symbols. After deployment, click **Retry** on the existing job. Completed date chunks and completed symbol batches are preserved.
-
-### Discovery job fails on one combination
-
-Retry the job. Completed family/direction/horizon tasks remain completed; only failed or interrupted combinations rerun.
-
-### Wrong database
-
-If System reports `rd_bars` missing, replace `DATABASE_URL` with the exact value used by the loader and redeploy.
-
-### Python or `pydantic-core` build failure
-
-Confirm both services use:
+Both pin:
 
 ```text
 PYTHON_VERSION=3.12.7
+AUTO_MIGRATE=true
 ```
 
-Then choose **Clear build cache & deploy**.
+The existing `DATABASE_URL` and `APP_PASSWORD` values have `sync: false`; Blueprint updates do not replace them. Verify them manually in Render.
 
-### Universe build fails with `could not determine data type of parameter $18`
+## 5. Timeout settings
 
-Upgrade to version 1.0.1 or later. Version 1.0.0 did not explicitly type a blank optional include-regex parameter. After redeploying, open the failed job and click **Retry**. No schema migration is needed.
-
-
-## Feature batch timeout controls
-
-The Blueprint sets:
+The Blueprint supplies:
 
 ```text
 DATABASE_STATEMENT_TIMEOUT_SECONDS=600
 FEATURE_BATCH_WALL_TIMEOUT_SECONDS=660
-FEATURE_MIN_SYMBOL_BATCH_SIZE=1
 FEATURE_CANCEL_GRACE_SECONDS=15
-```
-
-The database cancels a long SQL statement after ten minutes. The independent worker watchdog cancels it after eleven minutes if the server-side timeout does not return control. The batch is then split automatically and retried.
-
-### `deadlock detected` during a feature build
-
-Deploy v1.0.6 or later and click **Retry**. The worker preserves completed chunks/batches, skips unnecessary startup DDL, and automatically retries transient PostgreSQL lock conflicts. Do not delete the feature job.
-
-## v1.0.5 deadlock recovery
-
-If a feature job failed with `deadlock detected` while deploying v1.0.5:
-
-1. Deploy v1.0.6 to both services.
-2. Confirm both services report v1.0.6.
-3. Click **Retry** on the existing failed feature job.
-
-Completed date chunks and symbol batches remain intact. The failed batch is retried. Do not delete or recreate the job.
-
-As a temporary pre-v1.0.6 workaround only, set `AUTO_MIGRATE=false` on both web and worker after the schema has already been installed. v1.0.6 can safely retain `AUTO_MIGRATE=true` because it skips full startup DDL when the schema is compatible.
-
-## Discovery statement timeout
-
-Version 1.0.7 optimises discovery scans by using non-overlapping entry points and partition-prunable timestamp bounds. The worker Blueprint includes:
-
-```text
+FEATURE_MIN_SYMBOL_BATCH_SIZE=1
+FEATURE_DB_CONFLICT_RETRIES=5
 DISCOVERY_STATEMENT_TIMEOUT_SECONDS=600
 DISCOVERY_WALL_TIMEOUT_SECONDS=660
 DISCOVERY_CANCEL_GRACE_SECONDS=15
 DISCOVERY_QUERY_RETRIES=2
 ```
 
-After upgrading an existing failed discovery run, click **Retry**. The first retry resets previously completed legacy discovery tasks so the run uses one consistent v1.0.7 methodology. Feature rows are not rebuilt.
+Do not increase these simply to conceal a query that is failing to make progress. The watchdogs and batching exist to expose and divide oversized work.
+
+## 6. Deploy
+
+Deploy both services from the same commit. Confirm their logs show:
+
+```text
+Python 3.12.7
+version 1.1.0
+```
+
+The schema upgrade is minimal. It adds candidate methodology metadata and records schema version 1.1.0. Existing `rd_` bars and completed feature rows are unchanged.
+
+## 7. Mandatory deployed preflight
+
+Open **System → Run checks**.
+
+Require all of the following:
+
+- Database target is port 5432
+- `is_replica=false`
+- Transaction read-only settings are `off`
+- `rd_bars` and `rd_assets` exist
+- `ra_` schema is ready
+- Worker heartbeat is current
+- SQL preflight reports `ok=true`
+- A query-definition hash is displayed
+- PostgreSQL plans are greater than zero
+
+The API refuses new discovery and sealed-test jobs if this preflight fails.
+
+## 8. Existing feature set
+
+Your completed June/July regular-session feature set does **not** need rebuilding. Feature definition 1.1.0 changes release validation and metadata, not the stored predictor semantics used by the existing set.
+
+Keep the existing feature set unless its own quality or coverage is suspect.
+
+## 9. Existing failed discovery run
+
+Open **Initial interpretable rule scan** and click **Retry** only after:
+
+1. GitHub Actions is green.
+2. Web and worker both show 1.1.0.
+3. System SQL preflight passes.
+
+On retry, progress will reset from the old partial result to `0/48`. This is deliberate. The workbench deletes legacy candidates and reruns every discovery task using one consistent v1.1.0 methodology.
+
+The feature table is not rebuilt.
+
+## 10. Acceptance sequence
+
+For the existing data:
+
+1. Run System checks.
+2. Inspect the feature-set coverage.
+3. Retry the existing discovery scan.
+4. Confirm task progress advances through all 48 combinations.
+5. Review candidates only after the run status is `completed`.
+6. Shortlist a candidate based on net return, samples, concentration and validation—not win rate alone.
+7. Trigger sealed evaluation only after the candidate definition is frozen.
+
+## 11. Recovery behaviour
+
+- Pause and Cancel cancel in-flight database work through an independent monitor.
+- Worker restarts reconcile stale control states.
+- Feature retries preserve completed chunks and symbol batches.
+- Discovery retries preserve compatible completed tasks; an engine-version change resets all tasks.
+- Legacy candidates cannot be sealed.
+- Upstream analysis assets cannot be deleted through the dashboard while dependants exist.
+
+## 12. Troubleshooting
+
+### SQL preflight fails
+
+Do not queue analysis. Open System details and inspect the exact missing object or failed PostgreSQL plan. Confirm both services are on the same 1.1.0 commit and database.
+
+### Worker is absent
+
+Check the worker's `DATABASE_URL`, startup migration log and heartbeat. The web service cannot execute queued analysis on its own.
+
+### Read-only transaction
+
+Replace `DATABASE_URL` on both services with the Supabase Primary Session pooler on port 5432 and redeploy.
+
+### Feature timeout
+
+The worker automatically splits symbol batches. Retry the same feature job; do not recreate it. Completed work is retained.
+
+### Discovery timeout
+
+The task retries once with jitter. If it still fails, inspect database compute and the selected every-bar/non-overlapping sampling mode. Non-overlapping is the recommended default.
+
+### Old percent-placeholder failure
+
+That defect belongs to v1.0.7 and earlier. v1.1.0 uses machine-safe category codes and validates all generated SQL through Psycopg grammar and PostgreSQL preflight before execution.

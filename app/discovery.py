@@ -5,7 +5,8 @@ import random
 import threading
 import time as clock
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time, timedelta
+from hashlib import sha256
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -14,10 +15,12 @@ from app.config import get_settings
 from app.db import connection
 from app.jobs import JobInterrupted, add_event, check_control, set_progress
 from app.models import DiscoveryConfig, SealedEvaluationConfig, timeframe_minutes
+from app.sql_validation import validate_sql_bindings
 from app.utils import finite_or_none, json_safe
 
 
-DISCOVERY_VERSION = "1.0.7"
+DISCOVERY_VERSION = "1.1.0"
+RULE_DEFINITION_VERSION = "2026-08-audited-v1"
 
 
 class DiscoveryQueryTimeout(RuntimeError):
@@ -31,183 +34,216 @@ class Dimension:
     labels: dict[str, tuple[dict[str, Any], str]]
 
 
-def _range(column: str, low: float | int | None, high: float | int | None, label: str) -> tuple[dict[str, Any], str]:
-    return ({"column": column, "operator": "range", "low": low, "high": high}, label)
+def _range(
+    column: str,
+    low: float | int | None,
+    high: float | int | None,
+    label: str,
+    *,
+    low_inclusive: bool = True,
+    high_inclusive: bool = False,
+) -> tuple[dict[str, Any], str]:
+    return (
+        {
+            "column": column,
+            "operator": "range",
+            "low": low,
+            "high": high,
+            "low_inclusive": low_inclusive,
+            "high_inclusive": high_inclusive,
+        },
+        label,
+    )
 
 
 def _eq(column: str, value: Any, label: str) -> tuple[dict[str, Any], str]:
     return ({"column": column, "operator": "eq", "value": value}, label)
 
 
+# SQL category values are machine-safe codes. Human-facing labels containing
+# percent signs never enter a parameterised SQL string. Every CASE handles NULL
+# explicitly, preventing missing predictors from falling into the terminal bin.
 TIME = Dimension(
     "time_bin",
     """CASE
-        WHEN minute_of_day>=570 AND minute_of_day<600 THEN '09:30–10:00 ET'
-        WHEN minute_of_day>=600 AND minute_of_day<660 THEN '10:00–11:00 ET'
-        WHEN minute_of_day>=660 AND minute_of_day<780 THEN '11:00–13:00 ET'
-        WHEN minute_of_day>=780 AND minute_of_day<870 THEN '13:00–14:30 ET'
-        WHEN minute_of_day>=870 AND minute_of_day<930 THEN '14:30–15:30 ET'
-        WHEN minute_of_day>=930 AND minute_of_day<960 THEN '15:30–16:00 ET'
-        ELSE 'Other time' END""",
+        WHEN minute_of_day>=570 AND minute_of_day<600 THEN 't0930_1000'
+        WHEN minute_of_day>=600 AND minute_of_day<660 THEN 't1000_1100'
+        WHEN minute_of_day>=660 AND minute_of_day<780 THEN 't1100_1300'
+        WHEN minute_of_day>=780 AND minute_of_day<870 THEN 't1300_1430'
+        WHEN minute_of_day>=870 AND minute_of_day<930 THEN 't1430_1530'
+        WHEN minute_of_day>=930 AND minute_of_day<960 THEN 't1530_1600'
+        ELSE NULL END""",
     {
-        "09:30–10:00 ET": _range("minute_of_day", 570, 600, "between 09:30 and 10:00 ET"),
-        "10:00–11:00 ET": _range("minute_of_day", 600, 660, "between 10:00 and 11:00 ET"),
-        "11:00–13:00 ET": _range("minute_of_day", 660, 780, "between 11:00 and 13:00 ET"),
-        "13:00–14:30 ET": _range("minute_of_day", 780, 870, "between 13:00 and 14:30 ET"),
-        "14:30–15:30 ET": _range("minute_of_day", 870, 930, "between 14:30 and 15:30 ET"),
-        "15:30–16:00 ET": _range("minute_of_day", 930, 960, "between 15:30 and 16:00 ET"),
-        "Other time": _range("minute_of_day", None, None, "outside the standard regular-session bins"),
+        "t0930_1000": _range("minute_of_day", 570, 600, "between 09:30 and 10:00 ET"),
+        "t1000_1100": _range("minute_of_day", 600, 660, "between 10:00 and 11:00 ET"),
+        "t1100_1300": _range("minute_of_day", 660, 780, "between 11:00 and 13:00 ET"),
+        "t1300_1430": _range("minute_of_day", 780, 870, "between 13:00 and 14:30 ET"),
+        "t1430_1530": _range("minute_of_day", 870, 930, "between 14:30 and 15:30 ET"),
+        "t1530_1600": _range("minute_of_day", 930, 960, "between 15:30 and 16:00 ET"),
     },
 )
 WEEKDAY = Dimension(
     "weekday_bin",
-    "CASE weekday_iso WHEN 1 THEN 'Monday' WHEN 2 THEN 'Tuesday' WHEN 3 THEN 'Wednesday' WHEN 4 THEN 'Thursday' WHEN 5 THEN 'Friday' ELSE 'Other' END",
-    {day: _eq("weekday_iso", index, f"on {day}s") for index, day in enumerate(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"], 1)},
+    "CASE weekday_iso WHEN 1 THEN 'mon' WHEN 2 THEN 'tue' WHEN 3 THEN 'wed' WHEN 4 THEN 'thu' WHEN 5 THEN 'fri' ELSE NULL END",
+    {
+        "mon": _eq("weekday_iso", 1, "on Mondays"),
+        "tue": _eq("weekday_iso", 2, "on Tuesdays"),
+        "wed": _eq("weekday_iso", 3, "on Wednesdays"),
+        "thu": _eq("weekday_iso", 4, "on Thursdays"),
+        "fri": _eq("weekday_iso", 5, "on Fridays"),
+    },
 )
 RET30 = Dimension(
     "ret30_bin",
     """CASE
-        WHEN ret_30m_pct<=-5 THEN '≤ -5%'
-        WHEN ret_30m_pct<=-3 THEN '-5% to -3%'
-        WHEN ret_30m_pct<=-2 THEN '-3% to -2%'
-        WHEN ret_30m_pct<=-1 THEN '-2% to -1%'
-        WHEN ret_30m_pct<0 THEN '-1% to 0%'
-        WHEN ret_30m_pct<1 THEN '0% to +1%'
-        WHEN ret_30m_pct<2 THEN '+1% to +2%'
-        WHEN ret_30m_pct<3 THEN '+2% to +3%'
-        WHEN ret_30m_pct<5 THEN '+3% to +5%'
-        ELSE '≥ +5%' END""",
+        WHEN ret_30m_pct IS NULL THEN NULL
+        WHEN ret_30m_pct < -5 THEN 'lt_n5'
+        WHEN ret_30m_pct < -3 THEN 'n5_n3'
+        WHEN ret_30m_pct < -2 THEN 'n3_n2'
+        WHEN ret_30m_pct < -1 THEN 'n2_n1'
+        WHEN ret_30m_pct < 0 THEN 'n1_0'
+        WHEN ret_30m_pct < 1 THEN '0_p1'
+        WHEN ret_30m_pct < 2 THEN 'p1_p2'
+        WHEN ret_30m_pct < 3 THEN 'p2_p3'
+        WHEN ret_30m_pct < 5 THEN 'p3_p5'
+        ELSE 'ge_p5' END""",
     {
-        "≤ -5%": _range("ret_30m_pct", None, -5, "the prior 30-minute return is at most -5%"),
-        "-5% to -3%": _range("ret_30m_pct", -5, -3, "the prior 30-minute return is -5% to -3%"),
-        "-3% to -2%": _range("ret_30m_pct", -3, -2, "the prior 30-minute return is -3% to -2%"),
-        "-2% to -1%": _range("ret_30m_pct", -2, -1, "the prior 30-minute return is -2% to -1%"),
-        "-1% to 0%": _range("ret_30m_pct", -1, 0, "the prior 30-minute return is -1% to 0%"),
-        "0% to +1%": _range("ret_30m_pct", 0, 1, "the prior 30-minute return is 0% to +1%"),
-        "+1% to +2%": _range("ret_30m_pct", 1, 2, "the prior 30-minute return is +1% to +2%"),
-        "+2% to +3%": _range("ret_30m_pct", 2, 3, "the prior 30-minute return is +2% to +3%"),
-        "+3% to +5%": _range("ret_30m_pct", 3, 5, "the prior 30-minute return is +3% to +5%"),
-        "≥ +5%": _range("ret_30m_pct", 5, None, "the prior 30-minute return is at least +5%"),
+        "lt_n5": _range("ret_30m_pct", None, -5, "the prior 30-minute return is below -5%"),
+        "n5_n3": _range("ret_30m_pct", -5, -3, "the prior 30-minute return is -5% to below -3%"),
+        "n3_n2": _range("ret_30m_pct", -3, -2, "the prior 30-minute return is -3% to below -2%"),
+        "n2_n1": _range("ret_30m_pct", -2, -1, "the prior 30-minute return is -2% to below -1%"),
+        "n1_0": _range("ret_30m_pct", -1, 0, "the prior 30-minute return is -1% to below 0%"),
+        "0_p1": _range("ret_30m_pct", 0, 1, "the prior 30-minute return is 0% to below +1%"),
+        "p1_p2": _range("ret_30m_pct", 1, 2, "the prior 30-minute return is +1% to below +2%"),
+        "p2_p3": _range("ret_30m_pct", 2, 3, "the prior 30-minute return is +2% to below +3%"),
+        "p3_p5": _range("ret_30m_pct", 3, 5, "the prior 30-minute return is +3% to below +5%"),
+        "ge_p5": _range("ret_30m_pct", 5, None, "the prior 30-minute return is at least +5%"),
     },
 )
 RET5 = Dimension(
     "ret5_bin",
     """CASE
-        WHEN ret_5m_pct<=-2 THEN '≤ -2%'
-        WHEN ret_5m_pct<=-1 THEN '-2% to -1%'
-        WHEN ret_5m_pct<0 THEN '-1% to 0%'
-        WHEN ret_5m_pct<1 THEN '0% to +1%'
-        WHEN ret_5m_pct<2 THEN '+1% to +2%'
-        ELSE '≥ +2%' END""",
+        WHEN ret_5m_pct IS NULL THEN NULL
+        WHEN ret_5m_pct < -2 THEN 'lt_n2'
+        WHEN ret_5m_pct < -1 THEN 'n2_n1'
+        WHEN ret_5m_pct < 0 THEN 'n1_0'
+        WHEN ret_5m_pct < 1 THEN '0_p1'
+        WHEN ret_5m_pct < 2 THEN 'p1_p2'
+        ELSE 'ge_p2' END""",
     {
-        "≤ -2%": _range("ret_5m_pct", None, -2, "the prior 5-minute return is at most -2%"),
-        "-2% to -1%": _range("ret_5m_pct", -2, -1, "the prior 5-minute return is -2% to -1%"),
-        "-1% to 0%": _range("ret_5m_pct", -1, 0, "the prior 5-minute return is -1% to 0%"),
-        "0% to +1%": _range("ret_5m_pct", 0, 1, "the prior 5-minute return is 0% to +1%"),
-        "+1% to +2%": _range("ret_5m_pct", 1, 2, "the prior 5-minute return is +1% to +2%"),
-        "≥ +2%": _range("ret_5m_pct", 2, None, "the prior 5-minute return is at least +2%"),
+        "lt_n2": _range("ret_5m_pct", None, -2, "the prior 5-minute return is below -2%"),
+        "n2_n1": _range("ret_5m_pct", -2, -1, "the prior 5-minute return is -2% to below -1%"),
+        "n1_0": _range("ret_5m_pct", -1, 0, "the prior 5-minute return is -1% to below 0%"),
+        "0_p1": _range("ret_5m_pct", 0, 1, "the prior 5-minute return is 0% to below +1%"),
+        "p1_p2": _range("ret_5m_pct", 1, 2, "the prior 5-minute return is +1% to below +2%"),
+        "ge_p2": _range("ret_5m_pct", 2, None, "the prior 5-minute return is at least +2%"),
     },
 )
 RVOL = Dimension(
     "rvol_bin",
     """CASE
-        WHEN relative_volume_20bar<1 THEN '< 1x'
-        WHEN relative_volume_20bar<1.5 THEN '1x to 1.5x'
-        WHEN relative_volume_20bar<2 THEN '1.5x to 2x'
-        WHEN relative_volume_20bar<3 THEN '2x to 3x'
-        ELSE '≥ 3x' END""",
+        WHEN relative_volume_20bar IS NULL THEN NULL
+        WHEN relative_volume_20bar < 1 THEN 'lt_1x'
+        WHEN relative_volume_20bar < 1.5 THEN 'x1_x15'
+        WHEN relative_volume_20bar < 2 THEN 'x15_x2'
+        WHEN relative_volume_20bar < 3 THEN 'x2_x3'
+        ELSE 'ge_3x' END""",
     {
-        "< 1x": _range("relative_volume_20bar", None, 1, "relative volume is below 1x"),
-        "1x to 1.5x": _range("relative_volume_20bar", 1, 1.5, "relative volume is 1x to 1.5x"),
-        "1.5x to 2x": _range("relative_volume_20bar", 1.5, 2, "relative volume is 1.5x to 2x"),
-        "2x to 3x": _range("relative_volume_20bar", 2, 3, "relative volume is 2x to 3x"),
-        "≥ 3x": _range("relative_volume_20bar", 3, None, "relative volume is at least 3x"),
+        "lt_1x": _range("relative_volume_20bar", None, 1, "relative volume is below 1x"),
+        "x1_x15": _range("relative_volume_20bar", 1, 1.5, "relative volume is 1x to below 1.5x"),
+        "x15_x2": _range("relative_volume_20bar", 1.5, 2, "relative volume is 1.5x to below 2x"),
+        "x2_x3": _range("relative_volume_20bar", 2, 3, "relative volume is 2x to below 3x"),
+        "ge_3x": _range("relative_volume_20bar", 3, None, "relative volume is at least 3x"),
     },
 )
 VWAP = Dimension(
     "vwap_bin",
     """CASE
-        WHEN distance_from_cumulative_vwap_pct<=-3 THEN '≤ -3%'
-        WHEN distance_from_cumulative_vwap_pct<=-2 THEN '-3% to -2%'
-        WHEN distance_from_cumulative_vwap_pct<=-1 THEN '-2% to -1%'
-        WHEN distance_from_cumulative_vwap_pct<0 THEN '-1% to 0%'
-        WHEN distance_from_cumulative_vwap_pct<1 THEN '0% to +1%'
-        WHEN distance_from_cumulative_vwap_pct<2 THEN '+1% to +2%'
-        WHEN distance_from_cumulative_vwap_pct<3 THEN '+2% to +3%'
-        ELSE '≥ +3%' END""",
+        WHEN distance_from_cumulative_vwap_pct IS NULL THEN NULL
+        WHEN distance_from_cumulative_vwap_pct < -3 THEN 'lt_n3'
+        WHEN distance_from_cumulative_vwap_pct < -2 THEN 'n3_n2'
+        WHEN distance_from_cumulative_vwap_pct < -1 THEN 'n2_n1'
+        WHEN distance_from_cumulative_vwap_pct < 0 THEN 'n1_0'
+        WHEN distance_from_cumulative_vwap_pct < 1 THEN '0_p1'
+        WHEN distance_from_cumulative_vwap_pct < 2 THEN 'p1_p2'
+        WHEN distance_from_cumulative_vwap_pct < 3 THEN 'p2_p3'
+        ELSE 'ge_p3' END""",
     {
-        "≤ -3%": _range("distance_from_cumulative_vwap_pct", None, -3, "price is at least 3% below cumulative VWAP"),
-        "-3% to -2%": _range("distance_from_cumulative_vwap_pct", -3, -2, "price is 2% to 3% below cumulative VWAP"),
-        "-2% to -1%": _range("distance_from_cumulative_vwap_pct", -2, -1, "price is 1% to 2% below cumulative VWAP"),
-        "-1% to 0%": _range("distance_from_cumulative_vwap_pct", -1, 0, "price is below cumulative VWAP by less than 1%"),
-        "0% to +1%": _range("distance_from_cumulative_vwap_pct", 0, 1, "price is above cumulative VWAP by less than 1%"),
-        "+1% to +2%": _range("distance_from_cumulative_vwap_pct", 1, 2, "price is 1% to 2% above cumulative VWAP"),
-        "+2% to +3%": _range("distance_from_cumulative_vwap_pct", 2, 3, "price is 2% to 3% above cumulative VWAP"),
-        "≥ +3%": _range("distance_from_cumulative_vwap_pct", 3, None, "price is at least 3% above cumulative VWAP"),
+        "lt_n3": _range("distance_from_cumulative_vwap_pct", None, -3, "price is more than 3% below cumulative VWAP"),
+        "n3_n2": _range("distance_from_cumulative_vwap_pct", -3, -2, "price is 2% to 3% below cumulative VWAP"),
+        "n2_n1": _range("distance_from_cumulative_vwap_pct", -2, -1, "price is 1% to 2% below cumulative VWAP"),
+        "n1_0": _range("distance_from_cumulative_vwap_pct", -1, 0, "price is below cumulative VWAP by less than 1%"),
+        "0_p1": _range("distance_from_cumulative_vwap_pct", 0, 1, "price is above cumulative VWAP by less than 1%"),
+        "p1_p2": _range("distance_from_cumulative_vwap_pct", 1, 2, "price is 1% to below 2% above cumulative VWAP"),
+        "p2_p3": _range("distance_from_cumulative_vwap_pct", 2, 3, "price is 2% to below 3% above cumulative VWAP"),
+        "ge_p3": _range("distance_from_cumulative_vwap_pct", 3, None, "price is at least 3% above cumulative VWAP"),
     },
 )
 RANGE_POS = Dimension(
     "range_bin",
     """CASE
-        WHEN cumulative_range_position<0.2 THEN 'Bottom 20%'
-        WHEN cumulative_range_position<0.4 THEN '20%–40%'
-        WHEN cumulative_range_position<0.6 THEN '40%–60%'
-        WHEN cumulative_range_position<0.8 THEN '60%–80%'
-        ELSE 'Top 20%' END""",
+        WHEN cumulative_range_position IS NULL THEN NULL
+        WHEN cumulative_range_position < 0.2 THEN 'bottom20'
+        WHEN cumulative_range_position < 0.4 THEN 'p20_p40'
+        WHEN cumulative_range_position < 0.6 THEN 'p40_p60'
+        WHEN cumulative_range_position < 0.8 THEN 'p60_p80'
+        ELSE 'top20' END""",
     {
-        "Bottom 20%": _range("cumulative_range_position", None, 0.2, "price is in the bottom 20% of the session range"),
-        "20%–40%": _range("cumulative_range_position", 0.2, 0.4, "price is in the 20%–40% portion of the session range"),
-        "40%–60%": _range("cumulative_range_position", 0.4, 0.6, "price is in the middle 40%–60% of the session range"),
-        "60%–80%": _range("cumulative_range_position", 0.6, 0.8, "price is in the 60%–80% portion of the session range"),
-        "Top 20%": _range("cumulative_range_position", 0.8, None, "price is in the top 20% of the session range"),
+        "bottom20": _range("cumulative_range_position", None, 0.2, "price is in the bottom 20% of the session range"),
+        "p20_p40": _range("cumulative_range_position", 0.2, 0.4, "price is in the 20% to below 40% portion of the session range"),
+        "p40_p60": _range("cumulative_range_position", 0.4, 0.6, "price is in the 40% to below 60% portion of the session range"),
+        "p60_p80": _range("cumulative_range_position", 0.6, 0.8, "price is in the 60% to below 80% portion of the session range"),
+        "top20": _range("cumulative_range_position", 0.8, None, "price is in the top 20% of the session range"),
     },
 )
 GAP = Dimension(
     "gap_bin",
     """CASE
-        WHEN gap_from_previous_regular_close_pct<=-5 THEN '≤ -5%'
-        WHEN gap_from_previous_regular_close_pct<=-3 THEN '-5% to -3%'
-        WHEN gap_from_previous_regular_close_pct<=-1 THEN '-3% to -1%'
-        WHEN gap_from_previous_regular_close_pct<0 THEN '-1% to 0%'
-        WHEN gap_from_previous_regular_close_pct<1 THEN '0% to +1%'
-        WHEN gap_from_previous_regular_close_pct<3 THEN '+1% to +3%'
-        WHEN gap_from_previous_regular_close_pct<5 THEN '+3% to +5%'
-        ELSE '≥ +5%' END""",
+        WHEN gap_from_previous_regular_close_pct IS NULL THEN NULL
+        WHEN gap_from_previous_regular_close_pct < -5 THEN 'lt_n5'
+        WHEN gap_from_previous_regular_close_pct < -3 THEN 'n5_n3'
+        WHEN gap_from_previous_regular_close_pct < -1 THEN 'n3_n1'
+        WHEN gap_from_previous_regular_close_pct < 0 THEN 'n1_0'
+        WHEN gap_from_previous_regular_close_pct < 1 THEN '0_p1'
+        WHEN gap_from_previous_regular_close_pct < 3 THEN 'p1_p3'
+        WHEN gap_from_previous_regular_close_pct < 5 THEN 'p3_p5'
+        ELSE 'ge_p5' END""",
     {
-        "≤ -5%": _range("gap_from_previous_regular_close_pct", None, -5, "the opening gap is at most -5%"),
-        "-5% to -3%": _range("gap_from_previous_regular_close_pct", -5, -3, "the opening gap is -5% to -3%"),
-        "-3% to -1%": _range("gap_from_previous_regular_close_pct", -3, -1, "the opening gap is -3% to -1%"),
-        "-1% to 0%": _range("gap_from_previous_regular_close_pct", -1, 0, "the opening gap is -1% to 0%"),
-        "0% to +1%": _range("gap_from_previous_regular_close_pct", 0, 1, "the opening gap is 0% to +1%"),
-        "+1% to +3%": _range("gap_from_previous_regular_close_pct", 1, 3, "the opening gap is +1% to +3%"),
-        "+3% to +5%": _range("gap_from_previous_regular_close_pct", 3, 5, "the opening gap is +3% to +5%"),
-        "≥ +5%": _range("gap_from_previous_regular_close_pct", 5, None, "the opening gap is at least +5%"),
+        "lt_n5": _range("gap_from_previous_regular_close_pct", None, -5, "the opening gap is below -5%"),
+        "n5_n3": _range("gap_from_previous_regular_close_pct", -5, -3, "the opening gap is -5% to below -3%"),
+        "n3_n1": _range("gap_from_previous_regular_close_pct", -3, -1, "the opening gap is -3% to below -1%"),
+        "n1_0": _range("gap_from_previous_regular_close_pct", -1, 0, "the opening gap is -1% to below 0%"),
+        "0_p1": _range("gap_from_previous_regular_close_pct", 0, 1, "the opening gap is 0% to below +1%"),
+        "p1_p3": _range("gap_from_previous_regular_close_pct", 1, 3, "the opening gap is +1% to below +3%"),
+        "p3_p5": _range("gap_from_previous_regular_close_pct", 3, 5, "the opening gap is +3% to below +5%"),
+        "ge_p5": _range("gap_from_previous_regular_close_pct", 5, None, "the opening gap is at least +5%"),
     },
 )
 PREV_DAY = Dimension(
     "prev_day_bin",
     """CASE
-        WHEN previous_day_return_pct<=-3 THEN '≤ -3%'
-        WHEN previous_day_return_pct<=-1 THEN '-3% to -1%'
-        WHEN previous_day_return_pct<0 THEN '-1% to 0%'
-        WHEN previous_day_return_pct<1 THEN '0% to +1%'
-        WHEN previous_day_return_pct<3 THEN '+1% to +3%'
-        ELSE '≥ +3%' END""",
+        WHEN previous_day_return_pct IS NULL THEN NULL
+        WHEN previous_day_return_pct < -3 THEN 'lt_n3'
+        WHEN previous_day_return_pct < -1 THEN 'n3_n1'
+        WHEN previous_day_return_pct < 0 THEN 'n1_0'
+        WHEN previous_day_return_pct < 1 THEN '0_p1'
+        WHEN previous_day_return_pct < 3 THEN 'p1_p3'
+        ELSE 'ge_p3' END""",
     {
-        "≤ -3%": _range("previous_day_return_pct", None, -3, "the previous day returned at most -3%"),
-        "-3% to -1%": _range("previous_day_return_pct", -3, -1, "the previous day returned -3% to -1%"),
-        "-1% to 0%": _range("previous_day_return_pct", -1, 0, "the previous day returned -1% to 0%"),
-        "0% to +1%": _range("previous_day_return_pct", 0, 1, "the previous day returned 0% to +1%"),
-        "+1% to +3%": _range("previous_day_return_pct", 1, 3, "the previous day returned +1% to +3%"),
-        "≥ +3%": _range("previous_day_return_pct", 3, None, "the previous day returned at least +3%"),
+        "lt_n3": _range("previous_day_return_pct", None, -3, "the previous day returned below -3%"),
+        "n3_n1": _range("previous_day_return_pct", -3, -1, "the previous day returned -3% to below -1%"),
+        "n1_0": _range("previous_day_return_pct", -1, 0, "the previous day returned -1% to below 0%"),
+        "0_p1": _range("previous_day_return_pct", 0, 1, "the previous day returned 0% to below +1%"),
+        "p1_p3": _range("previous_day_return_pct", 1, 3, "the previous day returned +1% to below +3%"),
+        "ge_p3": _range("previous_day_return_pct", 3, None, "the previous day returned at least +3%"),
     },
 )
 
 FAMILIES: dict[str, dict[str, Any]] = {
-    "time_of_day": {"dimensions": [TIME, WEEKDAY], "filter": "minute_of_day BETWEEN 570 AND 959"},
+    "time_of_day": {"dimensions": [TIME, WEEKDAY], "filter": "minute_of_day>=570 AND minute_of_day<960 AND weekday_iso BETWEEN 1 AND 5"},
     "oversold_reversal": {"dimensions": [TIME, RET30, VWAP, RVOL], "filter": "ret_30m_pct<0 AND distance_from_cumulative_vwap_pct<0 AND relative_volume_20bar IS NOT NULL"},
     "momentum_continuation": {"dimensions": [TIME, RET30, RANGE_POS, RVOL], "filter": "ret_30m_pct>0 AND cumulative_range_position>=0.5 AND relative_volume_20bar IS NOT NULL"},
-    "vwap_reversion": {"dimensions": [TIME, VWAP, RANGE_POS, RVOL], "filter": "abs(distance_from_cumulative_vwap_pct)>=1 AND relative_volume_20bar IS NOT NULL"},
+    "vwap_reversion": {"dimensions": [TIME, VWAP, RANGE_POS, RVOL], "filter": "abs(distance_from_cumulative_vwap_pct)>=1 AND cumulative_range_position IS NOT NULL AND relative_volume_20bar IS NOT NULL"},
     "gap_behavior": {"dimensions": [TIME, GAP, PREV_DAY], "filter": "abs(gap_from_previous_regular_close_pct)>=1 AND previous_day_return_pct IS NOT NULL"},
     "volume_shock": {"dimensions": [TIME, RVOL, RET5], "filter": "relative_volume_20bar>=1.5 AND ret_5m_pct IS NOT NULL"},
 }
@@ -219,7 +255,6 @@ ALLOWED_CONDITION_COLUMNS = {
     "previous_day_return_pct",
 }
 
-
 def _period_group_query(
     dimensions: list[Dimension],
     family_filter: str,
@@ -227,74 +262,108 @@ def _period_group_query(
     direction: str,
     entry_stride_minutes: int = 1,
     entry_anchor_minute: int = 0,
+    cost_pct: float = 0.0,
 ) -> str:
-    aliases = [d.name for d in dimensions]
-    select_dims = ",\n                ".join(f"{d.expression} AS {d.name}" for d in dimensions)
+    if horizon not in {5, 15, 30, 60}:
+        raise ValueError(f"Unsupported holding horizon: {horizon}")
+    if direction not in {"long", "short"}:
+        raise ValueError(f"Unsupported direction: {direction}")
+    if entry_stride_minutes < 1:
+        raise ValueError("Entry stride must be at least one minute")
+
+    aliases = [dimension.name for dimension in dimensions]
+    select_dims = ",\n                ".join(
+        f"{dimension.expression} AS {dimension.name}" for dimension in dimensions
+    )
     group_dims = ",".join(aliases)
-    join_dims = " AND ".join(f"x.{name} IS NOT DISTINCT FROM g.{name}" for name in aliases)
-    outcome = f"fwd_return_{horizon}m_pct" if direction == "long" else f"-fwd_return_{horizon}m_pct"
+    non_null_dimensions = " AND ".join(f"{name} IS NOT NULL" for name in aliases)
+    join_symbol = " AND ".join(f"s.{name}=g.{name}" for name in aliases)
+    join_date = " AND ".join(f"d.{name}=g.{name}" for name in aliases)
+    outcome_column = f"fwd_return_{horizon}m_pct"
+    outcome = outcome_column if direction == "long" else f"-{outcome_column}"
     sampling_filter = "TRUE"
     if entry_stride_minutes > 1:
-        # Non-overlapping entries prevent the same future price path from being
-        # counted once per minute for a multi-minute holding horizon.
         sampling_filter = (
             f"mod(minute_of_day - {int(entry_anchor_minute)}, "
             f"{int(entry_stride_minutes)}) = 0"
         )
-    return f"""
-        WITH base AS MATERIALIZED (
-            SELECT symbol,trade_date,{select_dims},({outcome})::double precision AS outcome
+
+    query = f"""
+        WITH categorised AS MATERIALIZED (
+            SELECT symbol,trade_date,{select_dims},
+                ({outcome})::double precision AS outcome_gross,
+                (({outcome}) - %s::double precision)::double precision AS outcome
             FROM ra_intraday_features
             WHERE feature_set_id=%s
               AND bar_ts >= (%s::date::timestamp AT TIME ZONE 'America/New_York')
               AND bar_ts < (((%s::date + 1)::timestamp) AT TIME ZONE 'America/New_York')
               AND trade_date BETWEEN %s AND %s
-              AND fwd_return_{horizon}m_pct IS NOT NULL
+              AND {outcome_column} IS NOT NULL
               AND ({sampling_filter})
               AND ({family_filter})
+        ), base AS MATERIALIZED (
+            SELECT * FROM categorised WHERE {non_null_dimensions}
         ), grouped AS (
             SELECT {group_dims},count(*)::bigint AS observations,
                 count(DISTINCT symbol)::integer AS symbols,
                 count(DISTINCT trade_date)::integer AS dates,
-                avg(outcome)::double precision AS gross_avg_pct,
+                avg(outcome_gross)::double precision AS gross_avg_pct,
                 percentile_cont(0.5) WITHIN GROUP (ORDER BY outcome)::double precision AS median_pct,
                 avg((outcome>0)::integer)::double precision*100 AS win_rate_pct,
-                CASE WHEN stddev_samp(outcome)>0 THEN avg(outcome)/stddev_samp(outcome)*sqrt(count(*)) END::double precision AS t_stat,
+                CASE WHEN stddev_samp(outcome)>0
+                     THEN avg(outcome)/stddev_samp(outcome)*sqrt(count(*)) END::double precision AS t_stat,
                 CASE WHEN abs(sum(outcome) FILTER (WHERE outcome<0))>0
-                     THEN sum(outcome) FILTER (WHERE outcome>0)/abs(sum(outcome) FILTER (WHERE outcome<0)) END::double precision AS profit_factor,
+                     THEN sum(outcome) FILTER (WHERE outcome>0)
+                          /abs(sum(outcome) FILTER (WHERE outcome<0)) END::double precision AS profit_factor,
                 percentile_cont(0.05) WITHIN GROUP (ORDER BY outcome)::double precision AS p05_pct,
                 min(outcome)::double precision AS worst_pct
             FROM base GROUP BY {group_dims}
         ), symbol_counts AS (
-            SELECT {group_dims},symbol,count(*)::bigint AS n FROM base GROUP BY {group_dims},symbol
+            SELECT {group_dims},symbol,count(*)::bigint AS n
+            FROM base GROUP BY {group_dims},symbol
         ), symbol_max AS (
-            SELECT {group_dims},max(n)::bigint AS max_symbol_n FROM symbol_counts GROUP BY {group_dims}
+            SELECT {group_dims},max(n)::bigint AS max_symbol_n
+            FROM symbol_counts GROUP BY {group_dims}
         ), date_counts AS (
-            SELECT {group_dims},trade_date,count(*)::bigint AS n FROM base GROUP BY {group_dims},trade_date
+            SELECT {group_dims},trade_date,count(*)::bigint AS n
+            FROM base GROUP BY {group_dims},trade_date
         ), date_max AS (
-            SELECT {group_dims},max(n)::bigint AS max_date_n FROM date_counts GROUP BY {group_dims}
+            SELECT {group_dims},max(n)::bigint AS max_date_n
+            FROM date_counts GROUP BY {group_dims}
         )
         SELECT g.*,100.0*s.max_symbol_n/NULLIF(g.observations,0) AS max_symbol_share_pct,
             100.0*d.max_date_n/NULLIF(g.observations,0) AS max_date_share_pct
         FROM grouped g
-        JOIN symbol_max s ON {join_dims.replace('x.', 's.')}
-        JOIN date_max d ON {join_dims.replace('x.', 'd.')}
+        JOIN symbol_max s ON {join_symbol}
+        JOIN date_max d ON {join_date}
     """
-
+    validate_sql_bindings(
+        query,
+        (float(cost_pct), "feature-set", date.today(), date.today(), date.today(), date.today()),
+        name="period group query",
+    )
+    return query
 
 def _conditions(dimensions: list[Dimension], row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
     conditions: list[dict[str, Any]] = []
     descriptions: list[str] = []
     for dim in dimensions:
-        label = row[dim.name]
+        label = row.get(dim.name)
+        if label is None or label not in dim.labels:
+            return [], []
         condition, description = dim.labels[label]
-        if condition["column"] in ALLOWED_CONDITION_COLUMNS and not (condition["operator"] == "range" and condition.get("low") is None and condition.get("high") is None):
-            conditions.append(condition)
-            descriptions.append(description)
+        if condition["column"] not in ALLOWED_CONDITION_COLUMNS:
+            raise ValueError(f"Unsupported generated condition column: {condition['column']}")
+        if condition["operator"] == "range" and condition.get("low") is None and condition.get("high") is None:
+            raise ValueError(f"Dimension {dim.name} generated an unconstrained range")
+        conditions.append(dict(condition))
+        descriptions.append(description)
     return conditions, descriptions
 
 
 def _plain_rule(direction: str, descriptions: list[str], horizon: int) -> str:
+    if not descriptions:
+        raise ValueError("A rule requires at least one condition description")
     verb = "Buy" if direction == "long" else "Short"
     joined = ", ".join(descriptions[:-1]) + (f" and {descriptions[-1]}" if len(descriptions) > 1 else descriptions[0])
     return f"{verb} when {joined}; exit after {horizon} minutes."
@@ -342,13 +411,16 @@ def _run_group_query(
     direction: str,
     entry_stride_minutes: int,
     entry_anchor_minute: int,
+    cost_pct: float,
 ) -> tuple[list[Dimension], list[dict[str, Any]]]:
     spec = FAMILIES[family]
     dimensions: list[Dimension] = spec["dimensions"]
     query = _period_group_query(
         dimensions, spec["filter"], horizon, direction,
-        entry_stride_minutes, entry_anchor_minute,
+        entry_stride_minutes, entry_anchor_minute, cost_pct,
     )
+    params = (float(cost_pct), feature_set_id, start, end, start, end)
+    validate_sql_bindings(query, params, name=f"{family}/{direction}/{horizon}m discovery query")
     settings = get_settings()
     statement_timeout = max(30, int(settings.discovery_statement_timeout_seconds))
     wall_timeout = max(statement_timeout + 5, int(settings.discovery_wall_timeout_seconds))
@@ -417,10 +489,7 @@ def _run_group_query(
                 cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}s'")
                 cur.execute("SET LOCAL lock_timeout = '60s'")
                 cur.execute("SET LOCAL jit = off")
-                cur.execute(
-                    query,
-                    (feature_set_id, start, end, start, end),
-                )
+                cur.execute(query, params)
                 rows = cur.fetchall()
             conn.rollback()
         except Exception as exc:
@@ -456,13 +525,14 @@ def _run_group_query_with_retries(
     entry_stride_minutes: int,
     entry_anchor_minute: int,
     period_label: str,
+    cost_pct: float,
 ) -> tuple[list[Dimension], list[dict[str, Any]]]:
     attempts = max(1, int(get_settings().discovery_query_retries))
     for attempt in range(1, attempts + 1):
         try:
             return _run_group_query(
                 job_id, task_id, feature_set_id, start, end, family, horizon,
-                direction, entry_stride_minutes, entry_anchor_minute,
+                direction, entry_stride_minutes, entry_anchor_minute, cost_pct,
             )
         except JobInterrupted:
             raise
@@ -511,15 +581,26 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
     feature_config = dict(feature_set.get("config") or {})
     base_minutes = timeframe_minutes(str(feature_config.get("timeframe") or "1Min"))
     session_name = str(feature_config.get("session") or "regular")
-    entry_anchor_minute = {
-        "regular": 570,
-        "premarket": 240,
-        "postmarket": 960,
-        "overnight": 0,
-        "all": 0,
-    }.get(session_name, 0)
+    if session_name != "regular":
+        raise ValueError(
+            "The audited interpretable rule families are calibrated for regular-session features. "
+            f"Selected feature session: {session_name}. Build a regular-session feature set first."
+        )
+    available_outcomes = {int(value) for value in feature_config.get("outcome_horizons_minutes", [])}
+    missing_outcomes = sorted(set(map(int, config.holding_horizons_minutes)) - available_outcomes)
+    if missing_outcomes:
+        raise ValueError(
+            f"The feature set does not contain forward outcomes for: {missing_outcomes}. "
+            f"Available horizons: {sorted(available_outcomes)}"
+        )
+    entry_anchor_minute = 570
     run_config = config.model_dump(mode="json")
-    run_config["engine_version"] = DISCOVERY_VERSION
+    run_config.update({
+        "engine_version": DISCOVERY_VERSION,
+        "rule_definition_version": RULE_DEFINITION_VERSION,
+        "base_timeframe_minutes": base_minutes,
+        "entry_anchor_minute": entry_anchor_minute,
+    })
 
     combinations = [
         (family, direction, int(horizon))
@@ -578,7 +659,7 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
         add_event(
             job_id,
             "discovery_engine_upgraded",
-            "Discovery tasks were reset so every result uses the v1.0.7 non-overlapping entry methodology.",
+            "Discovery tasks were reset so every result uses the audited v1.1.0 rule definitions and sampling methodology.",
             level="warning",
             details={"engine_version": DISCOVERY_VERSION},
         )
@@ -618,7 +699,7 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
                 config.discovery_start, config.discovery_end,
                 family, horizon, direction,
                 entry_stride * base_minutes, entry_anchor_minute,
-                "discovery-period",
+                "discovery-period", cost_pct,
             )
             validation_map: dict[tuple[Any, ...], dict[str, Any]] = {}
             if config.validation_start and config.validation_end:
@@ -633,7 +714,7 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
                     config.validation_start, config.validation_end,
                     family, horizon, direction,
                     entry_stride * base_minutes, entry_anchor_minute,
-                    "validation-period",
+                    "validation-period", cost_pct,
                 )
                 validation_map = {tuple(row[d.name] for d in dimensions): row for row in validation_rows}
 
@@ -668,6 +749,7 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
                             """
                             INSERT INTO ra_candidate_rules(
                                 discovery_run_id,feature_set_id,family,direction,holding_horizon_minutes,
+                                entry_sampling_mode,entry_stride_minutes,entry_anchor_minute,rule_definition_version,
                                 conditions,plain_english_rule,rank_score,
                                 discovery_observations,discovery_symbols,discovery_dates,
                                 discovery_gross_avg_pct,discovery_net_avg_pct,discovery_median_pct,
@@ -680,13 +762,15 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
                                 validation_p05_pct,validation_worst_pct,validation_max_symbol_share_pct,
                                 validation_max_date_share_pct
                             ) VALUES (
-                                %s,%s,%s,%s,%s,%s,%s,%s,
+                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
                             )
                             """,
                             (
                                 run_id, config.feature_set_id, family, direction, horizon,
+                                config.entry_sampling_mode, entry_stride * base_minutes,
+                                entry_anchor_minute, RULE_DEFINITION_VERSION,
                                 Jsonb(conditions), plain, score,
                                 ds["observations"], ds["symbols"], ds["dates"], ds["gross_avg_pct"], ds["net_avg_pct"],
                                 ds["median_pct"], ds["win_rate_pct"], ds["t_stat"], ds["profit_factor"], ds["p05_pct"],
@@ -764,49 +848,111 @@ def _condition_sql(conditions: list[dict[str, Any]]) -> tuple[str, list[Any]]:
             params.append(condition.get("value"))
         elif operator == "range":
             low, high = condition.get("low"), condition.get("high")
+            if low is None and high is None:
+                raise ValueError(f"Unbounded condition is not permitted for {column}")
             if low is not None:
-                clauses.append(f"{column}>=%s")
+                low_operator = ">=" if condition.get("low_inclusive", True) else ">"
+                clauses.append(f"{column}{low_operator}%s")
                 params.append(low)
             if high is not None:
-                clauses.append(f"{column}<%s")
+                high_operator = "<=" if condition.get("high_inclusive", False) else "<"
+                clauses.append(f"{column}{high_operator}%s")
                 params.append(high)
         else:
             raise ValueError(f"Unsupported condition operator: {operator}")
-    return " AND ".join(clauses) if clauses else "TRUE", params
+    query = " AND ".join(clauses) if clauses else "TRUE"
+    validate_sql_bindings(query, params, name="candidate condition SQL")
+    return query, params
 
 
-def _exact_stats(feature_set_id: str, conditions: list[dict[str, Any]], direction: str, horizon: int, start: date, end: date, cost_pct: float) -> dict[str, Any]:
+def _exact_stats_query(
+    conditions: list[dict[str, Any]],
+    direction: str,
+    horizon: int,
+    *,
+    entry_stride_minutes: int,
+    entry_anchor_minute: int,
+    cost_pct: float = 0.0,
+) -> tuple[str, list[Any]]:
     where, condition_params = _condition_sql(conditions)
-    outcome = f"fwd_return_{horizon}m_pct" if direction == "long" else f"-fwd_return_{horizon}m_pct"
+    if direction not in {"long", "short"}:
+        raise ValueError(f"Unsupported direction: {direction}")
+    if horizon not in {5, 15, 30, 60}:
+        raise ValueError(f"Unsupported holding horizon: {horizon}")
+    outcome_column = f"fwd_return_{horizon}m_pct"
+    outcome = outcome_column if direction == "long" else f"-{outcome_column}"
+    sampling_filter = "TRUE"
+    if entry_stride_minutes > 1:
+        sampling_filter = f"mod(minute_of_day - {int(entry_anchor_minute)}, {int(entry_stride_minutes)}) = 0"
     query = f"""
-        WITH base AS (
-            SELECT symbol,trade_date,({outcome})::double precision AS outcome
+        WITH base AS MATERIALIZED (
+            SELECT symbol,trade_date,
+                ({outcome})::double precision AS outcome_gross,
+                (({outcome}) - %s::double precision)::double precision AS outcome
             FROM ra_intraday_features
-            WHERE feature_set_id=%s AND trade_date BETWEEN %s AND %s
-              AND fwd_return_{horizon}m_pct IS NOT NULL AND ({where})
+            WHERE feature_set_id=%s
+              AND bar_ts >= (%s::date::timestamp AT TIME ZONE 'America/New_York')
+              AND bar_ts < (((%s::date + 1)::timestamp) AT TIME ZONE 'America/New_York')
+              AND trade_date BETWEEN %s AND %s
+              AND {outcome_column} IS NOT NULL
+              AND ({sampling_filter})
+              AND ({where})
         ), totals AS (
             SELECT count(*)::bigint AS observations,count(DISTINCT symbol)::integer AS symbols,
-                count(DISTINCT trade_date)::integer AS dates,avg(outcome)::double precision AS gross_avg_pct,
+                count(DISTINCT trade_date)::integer AS dates,avg(outcome_gross)::double precision AS gross_avg_pct,
                 percentile_cont(0.5) WITHIN GROUP (ORDER BY outcome)::double precision AS median_pct,
                 avg((outcome>0)::integer)::double precision*100 AS win_rate_pct,
-                CASE WHEN stddev_samp(outcome)>0 THEN avg(outcome)/stddev_samp(outcome)*sqrt(count(*)) END::double precision AS t_stat,
+                CASE WHEN stddev_samp(outcome)>0
+                     THEN avg(outcome)/stddev_samp(outcome)*sqrt(count(*)) END::double precision AS t_stat,
                 CASE WHEN abs(sum(outcome) FILTER (WHERE outcome<0))>0
-                     THEN sum(outcome) FILTER (WHERE outcome>0)/abs(sum(outcome) FILTER (WHERE outcome<0)) END::double precision AS profit_factor,
-                percentile_cont(0.05) WITHIN GROUP (ORDER BY outcome)::double precision AS p05_pct,min(outcome)::double precision AS worst_pct
+                     THEN sum(outcome) FILTER (WHERE outcome>0)
+                          /abs(sum(outcome) FILTER (WHERE outcome<0)) END::double precision AS profit_factor,
+                percentile_cont(0.05) WITHIN GROUP (ORDER BY outcome)::double precision AS p05_pct,
+                min(outcome)::double precision AS worst_pct
             FROM base
-        ), sym AS (SELECT max(n) AS max_n FROM (SELECT symbol,count(*) n FROM base GROUP BY symbol)x),
-             dat AS (SELECT max(n) AS max_n FROM (SELECT trade_date,count(*) n FROM base GROUP BY trade_date)x)
+        ), sym AS (
+            SELECT max(n) AS max_n FROM (SELECT symbol,count(*) n FROM base GROUP BY symbol) x
+        ), dat AS (
+            SELECT max(n) AS max_n FROM (SELECT trade_date,count(*) n FROM base GROUP BY trade_date) x
+        )
         SELECT t.*,100.0*sym.max_n/NULLIF(t.observations,0) AS max_symbol_share_pct,
             100.0*dat.max_n/NULLIF(t.observations,0) AS max_date_share_pct
         FROM totals t CROSS JOIN sym CROSS JOIN dat
     """
+    return query, condition_params
+
+
+def _exact_stats(
+    feature_set_id: str,
+    conditions: list[dict[str, Any]],
+    direction: str,
+    horizon: int,
+    start: date,
+    end: date,
+    cost_pct: float,
+    *,
+    entry_stride_minutes: int,
+    entry_anchor_minute: int,
+) -> dict[str, Any]:
+    query, condition_params = _exact_stats_query(
+        conditions,
+        direction,
+        horizon,
+        entry_stride_minutes=entry_stride_minutes,
+        entry_anchor_minute=entry_anchor_minute,
+        cost_pct=cost_pct,
+    )
+    params = (float(cost_pct), feature_set_id, start, end, start, end, *condition_params)
+    validate_sql_bindings(query, params, name="sealed exact-statistics query")
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SET LOCAL statement_timeout = '{int(get_settings().database_statement_timeout_seconds)}s'")
-            cur.execute(query, (feature_set_id, start, end, *condition_params))
+            cur.execute(f"SET LOCAL statement_timeout = '{int(get_settings().discovery_statement_timeout_seconds)}s'")
+            cur.execute("SET LOCAL jit = off")
+            cur.execute(query, params)
             row = cur.fetchone()
         conn.rollback()
     return _normalise_stats(dict(row), cost_pct)
+
 
 
 def run_sealed_evaluation(job_id: str, config: SealedEvaluationConfig) -> dict[str, Any]:
@@ -838,9 +984,17 @@ def run_sealed_evaluation(job_id: str, config: SealedEvaluationConfig) -> dict[s
         )
     cost_pct = float(discovery_config["round_trip_cost_bps"]) / 100.0
     set_progress(job_id, "evaluating sealed period", 0, 1)
+    candidate_rule_version = str(candidate.get("rule_definition_version") or "legacy")
+    if candidate_rule_version != RULE_DEFINITION_VERSION:
+        raise ValueError(
+            "This candidate was generated by an older rule definition and cannot be sealed under "
+            f"{RULE_DEFINITION_VERSION}. Rerun discovery with the audited engine first."
+        )
     stats = _exact_stats(
         str(candidate["feature_set_id"]), candidate["conditions"], candidate["direction"],
         int(candidate["holding_horizon_minutes"]), config.sealed_start, config.sealed_end, cost_pct,
+        entry_stride_minutes=int(candidate.get("entry_stride_minutes") or 1),
+        entry_anchor_minute=int(candidate.get("entry_anchor_minute") or 570),
     )
     with connection() as conn:
         with conn.cursor() as cur:

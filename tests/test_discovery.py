@@ -26,7 +26,7 @@ def test_plain_rule_is_readable():
 
 
 def test_time_dimension_has_condition_mapping():
-    condition, description = TIME.labels["14:30–15:30 ET"]
+    condition, description = TIME.labels["t1430_1530"]
     assert condition["column"] == "minute_of_day"
     assert "14:30" in description
 

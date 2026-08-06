@@ -6,6 +6,8 @@ def test_startup_schema_uses_version_marker_and_compatibility_short_circuit():
     assert "ra_schema_versions" in source
     assert "_schema_is_compatible" in source
     assert "startup DDL skipped" in source
+    assert "already_applied and _schema_is_compatible(cur)" in source
+    assert "recorded but compatibility checks failed" in source
     assert "pg_advisory_xact_lock" in source
 
 

@@ -1,5 +1,25 @@
 # Release notes
 
+## 1.1.0 — Fully audited SQL and analytical-consistency release
+
+- Withdraws v1.0.7 candidate results and versions the new rule definition as `2026-08-audited-v1`.
+- Replaces human bucket labels inside SQL with machine-safe category codes, eliminating literal-percent Psycopg failures.
+- Validates Psycopg placeholder grammar and exact parameter counts for every generated query.
+- Adds 194-query local preflight coverage across all families, directions, horizons, sampling modes, exact statistics, feature generation and universe generation.
+- Adds PostgreSQL `EXPLAIN` preflight; discovery and sealed jobs are blocked when deployed SQL cannot be planned.
+- Adds PostgreSQL 16 synthetic end-to-end CI: schema, universe, feature set, discovery, candidate metadata and sealed evaluation.
+- Makes numeric bucket boundaries explicit, contiguous and identical in discovery, validation and sealed testing.
+- Handles missing predictor values explicitly rather than assigning them to terminal buckets.
+- Freezes sampling mode, stride, anchor and rule-definition version on each candidate.
+- Applies round-trip costs consistently before median, win rate, t-statistic, profit factor, lower tail and worst-return metrics.
+- Rejects legacy candidates during sealed evaluation.
+- Requires regular-session features and verifies that every requested forward horizon exists.
+- Adds timestamp-prunable bounds to universe and quality paths and validates the exact feature/universe production queries.
+- Adds dependency-safe dashboard deletion.
+- Adds minimal schema migration rather than replaying full DDL on an existing compatible database.
+
+Existing completed feature data remains usable. Existing discovery runs reset and rerun on retry so audited and legacy results cannot mix.
+
 ## 1.0.7 — Non-overlapping and watchdog-protected discovery
 
 - Samples discovery entries at the holding-period cadence by default: every 5, 15, 30 or 60 minutes rather than every one-minute bar.
