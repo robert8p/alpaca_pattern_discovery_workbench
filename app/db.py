@@ -15,7 +15,7 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
-SCHEMA_VERSION = "1.0.6"
+SCHEMA_VERSION = "1.0.7"
 SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
@@ -142,11 +142,11 @@ def database_diagnostics() -> dict[str, Any]:
 
 
 def _schema_is_compatible(cur: Any) -> bool:
-    """Return True when the installed v1 schema already has every object v1.0.6 needs.
+    """Return True when the installed v1 schema already has every object v1.0.7 needs.
 
     Earlier releases reran the entire idempotent schema on every web and worker
     start. During a rolling deploy that DDL could overlap an active feature
-    transaction and deadlock with its foreign-key/partition locks. v1.0.6
+    transaction and deadlock with its foreign-key/partition locks. v1.0.7
     records schema state and skips table/index/trigger DDL when no migration is
     required.
     """
@@ -195,7 +195,7 @@ def execute_schema() -> None:
                     return
 
                 if _schema_is_compatible(cur):
-                    # v1.0.6 changes transaction orchestration only; the v1.0.5
+                    # v1.0.7 changes discovery execution only; the v1.0.5
                     # database objects are already fully compatible. Mark them
                     # without touching active analysis tables.
                     cur.execute(

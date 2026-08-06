@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import random
+import threading
+import time as clock
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -9,9 +12,16 @@ from psycopg.types.json import Jsonb
 
 from app.config import get_settings
 from app.db import connection
-from app.jobs import add_event, check_control, set_progress
-from app.models import DiscoveryConfig, SealedEvaluationConfig
+from app.jobs import JobInterrupted, add_event, check_control, set_progress
+from app.models import DiscoveryConfig, SealedEvaluationConfig, timeframe_minutes
 from app.utils import finite_or_none, json_safe
+
+
+DISCOVERY_VERSION = "1.0.7"
+
+
+class DiscoveryQueryTimeout(RuntimeError):
+    """Raised when one grouped discovery query exceeds its wall-clock deadline."""
 
 
 @dataclass(frozen=True)
@@ -210,18 +220,38 @@ ALLOWED_CONDITION_COLUMNS = {
 }
 
 
-def _period_group_query(dimensions: list[Dimension], family_filter: str, horizon: int, direction: str) -> str:
+def _period_group_query(
+    dimensions: list[Dimension],
+    family_filter: str,
+    horizon: int,
+    direction: str,
+    entry_stride_minutes: int = 1,
+    entry_anchor_minute: int = 0,
+) -> str:
     aliases = [d.name for d in dimensions]
     select_dims = ",\n                ".join(f"{d.expression} AS {d.name}" for d in dimensions)
     group_dims = ",".join(aliases)
     join_dims = " AND ".join(f"x.{name} IS NOT DISTINCT FROM g.{name}" for name in aliases)
     outcome = f"fwd_return_{horizon}m_pct" if direction == "long" else f"-fwd_return_{horizon}m_pct"
+    sampling_filter = "TRUE"
+    if entry_stride_minutes > 1:
+        # Non-overlapping entries prevent the same future price path from being
+        # counted once per minute for a multi-minute holding horizon.
+        sampling_filter = (
+            f"mod(minute_of_day - {int(entry_anchor_minute)}, "
+            f"{int(entry_stride_minutes)}) = 0"
+        )
     return f"""
-        WITH base AS (
+        WITH base AS MATERIALIZED (
             SELECT symbol,trade_date,{select_dims},({outcome})::double precision AS outcome
             FROM ra_intraday_features
-            WHERE feature_set_id=%s AND trade_date BETWEEN %s AND %s
-              AND fwd_return_{horizon}m_pct IS NOT NULL AND ({family_filter})
+            WHERE feature_set_id=%s
+              AND bar_ts >= (%s::date::timestamp AT TIME ZONE 'America/New_York')
+              AND bar_ts < (((%s::date + 1)::timestamp) AT TIME ZONE 'America/New_York')
+              AND trade_date BETWEEN %s AND %s
+              AND fwd_return_{horizon}m_pct IS NOT NULL
+              AND ({sampling_filter})
+              AND ({family_filter})
         ), grouped AS (
             SELECT {group_dims},count(*)::bigint AS observations,
                 count(DISTINCT symbol)::integer AS symbols,
@@ -301,23 +331,170 @@ def _normalise_stats(row: dict[str, Any] | None, cost_pct: float) -> dict[str, A
     }
 
 
-def _run_group_query(feature_set_id: str, start: date, end: date, family: str, horizon: int, direction: str) -> tuple[list[Dimension], list[dict[str, Any]]]:
+def _run_group_query(
+    job_id: str,
+    task_id: int,
+    feature_set_id: str,
+    start: date,
+    end: date,
+    family: str,
+    horizon: int,
+    direction: str,
+    entry_stride_minutes: int,
+    entry_anchor_minute: int,
+) -> tuple[list[Dimension], list[dict[str, Any]]]:
     spec = FAMILIES[family]
     dimensions: list[Dimension] = spec["dimensions"]
-    query = _period_group_query(dimensions, spec["filter"], horizon, direction)
+    query = _period_group_query(
+        dimensions, spec["filter"], horizon, direction,
+        entry_stride_minutes, entry_anchor_minute,
+    )
+    settings = get_settings()
+    statement_timeout = max(30, int(settings.discovery_statement_timeout_seconds))
+    wall_timeout = max(statement_timeout + 5, int(settings.discovery_wall_timeout_seconds))
+    cancel_grace = max(3, int(settings.discovery_cancel_grace_seconds))
+
     with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"SET LOCAL statement_timeout = '{int(get_settings().database_statement_timeout_seconds)}s'")
-            cur.execute(query, (feature_set_id, start, end))
-            rows = cur.fetchall()
-        conn.rollback()
+        with conn.cursor() as pid_cur:
+            pid_cur.execute("SELECT pg_backend_pid() AS pid")
+            backend_pid = int(pid_cur.fetchone()["pid"])
+
+        stop_monitor = threading.Event()
+        interrupted: dict[str, str | None] = {"action": None}
+        started_monotonic = clock.monotonic()
+
+        def cancel_or_terminate(action: str) -> None:
+            if interrupted["action"] is not None:
+                return
+            interrupted["action"] = action
+            try:
+                conn.cancel()
+            except Exception:
+                pass
+            if not stop_monitor.wait(cancel_grace):
+                try:
+                    with connection() as kill_conn:
+                        with kill_conn.cursor() as kill_cur:
+                            kill_cur.execute("SELECT pg_terminate_backend(%s)", (backend_pid,))
+                        kill_conn.commit()
+                except Exception:
+                    pass
+
+        def monitor_control() -> None:
+            while not stop_monitor.wait(2.0):
+                elapsed = clock.monotonic() - started_monotonic
+                try:
+                    with connection() as control_conn:
+                        with control_conn.cursor() as control_cur:
+                            control_cur.execute(
+                                "UPDATE ra_jobs SET heartbeat_at=now() WHERE id=%s RETURNING status",
+                                (job_id,),
+                            )
+                            row = control_cur.fetchone()
+                            control_cur.execute(
+                                "UPDATE ra_discovery_tasks SET updated_at=now() WHERE id=%s AND status='running'",
+                                (task_id,),
+                            )
+                        control_conn.commit()
+                    status = row["status"] if row else "cancel_requested"
+                    if status in {"pause_requested", "cancel_requested"}:
+                        cancel_or_terminate("pause" if status == "pause_requested" else "cancel")
+                        return
+                except Exception:
+                    pass
+                if elapsed >= wall_timeout:
+                    cancel_or_terminate("timeout")
+                    return
+
+        monitor = threading.Thread(
+            target=monitor_control,
+            name=f"discovery-control-{task_id}",
+            daemon=True,
+        )
+        monitor.start()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}s'")
+                cur.execute("SET LOCAL lock_timeout = '60s'")
+                cur.execute("SET LOCAL jit = off")
+                cur.execute(
+                    query,
+                    (feature_set_id, start, end, start, end),
+                )
+                rows = cur.fetchall()
+            conn.rollback()
+        except Exception as exc:
+            conn.rollback()
+            if interrupted["action"] in {"pause", "cancel"}:
+                raise JobInterrupted(interrupted["action"]) from exc
+            if interrupted["action"] == "timeout":
+                raise DiscoveryQueryTimeout(
+                    f"Discovery query exceeded the {wall_timeout}-second wall-clock limit"
+                ) from exc
+            raise
+        finally:
+            stop_monitor.set()
+            monitor.join(timeout=3.0)
     return dimensions, [dict(row) for row in rows]
+
+def _is_discovery_timeout(exc: Exception) -> bool:
+    if isinstance(exc, DiscoveryQueryTimeout):
+        return True
+    message = str(exc).lower()
+    return "statement timeout" in message or "wall-clock limit" in message
+
+
+def _run_group_query_with_retries(
+    job_id: str,
+    task_id: int,
+    feature_set_id: str,
+    start: date,
+    end: date,
+    family: str,
+    horizon: int,
+    direction: str,
+    entry_stride_minutes: int,
+    entry_anchor_minute: int,
+    period_label: str,
+) -> tuple[list[Dimension], list[dict[str, Any]]]:
+    attempts = max(1, int(get_settings().discovery_query_retries))
+    for attempt in range(1, attempts + 1):
+        try:
+            return _run_group_query(
+                job_id, task_id, feature_set_id, start, end, family, horizon,
+                direction, entry_stride_minutes, entry_anchor_minute,
+            )
+        except JobInterrupted:
+            raise
+        except Exception as exc:
+            if not _is_discovery_timeout(exc) or attempt >= attempts:
+                raise
+            delay = min(30.0, 4.0 * attempt + random.uniform(0.5, 2.0))
+            add_event(
+                job_id,
+                "discovery_query_retry",
+                f"The {period_label} query timed out; retrying after {delay:.1f}s.",
+                level="warning",
+                details={
+                    "family": family,
+                    "direction": direction,
+                    "horizon_minutes": horizon,
+                    "attempt": attempt,
+                    "entry_stride_minutes": entry_stride_minutes,
+                },
+            )
+            check_control(job_id)
+            clock.sleep(delay)
+    raise RuntimeError("Discovery query retry loop ended unexpectedly")
 
 
 def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT status,min_trade_date,max_trade_date FROM ra_feature_sets WHERE id=%s", (config.feature_set_id,))
+            cur.execute(
+                "SELECT status,min_trade_date,max_trade_date,config FROM ra_feature_sets WHERE id=%s",
+                (config.feature_set_id,),
+            )
             feature_set = cur.fetchone()
         conn.rollback()
     if not feature_set or feature_set["status"] != "completed":
@@ -331,30 +508,56 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
             f"{feature_set['min_trade_date']} to {feature_set['max_trade_date']}"
         )
 
+    feature_config = dict(feature_set.get("config") or {})
+    base_minutes = timeframe_minutes(str(feature_config.get("timeframe") or "1Min"))
+    session_name = str(feature_config.get("session") or "regular")
+    entry_anchor_minute = {
+        "regular": 570,
+        "premarket": 240,
+        "postmarket": 960,
+        "overnight": 0,
+        "all": 0,
+    }.get(session_name, 0)
+    run_config = config.model_dump(mode="json")
+    run_config["engine_version"] = DISCOVERY_VERSION
+
     combinations = [
         (family, direction, int(horizon))
         for family in config.families
         for direction in config.directions
         for horizon in config.holding_horizons_minutes
     ]
+    engine_upgraded = False
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM ra_discovery_runs WHERE job_id=%s", (job_id,))
+            cur.execute("SELECT id,config FROM ra_discovery_runs WHERE job_id=%s", (job_id,))
             existing = cur.fetchone()
             if existing:
                 run_id = existing["id"]
+                previous_engine = str((existing.get("config") or {}).get("engine_version") or "legacy")
+                engine_upgraded = previous_engine != DISCOVERY_VERSION
                 cur.execute(
-                    "UPDATE ra_discovery_runs SET status='running',completed_at=NULL WHERE id=%s",
-                    (run_id,),
+                    "UPDATE ra_discovery_runs SET status='running',completed_at=NULL,config=%s WHERE id=%s",
+                    (Jsonb(run_config), run_id),
                 )
-                cur.execute(
-                    "UPDATE ra_discovery_tasks SET status='pending',error=NULL WHERE discovery_run_id=%s AND status IN ('running','failed','cancelled')",
-                    (run_id,),
-                )
+                if engine_upgraded:
+                    # Results produced by a previous sampling/query definition are
+                    # not mixed with v1.0.7 results. This normally resets only a
+                    # small number of completed tasks after an upgrade.
+                    cur.execute(
+                        "UPDATE ra_discovery_tasks SET status='pending',groups_tested=0,candidates_retained=0,error=NULL,completed_at=NULL WHERE discovery_run_id=%s",
+                        (run_id,),
+                    )
+                    cur.execute("DELETE FROM ra_candidate_rules WHERE discovery_run_id=%s", (run_id,))
+                else:
+                    cur.execute(
+                        "UPDATE ra_discovery_tasks SET status='pending',error=NULL WHERE discovery_run_id=%s AND status IN ('running','failed','cancelled')",
+                        (run_id,),
+                    )
             else:
                 cur.execute(
                     "INSERT INTO ra_discovery_runs(job_id,feature_set_id,name,config) VALUES (%s,%s,%s,%s) RETURNING id",
-                    (job_id, config.feature_set_id, config.name, Jsonb(config.model_dump(mode="json"))),
+                    (job_id, config.feature_set_id, config.name, Jsonb(run_config)),
                 )
                 run_id = cur.fetchone()["id"]
             cur.executemany(
@@ -370,6 +573,15 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
             )
             tasks = [dict(row) for row in cur.fetchall()]
         conn.commit()
+
+    if engine_upgraded:
+        add_event(
+            job_id,
+            "discovery_engine_upgraded",
+            "Discovery tasks were reset so every result uses the v1.0.7 non-overlapping entry methodology.",
+            level="warning",
+            details={"engine_version": DISCOVERY_VERSION},
+        )
 
     completed = sum(1 for task in tasks if task["status"] == "completed")
     set_progress(job_id, "scanning rule families", completed, len(tasks), result={"discovery_run_id": run_id})
@@ -392,15 +604,36 @@ def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
                 )
             conn.commit()
         try:
-            dimensions, discovery_rows = _run_group_query(
-                str(config.feature_set_id), config.discovery_start, config.discovery_end,
+            entry_stride = 1
+            if config.entry_sampling_mode == "non_overlapping":
+                entry_stride = max(1, horizon // base_minutes)
+            set_progress(
+                job_id,
+                f"scanning {family} · {direction} · {horizon}m · discovery · every {entry_stride * base_minutes}m",
+                completed,
+                len(tasks),
+            )
+            dimensions, discovery_rows = _run_group_query_with_retries(
+                job_id, int(task["id"]), str(config.feature_set_id),
+                config.discovery_start, config.discovery_end,
                 family, horizon, direction,
+                entry_stride * base_minutes, entry_anchor_minute,
+                "discovery-period",
             )
             validation_map: dict[tuple[Any, ...], dict[str, Any]] = {}
             if config.validation_start and config.validation_end:
-                _, validation_rows = _run_group_query(
-                    str(config.feature_set_id), config.validation_start, config.validation_end,
+                set_progress(
+                    job_id,
+                    f"scanning {family} · {direction} · {horizon}m · validation · every {entry_stride * base_minutes}m",
+                    completed,
+                    len(tasks),
+                )
+                _, validation_rows = _run_group_query_with_retries(
+                    job_id, int(task["id"]), str(config.feature_set_id),
+                    config.validation_start, config.validation_end,
                     family, horizon, direction,
+                    entry_stride * base_minutes, entry_anchor_minute,
+                    "validation-period",
                 )
                 validation_map = {tuple(row[d.name] for d in dimensions): row for row in validation_rows}
 

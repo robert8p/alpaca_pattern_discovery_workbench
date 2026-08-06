@@ -115,6 +115,7 @@ class DiscoveryConfig(BaseModel):
     maximum_symbol_concentration_pct: float = Field(default=15.0, ge=1, le=100)
     maximum_date_concentration_pct: float = Field(default=20.0, ge=1, le=100)
     top_candidates_per_family: int = Field(default=30, ge=1, le=200)
+    entry_sampling_mode: Literal["non_overlapping", "all_bars"] = "non_overlapping"
 
     @model_validator(mode="after")
     def periods_are_valid(self):

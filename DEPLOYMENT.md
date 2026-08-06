@@ -308,3 +308,16 @@ If a feature job failed with `deadlock detected` while deploying v1.0.5:
 Completed date chunks and symbol batches remain intact. The failed batch is retried. Do not delete or recreate the job.
 
 As a temporary pre-v1.0.6 workaround only, set `AUTO_MIGRATE=false` on both web and worker after the schema has already been installed. v1.0.6 can safely retain `AUTO_MIGRATE=true` because it skips full startup DDL when the schema is compatible.
+
+## Discovery statement timeout
+
+Version 1.0.7 optimises discovery scans by using non-overlapping entry points and partition-prunable timestamp bounds. The worker Blueprint includes:
+
+```text
+DISCOVERY_STATEMENT_TIMEOUT_SECONDS=600
+DISCOVERY_WALL_TIMEOUT_SECONDS=660
+DISCOVERY_CANCEL_GRACE_SECONDS=15
+DISCOVERY_QUERY_RETRIES=2
+```
+
+After upgrading an existing failed discovery run, click **Retry**. The first retry resets previously completed legacy discovery tasks so the run uses one consistent v1.0.7 methodology. Feature rows are not rebuilt.

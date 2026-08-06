@@ -23,7 +23,7 @@ from app.models import (
 )
 from app.utils import json_safe
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()

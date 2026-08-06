@@ -1,5 +1,18 @@
 # Release notes
 
+## 1.0.7 — Non-overlapping and watchdog-protected discovery
+
+- Samples discovery entries at the holding-period cadence by default: every 5, 15, 30 or 60 minutes rather than every one-minute bar.
+- Removes severe outcome overlap and reduces pseudo-replication in candidate statistics.
+- Adds UTC timestamp bounds alongside trade-date bounds so PostgreSQL can prune monthly feature partitions.
+- Materializes only the sampled discovery rows before grouped statistics are calculated.
+- Adds a discovery-query heartbeat, responsive Pause/Cancel, a ten-minute server timeout and an eleven-minute wall-clock watchdog.
+- Retries one transient discovery timeout automatically with jittered backoff.
+- Shows whether the worker is scanning the discovery or validation period and the active entry cadence.
+- Resets earlier completed discovery tasks on the first v1.0.7 retry so one run cannot mix legacy every-minute results with non-overlapping results.
+
+No feature rebuild or database schema migration is required.
+
 ## 1.0.6 — Deadlock-safe startup and feature writes
 
 - Stops rerunning the full table/index/trigger schema on every web and worker startup once the installed schema is compatible.

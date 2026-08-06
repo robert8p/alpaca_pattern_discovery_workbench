@@ -130,3 +130,9 @@ See [`DEPLOYMENT.md`](DEPLOYMENT.md).
 ## Deadlock-safe startup
 
 From v1.0.6, startup checks and records schema compatibility rather than replaying all idempotent DDL on every web/worker deploy. Feature partition DDL runs once per date chunk, and transient PostgreSQL lock conflicts are retried automatically.
+
+## Discovery entry sampling
+
+Discovery defaults to **non-overlapping entries**. A 15-minute holding-period test evaluates entries every 15 minutes rather than every minute. This both lowers database cost and prevents the same future price path from being counted repeatedly as independent evidence. The dashboard can still select every-bar sampling for diagnostics, but it is not recommended for candidate ranking.
+
+Each grouped discovery query has its own heartbeat, server-side statement timeout, independent wall-clock watchdog and one automatic retry.

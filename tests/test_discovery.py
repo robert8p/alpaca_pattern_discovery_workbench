@@ -29,3 +29,28 @@ def test_time_dimension_has_condition_mapping():
     condition, description = TIME.labels["14:30–15:30 ET"]
     assert condition["column"] == "minute_of_day"
     assert "14:30" in description
+
+
+def test_non_overlapping_query_uses_timestamp_pruning_and_stride():
+    query = _period_group_query(
+        FAMILIES["time_of_day"]["dimensions"],
+        FAMILIES["time_of_day"]["filter"],
+        15,
+        "long",
+        entry_stride_minutes=15,
+        entry_anchor_minute=570,
+    )
+    assert "base AS MATERIALIZED" in query
+    assert "bar_ts >=" in query
+    assert "bar_ts <" in query
+    assert "mod(minute_of_day - 570, 15) = 0" in query
+
+
+def test_all_bar_query_does_not_add_stride_filter():
+    query = _period_group_query(
+        FAMILIES["time_of_day"]["dimensions"],
+        FAMILIES["time_of_day"]["filter"],
+        15,
+        "long",
+    )
+    assert "mod(minute_of_day" not in query

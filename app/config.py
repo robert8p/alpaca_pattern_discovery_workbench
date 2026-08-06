@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     feature_min_symbol_batch_size: int = Field(default=1, alias="FEATURE_MIN_SYMBOL_BATCH_SIZE")
     feature_cancel_grace_seconds: int = Field(default=15, alias="FEATURE_CANCEL_GRACE_SECONDS")
     feature_db_conflict_retries: int = Field(default=5, alias="FEATURE_DB_CONFLICT_RETRIES")
+    discovery_statement_timeout_seconds: int = Field(default=600, alias="DISCOVERY_STATEMENT_TIMEOUT_SECONDS")
+    discovery_wall_timeout_seconds: int = Field(default=660, alias="DISCOVERY_WALL_TIMEOUT_SECONDS")
+    discovery_cancel_grace_seconds: int = Field(default=15, alias="DISCOVERY_CANCEL_GRACE_SECONDS")
+    discovery_query_retries: int = Field(default=2, alias="DISCOVERY_QUERY_RETRIES")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
 

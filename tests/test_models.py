@@ -48,3 +48,17 @@ def test_feature_symbol_batch_size_defaults_for_legacy_jobs():
         end_date="2026-07-02", timeframe="1Min",
     )
     assert config.symbol_batch_size == 100
+
+
+def test_discovery_defaults_to_non_overlapping_entries():
+    from app.models import DiscoveryConfig
+
+    cfg = DiscoveryConfig.model_validate({
+        "feature_set_id": "00000000-0000-0000-0000-000000000001",
+        "discovery_start": "2026-07-01",
+        "discovery_end": "2026-07-10",
+        "directions": ["long"],
+        "holding_horizons_minutes": [15],
+        "families": ["time_of_day"],
+    })
+    assert cfg.entry_sampling_mode == "non_overlapping"
