@@ -1,5 +1,13 @@
 # Release notes
 
+## 2.0.1 — PostgreSQL migration-startup correction
+
+- Corrects the schema-version UPSERT to use the primary-key conflict target: `ON CONFLICT (version) DO UPDATE`.
+- Adds a repository-wide static release check that rejects `ON CONFLICT DO UPDATE` without an inference target or constraint name.
+- Adds regression tests for the schema-version UPSERT and all `ON CONFLICT ... DO UPDATE` statements.
+- Keeps the staged v2 discovery methodology, schema version and rule-definition version unchanged.
+- No raw `rd_` data or completed feature set needs to be rebuilt.
+
 ## 2.0.0 — Staged discovery-engine rebuild
 
 - Replaces monolithic discovery queries with a staged, resumable engine.

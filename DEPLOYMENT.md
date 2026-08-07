@@ -1,8 +1,8 @@
-# Deployment and upgrade guide — v2.0.0
+# Deployment and upgrade guide — v2.0.1
 
 ## Before deployment
 
-1. Extract `alpaca_pattern_discovery_workbench_v2.0.0.zip` into the existing private GitHub repository.
+1. Extract `alpaca_pattern_discovery_workbench_v2.0.1.zip` into the existing private GitHub repository.
 2. Preserve hidden files, especially `.github/workflows/ci.yml` and `.python-version`.
 3. Commit and push.
 4. Open **GitHub → Actions → release-gate**.
@@ -66,7 +66,7 @@ The updated `render.yaml` supplies all non-secret defaults.
 
 ## Migration
 
-On first 2.0.0 startup, one service obtains a PostgreSQL advisory lock and applies `sql/migrations/2.0.0.sql`. It creates only the new `ra_` discovery objects and metadata columns.
+On first 2.0.1 startup, one service obtains a PostgreSQL advisory lock and applies `sql/migrations/2.0.0.sql`. It creates only the new `ra_` discovery objects and metadata columns.
 
 It does not modify:
 
@@ -81,7 +81,7 @@ After migration, later starts detect schema 2.0.0 and skip DDL.
 
 After both services deploy:
 
-1. Confirm web and worker show version `2.0.0`.
+1. Confirm web and worker show version `2.0.1`.
 2. Open **System → Run checks**.
 3. Confirm:
    - database port 5432
@@ -135,8 +135,8 @@ The chunk is returned to `pending` and retried with jittered backoff up to `DISC
 
 ### Pause remains requested
 
-Redeploy/restart the 2.0.0 worker. Startup recovery converts stale control states and returns active chunks to `pending`.
+Redeploy/restart the 2.0.1 worker. Startup recovery converts stale control states and returns active chunks to `pending`.
 
 ### Preflight blocks a job
 
-Do not bypass it. Open **System**, inspect the exact missing object or PostgreSQL planning error, and confirm both services use the same 2.0.0 commit and database.
+Do not bypass it. Open **System**, inspect the exact missing object or PostgreSQL planning error, and confirm both services use the same 2.0.1 commit and database.

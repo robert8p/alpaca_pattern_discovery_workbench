@@ -18,10 +18,13 @@ except ImportError:
     runpy.run_path(str(ROOT / "tests" / "conftest.py"))
 
 from app.discovery import DISCOVERY_VERSION, RULE_DEFINITION_VERSION, STATISTICS_METHOD
+from app.db import APP_VERSION, SCHEMA_VERSION
 from app.preflight import local_sql_preflight
 from app.sql_validation import SqlBindingError, inspect_psycopg_placeholders
 
-EXPECTED_VERSION = "2.0.0"
+EXPECTED_APP_VERSION = "2.0.1"
+EXPECTED_DISCOVERY_VERSION = "2.0.0"
+EXPECTED_SCHEMA_VERSION = "2.0.0"
 
 
 def audit_sql_literals() -> int:
@@ -76,6 +79,37 @@ def audit_execute_parameter_counts() -> int:
     return checked
 
 
+
+
+def audit_on_conflict_update_targets() -> int:
+    """Reject PostgreSQL UPSERTs that use DO UPDATE without a conflict target.
+
+    PostgreSQL allows a target-less ``ON CONFLICT DO NOTHING``, but ``DO UPDATE``
+    requires either ``(column, ...)`` or ``ON CONSTRAINT name``. This check is
+    deliberately available offline so migration syntax is not dependent on CI.
+    """
+    checked = 0
+    errors: list[str] = []
+    paths = list((ROOT / "app").glob("*.py")) + [ROOT / "sql" / "schema.sql"]
+    paths += list((ROOT / "sql" / "migrations").glob("*.sql"))
+    invalid = re.compile(r"ON\s+CONFLICT\s+DO\s+UPDATE", re.I)
+    valid_update = re.compile(
+        r"ON\s+CONFLICT\s*(?:\([^)]*\)|ON\s+CONSTRAINT\s+[A-Za-z_][A-Za-z0-9_]*)\s+DO\s+UPDATE",
+        re.I | re.S,
+    )
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"ON\s+CONFLICT\b", text, re.I):
+            window = text[match.start():match.start() + 500]
+            if re.search(r"DO\s+UPDATE", window, re.I):
+                checked += 1
+                if invalid.search(window) or not valid_update.search(window):
+                    line = text[:match.start()].count("\n") + 1
+                    errors.append(f"{path.relative_to(ROOT)}:{line}: ON CONFLICT DO UPDATE requires a target")
+    if errors:
+        raise RuntimeError("Invalid PostgreSQL UPSERT syntax:\n" + "\n".join(errors))
+    return checked
+
 def audit_raw_write_policy() -> None:
     text = "\n".join(path.read_text(encoding="utf-8") for path in (ROOT / "app").glob("*.py"))
     forbidden = re.compile(r"\b(insert\s+into|update|delete\s+from|create\s+table|drop\s+table|alter\s+table)\s+rd_", re.I)
@@ -84,11 +118,15 @@ def audit_raw_write_policy() -> None:
 
 
 def audit_versions() -> None:
-    for relative in ("app/main.py", "app/worker.py", "app/db.py", "app/discovery.py"):
-        if EXPECTED_VERSION not in (ROOT / relative).read_text(encoding="utf-8"):
-            raise RuntimeError(f"{relative} does not contain release version {EXPECTED_VERSION}")
-    if DISCOVERY_VERSION != EXPECTED_VERSION:
+    for relative in ("app/main.py", "app/worker.py"):
+        if EXPECTED_APP_VERSION not in (ROOT / relative).read_text(encoding="utf-8"):
+            raise RuntimeError(f"{relative} does not contain app release version {EXPECTED_APP_VERSION}")
+    if DISCOVERY_VERSION != EXPECTED_DISCOVERY_VERSION:
         raise RuntimeError(f"Discovery version mismatch: {DISCOVERY_VERSION}")
+    if SCHEMA_VERSION != EXPECTED_SCHEMA_VERSION:
+        raise RuntimeError(f"Schema version mismatch: {SCHEMA_VERSION}")
+    if APP_VERSION != EXPECTED_APP_VERSION:
+        raise RuntimeError(f"DB migration app-version marker mismatch: {APP_VERSION}")
     if RULE_DEFINITION_VERSION != "2026-08-staged-v2":
         raise RuntimeError(f"Unexpected rule definition: {RULE_DEFINITION_VERSION}")
     if "histogram" not in STATISTICS_METHOD:
@@ -136,11 +174,12 @@ def main() -> None:
     audit_secrets()
     literal_queries = audit_sql_literals()
     static_bindings = audit_execute_parameter_counts()
+    conflict_updates = audit_on_conflict_update_targets()
     preflight = local_sql_preflight()
     print(
         f"Release audit passed ({DEPENDENCY_MODE}): {literal_queries} literal SQL statements, "
-        f"{static_bindings} static execute bindings, {preflight['checks']} generated-query checks, "
-        f"definition {preflight['definition_hash'][:16]}"
+        f"{static_bindings} static execute bindings, {conflict_updates} conflict-update statements, "
+        f"{preflight['checks']} generated-query checks, definition {preflight['definition_hash'][:16]}"
     )
 
 

@@ -1,8 +1,8 @@
-# Pattern Discovery Workbench 2.0.0 — audit report
+# Pattern Discovery Workbench 2.0.1 — audit report
 
 ## Scope
 
-Version 2.0.0 replaces the withdrawn monolithic discovery engine. The rebuild was initiated after production-sized one-minute feature scans repeatedly exceeded PostgreSQL statement timeouts.
+Version 2.0.1 is the startup-corrected release of the staged v2 engine that replaces the withdrawn monolithic discovery engine. The rebuild was initiated after production-sized one-minute feature scans repeatedly exceeded PostgreSQL statement timeouts.
 
 The loader, `rd_` market data, liquidity-ranked universes and completed `ra_intraday_features` feature sets are outside the rebuild and remain compatible.
 
@@ -44,12 +44,13 @@ The audit covers:
 The final local gate completed with:
 
 ```text
-45 tests passed
+47 tests passed
 1 PostgreSQL integration test skipped
 Python compilation passed
 JavaScript syntax validation passed
 214 literal SQL statements passed placeholder inspection
 167 statically countable execute bindings matched their parameter counts
+5 PostgreSQL `ON CONFLICT ... DO UPDATE` statements passed explicit-target validation
 196 generated production-query combinations passed binding validation
 Render Blueprint and version checks passed
 Raw rd_ write-protection scan passed
@@ -105,4 +106,11 @@ This preflight tests schema/query compatibility, not production-scale runtime. R
 
 ## Release decision
 
-The archive is suitable to enter the mandatory PostgreSQL CI gate. Deployment should occur only from the exact commit that passes that gate. Existing feature sets do not need to be rebuilt; withdrawn 1.x discovery artefacts are reset when their jobs are retried under 2.0.0.
+The v2.0.1 archive is suitable to enter the mandatory PostgreSQL CI gate. Deployment should occur only from the exact commit that passes that gate. Existing feature sets do not need to be rebuilt; withdrawn 1.x discovery artefacts are reset when their jobs are retried under the staged v2 engine.
+
+
+## 2.0.1 migration regression audit
+
+The v2.0.0 startup failure was traced to a malformed PostgreSQL UPSERT in `execute_schema()`: `ON CONFLICT DO UPDATE` lacked a conflict target. PostgreSQL requires an inference specification or constraint name for `DO UPDATE`. The corrected statement uses `ON CONFLICT (version) DO UPDATE`.
+
+The offline release gate now rejects this syntax repository-wide, so this class of defect no longer depends on the optional live-PostgreSQL CI job to be detected. The assembly environment still cannot execute a PostgreSQL server; the included GitHub PostgreSQL 16 integration workflow remains the strongest database-backed gate and should be allowed to complete before deployment.

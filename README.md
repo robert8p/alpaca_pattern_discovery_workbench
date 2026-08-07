@@ -1,14 +1,14 @@
-# Alpaca Pattern Discovery Workbench 2.0.0
+# Alpaca Pattern Discovery Workbench 2.0.1
 
 A button-driven companion to the **Alpaca Rapid Discovery Loader**. It connects to the same Supabase PostgreSQL database, reads the loader's `rd_` market-data tables, and writes only to its own `ra_` analysis tables.
 
-Version 2.0.0 rebuilds the discovery engine for production-sized one-minute datasets. The loader, universes, completed feature sets and `rd_` bars do not need to be rebuilt.
+Version 2.0.1 is the startup-corrected release of the staged v2 discovery engine for production-sized one-minute datasets. The loader, universes, completed feature sets and `rd_` bars do not need to be rebuilt.
 
 ## Why the discovery engine was rebuilt
 
 The withdrawn 1.x engine ran one large grouped PostgreSQL query for each rule family, direction and holding period. Exact percentiles, distinct counts, concentration calculations and multiple scans of the same feature rows could exceed the database statement timeout.
 
-The 2.0.0 engine removes that single-query failure point:
+The staged v2 engine removes that single-query failure point:
 
 ```text
 Completed feature set
@@ -95,7 +95,7 @@ Application and release-gate scans reject writes to `rd_` tables. The workbench 
 - Existing `rd_bars`: preserved.
 - Existing universe runs: preserved.
 - Existing completed feature sets: preserved; feature definition remains `1.1.0` because its calculation has not changed.
-- Existing 1.x discovery jobs: retryable. On first 2.0.0 retry, only withdrawn discovery samples/tasks/candidates are reset; the selected feature set remains intact.
+- Existing 1.x discovery jobs: retryable. On first staged-v2 retry, only withdrawn discovery samples/tasks/candidates are reset; the selected feature set remains intact.
 
 ## Deployment
 

@@ -16,6 +16,7 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
 SCHEMA_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
@@ -234,6 +235,10 @@ def execute_schema() -> None:
                 cur.execute("SELECT 1 FROM ra_schema_versions WHERE version=%s", (SCHEMA_VERSION,))
                 already_applied = cur.fetchone() is not None
                 if already_applied and _schema_is_compatible(cur):
+                    cur.execute(
+                        "UPDATE ra_schema_versions SET app_version=%s,applied_at=now() WHERE version=%s",
+                        (APP_VERSION, SCHEMA_VERSION),
+                    )
                     conn.commit()
                     logger.info("Pattern Discovery Workbench schema %s already installed; startup DDL skipped", SCHEMA_VERSION)
                     return
@@ -253,8 +258,8 @@ def execute_schema() -> None:
                 if not _schema_is_compatible(cur):
                     raise RuntimeError("Schema migration completed but v2 compatibility checks still failed")
                 cur.execute(
-                    "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT DO UPDATE SET app_version=excluded.app_version,applied_at=now()",
-                    (SCHEMA_VERSION, SCHEMA_VERSION),
+                    "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT (version) DO UPDATE SET app_version=excluded.app_version,applied_at=now()",
+                    (SCHEMA_VERSION, APP_VERSION),
                 )
             conn.commit()
     except ReadOnlySqlTransaction as exc:
