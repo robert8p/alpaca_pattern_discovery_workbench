@@ -18,7 +18,7 @@ from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "1.1.0"
+VERSION = "2.0.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
@@ -42,9 +42,15 @@ def _mark_related(job: dict[str, Any], status: str) -> None:
                         """,
                         (job["id"],),
                     )
-            elif job["job_type"] == "discovery_scan" and status == "cancelled":
-                cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (job["id"],))
-                cur.execute("UPDATE ra_discovery_tasks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','failed')", (job["id"],))
+            elif job["job_type"] == "discovery_scan":
+                if status == "cancelled":
+                    cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (job["id"],))
+                    cur.execute("UPDATE ra_discovery_tasks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','running','failed')", (job["id"],))
+                    cur.execute("UPDATE ra_discovery_sample_chunks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','running','failed')", (job["id"],))
+                    cur.execute("UPDATE ra_discovery_task_chunks SET status='cancelled' WHERE discovery_task_id IN (SELECT t.id FROM ra_discovery_tasks t JOIN ra_discovery_runs r ON r.id=t.discovery_run_id WHERE r.job_id=%s) AND status IN ('pending','running','failed')", (job["id"],))
+                elif status == "paused":
+                    cur.execute("UPDATE ra_discovery_sample_chunks SET status='pending' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status='running'", (job["id"],))
+                    cur.execute("UPDATE ra_discovery_task_chunks SET status='pending' WHERE discovery_task_id IN (SELECT t.id FROM ra_discovery_tasks t JOIN ra_discovery_runs r ON r.id=t.discovery_run_id WHERE r.job_id=%s) AND status='running'", (job["id"],))
         conn.commit()
 
 

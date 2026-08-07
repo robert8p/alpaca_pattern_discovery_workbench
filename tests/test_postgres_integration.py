@@ -132,20 +132,23 @@ def test_complete_postgres_workflow():
 
     preflight = database_sql_preflight(force=True, exhaustive=True)
     assert preflight["ok"] is True
-    assert preflight["database_plans"] == 194
+    assert preflight["database_plans"] == 196
 
     discovery_config = DiscoveryConfig(
         name="Synthetic audited discovery",
         feature_set_id=feature_result["feature_set_id"],
         discovery_start="2026-06-08", discovery_end="2026-06-19",
         validation_start="2026-06-22", validation_end="2026-06-30",
-        directions=["long"], holding_horizons_minutes=[5],
-        families=["time_of_day"], round_trip_cost_bps=0,
+        directions=["long", "short"], holding_horizons_minutes=[5, 15, 30, 60],
+        families=[
+            "time_of_day", "oversold_reversal", "momentum_continuation",
+            "vwap_reversion", "gap_behavior", "volume_shock",
+        ], round_trip_cost_bps=0,
         minimum_observations=20, minimum_symbols=2, minimum_dates=5,
         maximum_symbol_concentration_pct=100,
         maximum_date_concentration_pct=100,
         top_candidates_per_family=10,
-        entry_sampling_mode="non_overlapping",
+        entry_sampling_mode="non_overlapping", date_chunk_days=14, symbol_shards=1,
     )
     discovery_job = create_job("discovery_scan", discovery_config.name, discovery_config.model_dump(mode="json"))
     discovery_result = run_discovery(str(discovery_job["id"]), discovery_config)

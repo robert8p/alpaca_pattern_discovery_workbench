@@ -9,10 +9,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-# CI and Render use the real pinned dependencies. The execution sandbox used to
-# assemble an archive may be offline; in that case install only the test import
-# stubs so the static/generated-SQL release audit can still run. This mode does
-# not replace the PostgreSQL-backed CI job.
 DEPENDENCY_MODE = "real"
 try:
     import psycopg  # noqa: F401
@@ -21,12 +17,11 @@ except ImportError:
     DEPENDENCY_MODE = "offline-stub"
     runpy.run_path(str(ROOT / "tests" / "conftest.py"))
 
-from app.discovery import DISCOVERY_VERSION, RULE_DEFINITION_VERSION
-from app.features import FEATURE_VERSION
+from app.discovery import DISCOVERY_VERSION, RULE_DEFINITION_VERSION, STATISTICS_METHOD
 from app.preflight import local_sql_preflight
 from app.sql_validation import SqlBindingError, inspect_psycopg_placeholders
 
-EXPECTED_VERSION = "1.1.0"
+EXPECTED_VERSION = "2.0.0"
 
 
 def audit_sql_literals() -> int:
@@ -51,48 +46,68 @@ def audit_sql_literals() -> int:
     return checked
 
 
+def audit_execute_parameter_counts() -> int:
+    """Check literal cursor.execute SQL where the parameter tuple is statically visible."""
+    checked = 0
+    errors: list[str] = []
+    for path in (ROOT / "app").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "execute":
+                continue
+            if len(node.args) < 2 or not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+                continue
+            if not isinstance(node.args[1], (ast.Tuple, ast.List)):
+                continue
+            # Starred elements (for example ``(*common, threshold)``) are
+            # dynamically sized and cannot be counted accurately from the AST.
+            # Generated-query validation covers those paths separately.
+            if any(isinstance(element, ast.Starred) for element in node.args[1].elts):
+                continue
+            report = inspect_psycopg_placeholders(node.args[0].value)
+            expected = len(node.args[1].elts)
+            checked += 1
+            if report.placeholder_count != expected:
+                errors.append(
+                    f"{path.name}:{node.lineno}: {report.placeholder_count} placeholders but {expected} tuple elements"
+                )
+    if errors:
+        raise RuntimeError("Literal execute binding mismatch:\n" + "\n".join(errors))
+    return checked
+
+
 def audit_raw_write_policy() -> None:
     text = "\n".join(path.read_text(encoding="utf-8") for path in (ROOT / "app").glob("*.py"))
-    forbidden = re.compile(
-        r"\b(insert\s+into|update|delete\s+from|create\s+table|drop\s+table|alter\s+table)\s+rd_",
-        re.I,
-    )
-    matches = forbidden.findall(text)
-    if matches:
-        raise RuntimeError(f"Raw rd_ write policy violated: {matches}")
+    forbidden = re.compile(r"\b(insert\s+into|update|delete\s+from|create\s+table|drop\s+table|alter\s+table)\s+rd_", re.I)
+    if forbidden.search(text):
+        raise RuntimeError("Raw rd_ write policy violated")
 
 
 def audit_versions() -> None:
-    sources = {
-        "main": (ROOT / "app/main.py").read_text(),
-        "worker": (ROOT / "app/worker.py").read_text(),
-        "db": (ROOT / "app/db.py").read_text(),
-    }
-    for name, source in sources.items():
-        if EXPECTED_VERSION not in source:
-            raise RuntimeError(f"{name} does not contain release version {EXPECTED_VERSION}")
+    for relative in ("app/main.py", "app/worker.py", "app/db.py", "app/discovery.py"):
+        if EXPECTED_VERSION not in (ROOT / relative).read_text(encoding="utf-8"):
+            raise RuntimeError(f"{relative} does not contain release version {EXPECTED_VERSION}")
     if DISCOVERY_VERSION != EXPECTED_VERSION:
         raise RuntimeError(f"Discovery version mismatch: {DISCOVERY_VERSION}")
-    if FEATURE_VERSION != EXPECTED_VERSION:
-        raise RuntimeError(f"Feature version mismatch: {FEATURE_VERSION}")
-    if RULE_DEFINITION_VERSION == "legacy":
-        raise RuntimeError("Rule definition cannot be legacy")
+    if RULE_DEFINITION_VERSION != "2026-08-staged-v2":
+        raise RuntimeError(f"Unexpected rule definition: {RULE_DEFINITION_VERSION}")
+    if "histogram" not in STATISTICS_METHOD:
+        raise RuntimeError("v2 statistics method must identify its mergeable histogram")
 
 
 def audit_schema() -> None:
     schema = (ROOT / "sql/schema.sql").read_text(encoding="utf-8")
-    for column in (
-        "entry_sampling_mode",
-        "entry_stride_minutes",
-        "entry_anchor_minute",
-        "rule_definition_version",
-    ):
-        if column not in schema:
-            raise RuntimeError(f"Schema is missing {column}")
+    migration = (ROOT / "sql/migrations/2.0.0.sql").read_text(encoding="utf-8")
+    required = (
+        "ra_discovery_samples", "ra_discovery_sample_chunks", "ra_discovery_task_chunks",
+        "ra_discovery_partials", "ra_sealed_chunks", "sample_stride_minutes",
+        "fwd_return_60m_pct", "statistics_method", "engine_version",
+    )
+    for token in required:
+        if token not in schema or token not in migration:
+            raise RuntimeError(f"Schema or migration is missing {token}")
     if "CREATE TABLE IF NOT EXISTS rd_" in schema:
         raise RuntimeError("Schema creates raw rd_ tables")
-    if "DEFAULT '1.1.0'" not in schema:
-        raise RuntimeError("Schema feature-version default is not 1.1.0")
 
 
 def audit_blueprint() -> None:
@@ -106,20 +121,10 @@ def audit_blueprint() -> None:
 def audit_secrets() -> None:
     suspicious = re.compile(r"(?:eyJ[a-zA-Z0-9_-]{30,}|AKIA[0-9A-Z]{16}|postgresql://[^\s:]+:[^@\s]{12,}@)")
     for path in ROOT.rglob("*"):
-        if (
-            not path.is_file()
-            or path.suffix in {".pyc", ".zip"}
-            or ".git" in path.parts
-            or "tests" in path.parts
-        ):
+        if not path.is_file() or path.suffix in {".pyc", ".zip"} or ".git" in path.parts or "tests" in path.parts:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if (
-            suspicious.search(text)
-            and "YOUR_PASSWORD" not in text
-            and "postgres:postgres" not in text
-            and "localhost" not in text
-        ):
+        if suspicious.search(text) and "YOUR_PASSWORD" not in text and "postgres:postgres" not in text and "localhost" not in text:
             raise RuntimeError(f"Possible credential in {path.relative_to(ROOT)}")
 
 
@@ -130,10 +135,12 @@ def main() -> None:
     audit_raw_write_policy()
     audit_secrets()
     literal_queries = audit_sql_literals()
+    static_bindings = audit_execute_parameter_counts()
     preflight = local_sql_preflight()
     print(
         f"Release audit passed ({DEPENDENCY_MODE}): {literal_queries} literal SQL statements, "
-        f"{preflight['checks']} generated-query checks, definition {preflight['definition_hash'][:16]}"
+        f"{static_bindings} static execute bindings, {preflight['checks']} generated-query checks, "
+        f"definition {preflight['definition_hash'][:16]}"
     )
 
 

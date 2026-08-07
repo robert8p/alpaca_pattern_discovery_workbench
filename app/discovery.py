@@ -19,8 +19,8 @@ from app.sql_validation import validate_sql_bindings
 from app.utils import finite_or_none, json_safe
 
 
-DISCOVERY_VERSION = "1.1.0"
-RULE_DEFINITION_VERSION = "2026-08-audited-v1"
+DISCOVERY_VERSION = "2.0.0"
+RULE_DEFINITION_VERSION = "2026-08-staged-v2"
 
 
 class DiscoveryQueryTimeout(RuntimeError):
@@ -240,12 +240,72 @@ PREV_DAY = Dimension(
 )
 
 FAMILIES: dict[str, dict[str, Any]] = {
-    "time_of_day": {"dimensions": [TIME, WEEKDAY], "filter": "minute_of_day>=570 AND minute_of_day<960 AND weekday_iso BETWEEN 1 AND 5"},
-    "oversold_reversal": {"dimensions": [TIME, RET30, VWAP, RVOL], "filter": "ret_30m_pct<0 AND distance_from_cumulative_vwap_pct<0 AND relative_volume_20bar IS NOT NULL"},
-    "momentum_continuation": {"dimensions": [TIME, RET30, RANGE_POS, RVOL], "filter": "ret_30m_pct>0 AND cumulative_range_position>=0.5 AND relative_volume_20bar IS NOT NULL"},
-    "vwap_reversion": {"dimensions": [TIME, VWAP, RANGE_POS, RVOL], "filter": "abs(distance_from_cumulative_vwap_pct)>=1 AND cumulative_range_position IS NOT NULL AND relative_volume_20bar IS NOT NULL"},
-    "gap_behavior": {"dimensions": [TIME, GAP, PREV_DAY], "filter": "abs(gap_from_previous_regular_close_pct)>=1 AND previous_day_return_pct IS NOT NULL"},
-    "volume_shock": {"dimensions": [TIME, RVOL, RET5], "filter": "relative_volume_20bar>=1.5 AND ret_5m_pct IS NOT NULL"},
+    "time_of_day": {
+        "dimensions": [TIME, WEEKDAY],
+        "filter": "minute_of_day>=570 AND minute_of_day<960 AND weekday_iso BETWEEN 1 AND 5",
+        "constraints": [],
+        "constraint_descriptions": [],
+    },
+    "oversold_reversal": {
+        "dimensions": [TIME, RET30, VWAP, RVOL],
+        "filter": "ret_30m_pct<0 AND distance_from_cumulative_vwap_pct<0 AND relative_volume_20bar IS NOT NULL",
+        "constraints": [
+            {"column": "ret_30m_pct", "operator": "lt", "value": 0},
+            {"column": "distance_from_cumulative_vwap_pct", "operator": "lt", "value": 0},
+            {"column": "relative_volume_20bar", "operator": "not_null"},
+        ],
+        "constraint_descriptions": [
+            "the prior 30-minute return is negative",
+            "price is below cumulative VWAP",
+        ],
+    },
+    "momentum_continuation": {
+        "dimensions": [TIME, RET30, RANGE_POS, RVOL],
+        "filter": "ret_30m_pct>0 AND cumulative_range_position>=0.5 AND relative_volume_20bar IS NOT NULL",
+        "constraints": [
+            {"column": "ret_30m_pct", "operator": "gt", "value": 0},
+            {"column": "cumulative_range_position", "operator": "gte", "value": 0.5},
+            {"column": "relative_volume_20bar", "operator": "not_null"},
+        ],
+        "constraint_descriptions": [
+            "the prior 30-minute return is positive",
+            "price is in the upper half of the session range",
+        ],
+    },
+    "vwap_reversion": {
+        "dimensions": [TIME, VWAP, RANGE_POS, RVOL],
+        "filter": "abs(distance_from_cumulative_vwap_pct)>=1 AND cumulative_range_position IS NOT NULL AND relative_volume_20bar IS NOT NULL",
+        "constraints": [
+            {"column": "distance_from_cumulative_vwap_pct", "operator": "abs_gte", "value": 1},
+            {"column": "cumulative_range_position", "operator": "not_null"},
+            {"column": "relative_volume_20bar", "operator": "not_null"},
+        ],
+        "constraint_descriptions": [
+            "price is at least 1% away from cumulative VWAP",
+        ],
+    },
+    "gap_behavior": {
+        "dimensions": [TIME, GAP, PREV_DAY],
+        "filter": "abs(gap_from_previous_regular_close_pct)>=1 AND previous_day_return_pct IS NOT NULL",
+        "constraints": [
+            {"column": "gap_from_previous_regular_close_pct", "operator": "abs_gte", "value": 1},
+            {"column": "previous_day_return_pct", "operator": "not_null"},
+        ],
+        "constraint_descriptions": [
+            "the absolute opening gap is at least 1%",
+        ],
+    },
+    "volume_shock": {
+        "dimensions": [TIME, RVOL, RET5],
+        "filter": "relative_volume_20bar>=1.5 AND ret_5m_pct IS NOT NULL",
+        "constraints": [
+            {"column": "relative_volume_20bar", "operator": "gte", "value": 1.5},
+            {"column": "ret_5m_pct", "operator": "not_null"},
+        ],
+        "constraint_descriptions": [
+            "relative volume is at least 1.5x",
+        ],
+    },
 }
 
 ALLOWED_CONDITION_COLUMNS = {
@@ -255,587 +315,184 @@ ALLOWED_CONDITION_COLUMNS = {
     "previous_day_return_pct",
 }
 
-def _period_group_query(
-    dimensions: list[Dimension],
-    family_filter: str,
-    horizon: int,
-    direction: str,
-    entry_stride_minutes: int = 1,
-    entry_anchor_minute: int = 0,
-    cost_pct: float = 0.0,
+
+STATISTICS_METHOD = "mergeable_histogram_0.1pct_v1"
+HISTOGRAM_MIN_BIN = -200
+HISTOGRAM_MAX_BIN = 200
+SYMBOL_BUCKETS = 1024
+
+
+def _date_chunks(start: date, end: date, days: int) -> list[tuple[date, date]]:
+    if days < 1:
+        raise ValueError("Chunk size must be at least one day")
+    chunks: list[tuple[date, date]] = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(end, cursor + timedelta(days=days - 1))
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def _bucket_ranges(shards: int) -> list[tuple[int, int]]:
+    if shards < 1 or shards > SYMBOL_BUCKETS:
+        raise ValueError(f"Symbol shards must be between 1 and {SYMBOL_BUCKETS}")
+    ranges: list[tuple[int, int]] = []
+    for index in range(shards):
+        start = math.floor(index * SYMBOL_BUCKETS / shards)
+        end = math.floor((index + 1) * SYMBOL_BUCKETS / shards)
+        if start < end:
+            ranges.append((start, end))
+    return ranges
+
+
+def _sample_insert_query(
+    selected_horizons: list[int] | tuple[int, ...],
+    sample_stride_minutes: int,
+    entry_anchor_minute: int,
 ) -> str:
-    if horizon not in {5, 15, 30, 60}:
-        raise ValueError(f"Unsupported holding horizon: {horizon}")
+    horizons = sorted({int(value) for value in selected_horizons})
+    if not horizons or any(value not in {5, 15, 30, 60} for value in horizons):
+        raise ValueError(f"Unsupported holding horizons: {horizons}")
+    if sample_stride_minutes < 1:
+        raise ValueError("Sample stride must be at least one minute")
+    sampling = "TRUE" if sample_stride_minutes == 1 else (
+        f"mod(minute_of_day - {int(entry_anchor_minute)}, {int(sample_stride_minutes)}) = 0"
+    )
+    outcome_filter = " OR ".join(f"fwd_return_{horizon}m_pct IS NOT NULL" for horizon in horizons)
+    query = f"""
+        INSERT INTO ra_discovery_samples(
+            discovery_run_id,period_label,symbol_bucket,
+            symbol,bar_ts,trade_date,minute_of_day,weekday_iso,liquidity_tier,
+            ret_5m_pct,ret_30m_pct,relative_volume_20bar,
+            distance_from_cumulative_vwap_pct,cumulative_range_position,
+            gap_from_previous_regular_close_pct,previous_day_return_pct,
+            fwd_return_5m_pct,fwd_return_15m_pct,fwd_return_30m_pct,fwd_return_60m_pct
+        )
+        SELECT
+            %s,%s,
+            mod(abs(hashtext(symbol)::bigint), {SYMBOL_BUCKETS})::smallint,
+            symbol,bar_ts,trade_date,minute_of_day,weekday_iso,liquidity_tier,
+            ret_5m_pct,ret_30m_pct,relative_volume_20bar,
+            distance_from_cumulative_vwap_pct,cumulative_range_position,
+            gap_from_previous_regular_close_pct,previous_day_return_pct,
+            fwd_return_5m_pct,fwd_return_15m_pct,fwd_return_30m_pct,fwd_return_60m_pct
+        FROM ra_intraday_features
+        WHERE feature_set_id=%s
+          AND bar_ts >= (%s::date::timestamp AT TIME ZONE 'America/New_York')
+          AND bar_ts < (((%s::date + 1)::timestamp) AT TIME ZONE 'America/New_York')
+          AND trade_date BETWEEN %s AND %s
+          AND mod(abs(hashtext(symbol)::bigint), {SYMBOL_BUCKETS}) >= %s
+          AND mod(abs(hashtext(symbol)::bigint), {SYMBOL_BUCKETS}) < %s
+          AND ({outcome_filter})
+          AND ({sampling})
+        ON CONFLICT DO NOTHING
+    """
+    params = ("run", "discovery", "feature", date.today(), date.today(), date.today(), date.today(), 0, 256)
+    validate_sql_bindings(query, params, name="sample insert query")
+    return query
+
+
+def _partial_insert_query(
+    dimensions: list[Dimension], family_filter: str, direction: str,
+    horizon: int, entry_stride_minutes: int, entry_anchor_minute: int,
+) -> str:
     if direction not in {"long", "short"}:
         raise ValueError(f"Unsupported direction: {direction}")
+    if horizon not in {5, 15, 30, 60}:
+        raise ValueError(f"Unsupported holding horizon: {horizon}")
     if entry_stride_minutes < 1:
         raise ValueError("Entry stride must be at least one minute")
-
     aliases = [dimension.name for dimension in dimensions]
     select_dims = ",\n                ".join(
         f"{dimension.expression} AS {dimension.name}" for dimension in dimensions
     )
     group_dims = ",".join(aliases)
-    non_null_dimensions = " AND ".join(f"{name} IS NOT NULL" for name in aliases)
-    join_symbol = " AND ".join(f"s.{name}=g.{name}" for name in aliases)
-    join_date = " AND ".join(f"d.{name}=g.{name}" for name in aliases)
+    non_null = " AND ".join(f"{alias} IS NOT NULL" for alias in aliases)
+    joins = lambda left, right: " AND ".join(f"{left}.{a}={right}.{a}" for a in aliases)
+    key_expr = "concat_ws('|', " + ",".join(f"m.{alias}" for alias in aliases) + ")"
+    json_args = ",".join(f"'{a}',m.{a}" for a in aliases)
     outcome_column = f"fwd_return_{horizon}m_pct"
-    outcome = outcome_column if direction == "long" else f"-{outcome_column}"
-    sampling_filter = "TRUE"
-    if entry_stride_minutes > 1:
-        sampling_filter = (
-            f"mod(minute_of_day - {int(entry_anchor_minute)}, "
-            f"{int(entry_stride_minutes)}) = 0"
-        )
-
+    gross = outcome_column if direction == "long" else f"-{outcome_column}"
+    sampling = "TRUE" if entry_stride_minutes == 1 else (
+        f"mod(minute_of_day - {int(entry_anchor_minute)}, {int(entry_stride_minutes)}) = 0"
+    )
     query = f"""
+        INSERT INTO ra_discovery_partials(
+            discovery_task_chunk_id,group_key,group_values,
+            observations,gross_sum,net_sum,net_sum_squares,wins,
+            positive_sum,negative_sum_abs,worst_pct,histogram,symbol_counts,date_counts
+        )
         WITH categorised AS MATERIALIZED (
             SELECT symbol,trade_date,{select_dims},
-                ({outcome})::double precision AS outcome_gross,
-                (({outcome}) - %s::double precision)::double precision AS outcome
-            FROM ra_intraday_features
-            WHERE feature_set_id=%s
-              AND bar_ts >= (%s::date::timestamp AT TIME ZONE 'America/New_York')
-              AND bar_ts < (((%s::date + 1)::timestamp) AT TIME ZONE 'America/New_York')
+                ({gross})::double precision AS gross_outcome,
+                (({gross}) - %s::double precision)::double precision AS net_outcome
+            FROM ra_discovery_samples
+            WHERE discovery_run_id=%s
+              AND period_label=%s
               AND trade_date BETWEEN %s AND %s
+              AND symbol_bucket >= %s AND symbol_bucket < %s
               AND {outcome_column} IS NOT NULL
-              AND ({sampling_filter})
+              AND ({sampling})
               AND ({family_filter})
         ), base AS MATERIALIZED (
-            SELECT * FROM categorised WHERE {non_null_dimensions}
-        ), grouped AS (
+            SELECT *,
+                greatest({HISTOGRAM_MIN_BIN},least({HISTOGRAM_MAX_BIN},floor(net_outcome*10)::integer)) AS hist_bin
+            FROM categorised
+            WHERE {non_null}
+        ), metrics AS (
             SELECT {group_dims},count(*)::bigint AS observations,
-                count(DISTINCT symbol)::integer AS symbols,
-                count(DISTINCT trade_date)::integer AS dates,
-                avg(outcome_gross)::double precision AS gross_avg_pct,
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY outcome)::double precision AS median_pct,
-                avg((outcome>0)::integer)::double precision*100 AS win_rate_pct,
-                CASE WHEN stddev_samp(outcome)>0
-                     THEN avg(outcome)/stddev_samp(outcome)*sqrt(count(*)) END::double precision AS t_stat,
-                CASE WHEN abs(sum(outcome) FILTER (WHERE outcome<0))>0
-                     THEN sum(outcome) FILTER (WHERE outcome>0)
-                          /abs(sum(outcome) FILTER (WHERE outcome<0)) END::double precision AS profit_factor,
-                percentile_cont(0.05) WITHIN GROUP (ORDER BY outcome)::double precision AS p05_pct,
-                min(outcome)::double precision AS worst_pct
+                sum(gross_outcome)::double precision AS gross_sum,
+                sum(net_outcome)::double precision AS net_sum,
+                sum(net_outcome*net_outcome)::double precision AS net_sum_squares,
+                count(*) FILTER (WHERE net_outcome>0)::bigint AS wins,
+                COALESCE(sum(net_outcome) FILTER (WHERE net_outcome>0),0)::double precision AS positive_sum,
+                COALESCE(abs(sum(net_outcome) FILTER (WHERE net_outcome<0)),0)::double precision AS negative_sum_abs,
+                min(net_outcome)::double precision AS worst_pct
             FROM base GROUP BY {group_dims}
         ), symbol_counts AS (
             SELECT {group_dims},symbol,count(*)::bigint AS n
             FROM base GROUP BY {group_dims},symbol
-        ), symbol_max AS (
-            SELECT {group_dims},max(n)::bigint AS max_symbol_n
+        ), symbols AS (
+            SELECT {group_dims},jsonb_object_agg(symbol,n) AS symbol_counts
             FROM symbol_counts GROUP BY {group_dims}
         ), date_counts AS (
             SELECT {group_dims},trade_date,count(*)::bigint AS n
             FROM base GROUP BY {group_dims},trade_date
-        ), date_max AS (
-            SELECT {group_dims},max(n)::bigint AS max_date_n
+        ), dates AS (
+            SELECT {group_dims},jsonb_object_agg(trade_date::text,n) AS date_counts
             FROM date_counts GROUP BY {group_dims}
+        ), hist_counts AS (
+            SELECT {group_dims},hist_bin,count(*)::bigint AS n
+            FROM base GROUP BY {group_dims},hist_bin
+        ), histograms AS (
+            SELECT {group_dims},jsonb_object_agg(hist_bin::text,n) AS histogram
+            FROM hist_counts GROUP BY {group_dims}
         )
-        SELECT g.*,100.0*s.max_symbol_n/NULLIF(g.observations,0) AS max_symbol_share_pct,
-            100.0*d.max_date_n/NULLIF(g.observations,0) AS max_date_share_pct
-        FROM grouped g
-        JOIN symbol_max s ON {join_symbol}
-        JOIN date_max d ON {join_date}
+        SELECT %s,{key_expr},jsonb_build_object({json_args}),
+            m.observations,m.gross_sum,m.net_sum,m.net_sum_squares,m.wins,
+            m.positive_sum,m.negative_sum_abs,m.worst_pct,
+            h.histogram,s.symbol_counts,d.date_counts
+        FROM metrics m
+        JOIN symbols s ON {joins('s','m')}
+        JOIN dates d ON {joins('d','m')}
+        JOIN histograms h ON {joins('h','m')}
+        WHERE TRUE
+        ON CONFLICT(discovery_task_chunk_id,group_key) DO UPDATE SET
+            group_values=excluded.group_values,observations=excluded.observations,
+            gross_sum=excluded.gross_sum,net_sum=excluded.net_sum,
+            net_sum_squares=excluded.net_sum_squares,wins=excluded.wins,
+            positive_sum=excluded.positive_sum,negative_sum_abs=excluded.negative_sum_abs,
+            worst_pct=excluded.worst_pct,histogram=excluded.histogram,
+            symbol_counts=excluded.symbol_counts,date_counts=excluded.date_counts
     """
-    validate_sql_bindings(
-        query,
-        (float(cost_pct), "feature-set", date.today(), date.today(), date.today(), date.today()),
-        name="period group query",
-    )
+    params = (0.2, "run", "discovery", date.today(), date.today(), 0, 256, 1)
+    validate_sql_bindings(query, params, name="partial insert query")
     return query
 
-def _conditions(dimensions: list[Dimension], row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
-    conditions: list[dict[str, Any]] = []
-    descriptions: list[str] = []
-    for dim in dimensions:
-        label = row.get(dim.name)
-        if label is None or label not in dim.labels:
-            return [], []
-        condition, description = dim.labels[label]
-        if condition["column"] not in ALLOWED_CONDITION_COLUMNS:
-            raise ValueError(f"Unsupported generated condition column: {condition['column']}")
-        if condition["operator"] == "range" and condition.get("low") is None and condition.get("high") is None:
-            raise ValueError(f"Dimension {dim.name} generated an unconstrained range")
-        conditions.append(dict(condition))
-        descriptions.append(description)
-    return conditions, descriptions
 
-
-def _plain_rule(direction: str, descriptions: list[str], horizon: int) -> str:
-    if not descriptions:
-        raise ValueError("A rule requires at least one condition description")
-    verb = "Buy" if direction == "long" else "Short"
-    joined = ", ".join(descriptions[:-1]) + (f" and {descriptions[-1]}" if len(descriptions) > 1 else descriptions[0])
-    return f"{verb} when {joined}; exit after {horizon} minutes."
-
-
-def _rank_score(discovery: dict[str, Any], validation: dict[str, Any] | None, cost_pct: float) -> float:
-    d_net = float(discovery["gross_avg_pct"] or 0) - cost_pct
-    d_t = max(float(discovery["t_stat"] or 0), 0)
-    concentration = max(0.05, 1 - float(discovery["max_symbol_share_pct"] or 100) / 100) * max(0.05, 1 - float(discovery["max_date_share_pct"] or 100) / 100)
-    score = d_net * math.log1p(float(discovery["observations"])) * max(0.25, d_t) * concentration
-    if validation:
-        v_net = float(validation["gross_avg_pct"] or 0) - cost_pct
-        if v_net <= 0:
-            score *= 0.1
-        else:
-            stability = 1 - min(abs(d_net - v_net) / max(abs(d_net), abs(v_net), 0.01), 1)
-            score *= (0.5 + 0.5 * stability) * min(1.5, max(0.25, float(validation["t_stat"] or 0)))
-    return finite_or_none(score) or 0.0
-
-
-def _normalise_stats(row: dict[str, Any] | None, cost_pct: float) -> dict[str, Any]:
-    if not row:
-        return {}
-    observations = int(row["observations"] or 0)
-    return {
-        "observations": observations, "symbols": int(row["symbols"] or 0), "dates": int(row["dates"] or 0),
-        "gross_avg_pct": finite_or_none(row["gross_avg_pct"]),
-        "net_avg_pct": finite_or_none(float(row["gross_avg_pct"]) - cost_pct) if observations and row["gross_avg_pct"] is not None else None,
-        "median_pct": finite_or_none(row["median_pct"]), "win_rate_pct": finite_or_none(row["win_rate_pct"]),
-        "t_stat": finite_or_none(row["t_stat"]), "profit_factor": finite_or_none(row["profit_factor"]),
-        "p05_pct": finite_or_none(row["p05_pct"]), "worst_pct": finite_or_none(row["worst_pct"]),
-        "max_symbol_share_pct": finite_or_none(row["max_symbol_share_pct"]),
-        "max_date_share_pct": finite_or_none(row["max_date_share_pct"]),
-    }
-
-
-def _run_group_query(
-    job_id: str,
-    task_id: int,
-    feature_set_id: str,
-    start: date,
-    end: date,
-    family: str,
-    horizon: int,
-    direction: str,
-    entry_stride_minutes: int,
-    entry_anchor_minute: int,
-    cost_pct: float,
-) -> tuple[list[Dimension], list[dict[str, Any]]]:
-    spec = FAMILIES[family]
-    dimensions: list[Dimension] = spec["dimensions"]
-    query = _period_group_query(
-        dimensions, spec["filter"], horizon, direction,
-        entry_stride_minutes, entry_anchor_minute, cost_pct,
-    )
-    params = (float(cost_pct), feature_set_id, start, end, start, end)
-    validate_sql_bindings(query, params, name=f"{family}/{direction}/{horizon}m discovery query")
-    settings = get_settings()
-    statement_timeout = max(30, int(settings.discovery_statement_timeout_seconds))
-    wall_timeout = max(statement_timeout + 5, int(settings.discovery_wall_timeout_seconds))
-    cancel_grace = max(3, int(settings.discovery_cancel_grace_seconds))
-
-    with connection() as conn:
-        with conn.cursor() as pid_cur:
-            pid_cur.execute("SELECT pg_backend_pid() AS pid")
-            backend_pid = int(pid_cur.fetchone()["pid"])
-
-        stop_monitor = threading.Event()
-        interrupted: dict[str, str | None] = {"action": None}
-        started_monotonic = clock.monotonic()
-
-        def cancel_or_terminate(action: str) -> None:
-            if interrupted["action"] is not None:
-                return
-            interrupted["action"] = action
-            try:
-                conn.cancel()
-            except Exception:
-                pass
-            if not stop_monitor.wait(cancel_grace):
-                try:
-                    with connection() as kill_conn:
-                        with kill_conn.cursor() as kill_cur:
-                            kill_cur.execute("SELECT pg_terminate_backend(%s)", (backend_pid,))
-                        kill_conn.commit()
-                except Exception:
-                    pass
-
-        def monitor_control() -> None:
-            while not stop_monitor.wait(2.0):
-                elapsed = clock.monotonic() - started_monotonic
-                try:
-                    with connection() as control_conn:
-                        with control_conn.cursor() as control_cur:
-                            control_cur.execute(
-                                "UPDATE ra_jobs SET heartbeat_at=now() WHERE id=%s RETURNING status",
-                                (job_id,),
-                            )
-                            row = control_cur.fetchone()
-                            control_cur.execute(
-                                "UPDATE ra_discovery_tasks SET updated_at=now() WHERE id=%s AND status='running'",
-                                (task_id,),
-                            )
-                        control_conn.commit()
-                    status = row["status"] if row else "cancel_requested"
-                    if status in {"pause_requested", "cancel_requested"}:
-                        cancel_or_terminate("pause" if status == "pause_requested" else "cancel")
-                        return
-                except Exception:
-                    pass
-                if elapsed >= wall_timeout:
-                    cancel_or_terminate("timeout")
-                    return
-
-        monitor = threading.Thread(
-            target=monitor_control,
-            name=f"discovery-control-{task_id}",
-            daemon=True,
-        )
-        monitor.start()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}s'")
-                cur.execute("SET LOCAL lock_timeout = '60s'")
-                cur.execute("SET LOCAL jit = off")
-                cur.execute(query, params)
-                rows = cur.fetchall()
-            conn.rollback()
-        except Exception as exc:
-            conn.rollback()
-            if interrupted["action"] in {"pause", "cancel"}:
-                raise JobInterrupted(interrupted["action"]) from exc
-            if interrupted["action"] == "timeout":
-                raise DiscoveryQueryTimeout(
-                    f"Discovery query exceeded the {wall_timeout}-second wall-clock limit"
-                ) from exc
-            raise
-        finally:
-            stop_monitor.set()
-            monitor.join(timeout=3.0)
-    return dimensions, [dict(row) for row in rows]
-
-def _is_discovery_timeout(exc: Exception) -> bool:
-    if isinstance(exc, DiscoveryQueryTimeout):
-        return True
-    message = str(exc).lower()
-    return "statement timeout" in message or "wall-clock limit" in message
-
-
-def _run_group_query_with_retries(
-    job_id: str,
-    task_id: int,
-    feature_set_id: str,
-    start: date,
-    end: date,
-    family: str,
-    horizon: int,
-    direction: str,
-    entry_stride_minutes: int,
-    entry_anchor_minute: int,
-    period_label: str,
-    cost_pct: float,
-) -> tuple[list[Dimension], list[dict[str, Any]]]:
-    attempts = max(1, int(get_settings().discovery_query_retries))
-    for attempt in range(1, attempts + 1):
-        try:
-            return _run_group_query(
-                job_id, task_id, feature_set_id, start, end, family, horizon,
-                direction, entry_stride_minutes, entry_anchor_minute, cost_pct,
-            )
-        except JobInterrupted:
-            raise
-        except Exception as exc:
-            if not _is_discovery_timeout(exc) or attempt >= attempts:
-                raise
-            delay = min(30.0, 4.0 * attempt + random.uniform(0.5, 2.0))
-            add_event(
-                job_id,
-                "discovery_query_retry",
-                f"The {period_label} query timed out; retrying after {delay:.1f}s.",
-                level="warning",
-                details={
-                    "family": family,
-                    "direction": direction,
-                    "horizon_minutes": horizon,
-                    "attempt": attempt,
-                    "entry_stride_minutes": entry_stride_minutes,
-                },
-            )
-            check_control(job_id)
-            clock.sleep(delay)
-    raise RuntimeError("Discovery query retry loop ended unexpectedly")
-
-
-def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
-    with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT status,min_trade_date,max_trade_date,config FROM ra_feature_sets WHERE id=%s",
-                (config.feature_set_id,),
-            )
-            feature_set = cur.fetchone()
-        conn.rollback()
-    if not feature_set or feature_set["status"] != "completed":
-        raise RuntimeError("The selected feature set does not exist or is not completed")
-    periods = [(config.discovery_start, config.discovery_end)]
-    if config.validation_start and config.validation_end:
-        periods.append((config.validation_start, config.validation_end))
-    if any(start < feature_set["min_trade_date"] or end > feature_set["max_trade_date"] for start, end in periods):
-        raise ValueError(
-            f"Discovery and validation dates must remain within the feature set: "
-            f"{feature_set['min_trade_date']} to {feature_set['max_trade_date']}"
-        )
-
-    feature_config = dict(feature_set.get("config") or {})
-    base_minutes = timeframe_minutes(str(feature_config.get("timeframe") or "1Min"))
-    session_name = str(feature_config.get("session") or "regular")
-    if session_name != "regular":
-        raise ValueError(
-            "The audited interpretable rule families are calibrated for regular-session features. "
-            f"Selected feature session: {session_name}. Build a regular-session feature set first."
-        )
-    available_outcomes = {int(value) for value in feature_config.get("outcome_horizons_minutes", [])}
-    missing_outcomes = sorted(set(map(int, config.holding_horizons_minutes)) - available_outcomes)
-    if missing_outcomes:
-        raise ValueError(
-            f"The feature set does not contain forward outcomes for: {missing_outcomes}. "
-            f"Available horizons: {sorted(available_outcomes)}"
-        )
-    entry_anchor_minute = 570
-    run_config = config.model_dump(mode="json")
-    run_config.update({
-        "engine_version": DISCOVERY_VERSION,
-        "rule_definition_version": RULE_DEFINITION_VERSION,
-        "base_timeframe_minutes": base_minutes,
-        "entry_anchor_minute": entry_anchor_minute,
-    })
-
-    combinations = [
-        (family, direction, int(horizon))
-        for family in config.families
-        for direction in config.directions
-        for horizon in config.holding_horizons_minutes
-    ]
-    engine_upgraded = False
-    with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id,config FROM ra_discovery_runs WHERE job_id=%s", (job_id,))
-            existing = cur.fetchone()
-            if existing:
-                run_id = existing["id"]
-                previous_engine = str((existing.get("config") or {}).get("engine_version") or "legacy")
-                engine_upgraded = previous_engine != DISCOVERY_VERSION
-                cur.execute(
-                    "UPDATE ra_discovery_runs SET status='running',completed_at=NULL,config=%s WHERE id=%s",
-                    (Jsonb(run_config), run_id),
-                )
-                if engine_upgraded:
-                    # Results produced by a previous sampling/query definition are
-                    # not mixed with v1.0.7 results. This normally resets only a
-                    # small number of completed tasks after an upgrade.
-                    cur.execute(
-                        "UPDATE ra_discovery_tasks SET status='pending',groups_tested=0,candidates_retained=0,error=NULL,completed_at=NULL WHERE discovery_run_id=%s",
-                        (run_id,),
-                    )
-                    cur.execute("DELETE FROM ra_candidate_rules WHERE discovery_run_id=%s", (run_id,))
-                else:
-                    cur.execute(
-                        "UPDATE ra_discovery_tasks SET status='pending',error=NULL WHERE discovery_run_id=%s AND status IN ('running','failed','cancelled')",
-                        (run_id,),
-                    )
-            else:
-                cur.execute(
-                    "INSERT INTO ra_discovery_runs(job_id,feature_set_id,name,config) VALUES (%s,%s,%s,%s) RETURNING id",
-                    (job_id, config.feature_set_id, config.name, Jsonb(run_config)),
-                )
-                run_id = cur.fetchone()["id"]
-            cur.executemany(
-                """
-                INSERT INTO ra_discovery_tasks(discovery_run_id,family,direction,holding_horizon_minutes)
-                VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING
-                """,
-                [(run_id, family, direction, horizon) for family, direction, horizon in combinations],
-            )
-            cur.execute(
-                "SELECT * FROM ra_discovery_tasks WHERE discovery_run_id=%s ORDER BY id",
-                (run_id,),
-            )
-            tasks = [dict(row) for row in cur.fetchall()]
-        conn.commit()
-
-    if engine_upgraded:
-        add_event(
-            job_id,
-            "discovery_engine_upgraded",
-            "Discovery tasks were reset so every result uses the audited v1.1.0 rule definitions and sampling methodology.",
-            level="warning",
-            details={"engine_version": DISCOVERY_VERSION},
-        )
-
-    completed = sum(1 for task in tasks if task["status"] == "completed")
-    set_progress(job_id, "scanning rule families", completed, len(tasks), result={"discovery_run_id": run_id})
-    cost_pct = config.round_trip_cost_bps / 100.0
-
-    for task in tasks:
-        if task["status"] == "completed":
-            continue
-        check_control(job_id)
-        family, direction, horizon = task["family"], task["direction"], int(task["holding_horizon_minutes"])
-        with connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE ra_discovery_tasks SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,now()),error=NULL WHERE id=%s",
-                    (task["id"],),
-                )
-                cur.execute(
-                    "DELETE FROM ra_candidate_rules WHERE discovery_run_id=%s AND family=%s AND direction=%s AND holding_horizon_minutes=%s",
-                    (run_id, family, direction, horizon),
-                )
-            conn.commit()
-        try:
-            entry_stride = 1
-            if config.entry_sampling_mode == "non_overlapping":
-                entry_stride = max(1, horizon // base_minutes)
-            set_progress(
-                job_id,
-                f"scanning {family} · {direction} · {horizon}m · discovery · every {entry_stride * base_minutes}m",
-                completed,
-                len(tasks),
-            )
-            dimensions, discovery_rows = _run_group_query_with_retries(
-                job_id, int(task["id"]), str(config.feature_set_id),
-                config.discovery_start, config.discovery_end,
-                family, horizon, direction,
-                entry_stride * base_minutes, entry_anchor_minute,
-                "discovery-period", cost_pct,
-            )
-            validation_map: dict[tuple[Any, ...], dict[str, Any]] = {}
-            if config.validation_start and config.validation_end:
-                set_progress(
-                    job_id,
-                    f"scanning {family} · {direction} · {horizon}m · validation · every {entry_stride * base_minutes}m",
-                    completed,
-                    len(tasks),
-                )
-                _, validation_rows = _run_group_query_with_retries(
-                    job_id, int(task["id"]), str(config.feature_set_id),
-                    config.validation_start, config.validation_end,
-                    family, horizon, direction,
-                    entry_stride * base_minutes, entry_anchor_minute,
-                    "validation-period", cost_pct,
-                )
-                validation_map = {tuple(row[d.name] for d in dimensions): row for row in validation_rows}
-
-            eligible: list[tuple[float, dict[str, Any], dict[str, Any] | None, list[dict[str, Any]], str]] = []
-            for row in discovery_rows:
-                net = float(row["gross_avg_pct"] or 0) - cost_pct
-                if (
-                    int(row["observations"]) < config.minimum_observations
-                    or int(row["symbols"]) < config.minimum_symbols
-                    or int(row["dates"]) < config.minimum_dates
-                    or float(row["max_symbol_share_pct"] or 100) > config.maximum_symbol_concentration_pct
-                    or float(row["max_date_share_pct"] or 100) > config.maximum_date_concentration_pct
-                    or net <= 0
-                ):
-                    continue
-                key = tuple(row[d.name] for d in dimensions)
-                validation = validation_map.get(key)
-                conditions, descriptions = _conditions(dimensions, row)
-                if not conditions:
-                    continue
-                plain = _plain_rule(direction, descriptions, horizon)
-                eligible.append((_rank_score(row, validation, cost_pct), row, validation, conditions, plain))
-
-            eligible.sort(key=lambda item: item[0], reverse=True)
-            selected = eligible[: config.top_candidates_per_family]
-            with connection() as conn:
-                with conn.cursor() as cur:
-                    for score, discovery_row, validation_row, conditions, plain in selected:
-                        ds = _normalise_stats(discovery_row, cost_pct)
-                        vs = _normalise_stats(validation_row, cost_pct)
-                        cur.execute(
-                            """
-                            INSERT INTO ra_candidate_rules(
-                                discovery_run_id,feature_set_id,family,direction,holding_horizon_minutes,
-                                entry_sampling_mode,entry_stride_minutes,entry_anchor_minute,rule_definition_version,
-                                conditions,plain_english_rule,rank_score,
-                                discovery_observations,discovery_symbols,discovery_dates,
-                                discovery_gross_avg_pct,discovery_net_avg_pct,discovery_median_pct,
-                                discovery_win_rate_pct,discovery_t_stat,discovery_profit_factor,
-                                discovery_p05_pct,discovery_worst_pct,discovery_max_symbol_share_pct,
-                                discovery_max_date_share_pct,
-                                validation_observations,validation_symbols,validation_dates,
-                                validation_gross_avg_pct,validation_net_avg_pct,validation_median_pct,
-                                validation_win_rate_pct,validation_t_stat,validation_profit_factor,
-                                validation_p05_pct,validation_worst_pct,validation_max_symbol_share_pct,
-                                validation_max_date_share_pct
-                            ) VALUES (
-                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                            )
-                            """,
-                            (
-                                run_id, config.feature_set_id, family, direction, horizon,
-                                config.entry_sampling_mode, entry_stride * base_minutes,
-                                entry_anchor_minute, RULE_DEFINITION_VERSION,
-                                Jsonb(conditions), plain, score,
-                                ds["observations"], ds["symbols"], ds["dates"], ds["gross_avg_pct"], ds["net_avg_pct"],
-                                ds["median_pct"], ds["win_rate_pct"], ds["t_stat"], ds["profit_factor"], ds["p05_pct"],
-                                ds["worst_pct"], ds["max_symbol_share_pct"], ds["max_date_share_pct"],
-                                vs.get("observations"), vs.get("symbols"), vs.get("dates"), vs.get("gross_avg_pct"),
-                                vs.get("net_avg_pct"), vs.get("median_pct"), vs.get("win_rate_pct"), vs.get("t_stat"),
-                                vs.get("profit_factor"), vs.get("p05_pct"), vs.get("worst_pct"),
-                                vs.get("max_symbol_share_pct"), vs.get("max_date_share_pct"),
-                            ),
-                        )
-                    cur.execute(
-                        """
-                        UPDATE ra_discovery_tasks SET status='completed',groups_tested=%s,
-                            candidates_retained=%s,completed_at=now(),error=NULL WHERE id=%s
-                        """,
-                        (len(discovery_rows), len(selected), task["id"]),
-                    )
-                conn.commit()
-            completed += 1
-            set_progress(job_id, f"completed {family} · {direction} · {horizon}m", completed, len(tasks))
-            add_event(
-                job_id, "family_scan_completed",
-                f"{family}: tested {len(discovery_rows):,} groups and retained {len(selected):,} candidates for {direction} {horizon}m.",
-            )
-        except Exception as exc:
-            with connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE ra_discovery_tasks SET status='failed',error=%s WHERE id=%s",
-                        (str(exc), task["id"]),
-                    )
-                    cur.execute("UPDATE ra_discovery_runs SET status='failed' WHERE id=%s", (run_id,))
-                conn.commit()
-            raise
-
-    check_control(job_id)
-    with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COALESCE(sum(groups_tested),0)::bigint AS tested,
-                    COALESCE(sum(candidates_retained),0)::integer AS retained
-                FROM ra_discovery_tasks WHERE discovery_run_id=%s
-                """,
-                (run_id,),
-            )
-            totals = cur.fetchone()
-            cur.execute(
-                "UPDATE ra_discovery_runs SET status='completed',candidates_tested=%s,candidates_retained=%s,completed_at=now() WHERE id=%s",
-                (totals["tested"], totals["retained"], run_id),
-            )
-        conn.commit()
-    result = {
-        "discovery_run_id": run_id,
-        "candidates_tested": totals["tested"],
-        "candidates_retained": totals["retained"],
-    }
-    add_event(
-        job_id, "discovery_completed",
-        f"Discovery retained {totals['retained']:,} candidates from {totals['tested']:,} grouped tests.",
-        details=result,
-    )
-    return json_safe(result)
-
-def _condition_sql(conditions: list[dict[str, Any]]) -> tuple[str, list[Any]]:
+def _condition_sql(conditions: list[dict[str, Any]], alias: str = "") -> tuple[str, list[Any]]:
+    prefix = f"{alias}." if alias else ""
     clauses: list[str] = []
     params: list[Any] = []
     for condition in conditions:
@@ -844,19 +501,26 @@ def _condition_sql(conditions: list[dict[str, Any]]) -> tuple[str, list[Any]]:
             raise ValueError(f"Unsupported condition column: {column}")
         operator = condition.get("operator")
         if operator == "eq":
-            clauses.append(f"{column}=%s")
+            clauses.append(f"{prefix}{column}=%s")
             params.append(condition.get("value"))
+        elif operator in {"gt", "gte", "lt", "lte"}:
+            sql_operator = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}[operator]
+            clauses.append(f"{prefix}{column}{sql_operator}%s")
+            params.append(condition.get("value"))
+        elif operator == "abs_gte":
+            clauses.append(f"abs({prefix}{column})>=%s")
+            params.append(condition.get("value"))
+        elif operator == "not_null":
+            clauses.append(f"{prefix}{column} IS NOT NULL")
         elif operator == "range":
             low, high = condition.get("low"), condition.get("high")
             if low is None and high is None:
                 raise ValueError(f"Unbounded condition is not permitted for {column}")
             if low is not None:
-                low_operator = ">=" if condition.get("low_inclusive", True) else ">"
-                clauses.append(f"{column}{low_operator}%s")
+                clauses.append(f"{prefix}{column}{'>=' if condition.get('low_inclusive', True) else '>'}%s")
                 params.append(low)
             if high is not None:
-                high_operator = "<=" if condition.get("high_inclusive", False) else "<"
-                clauses.append(f"{column}{high_operator}%s")
+                clauses.append(f"{prefix}{column}{'<=' if condition.get('high_inclusive', False) else '<'}%s")
                 params.append(high)
         else:
             raise ValueError(f"Unsupported condition operator: {operator}")
@@ -865,153 +529,813 @@ def _condition_sql(conditions: list[dict[str, Any]]) -> tuple[str, list[Any]]:
     return query, params
 
 
-def _exact_stats_query(
-    conditions: list[dict[str, Any]],
-    direction: str,
-    horizon: int,
-    *,
-    entry_stride_minutes: int,
-    entry_anchor_minute: int,
-    cost_pct: float = 0.0,
+def _sealed_partial_query(
+    conditions: list[dict[str, Any]], direction: str, horizon: int,
+    entry_stride_minutes: int, entry_anchor_minute: int,
 ) -> tuple[str, list[Any]]:
-    where, condition_params = _condition_sql(conditions)
     if direction not in {"long", "short"}:
         raise ValueError(f"Unsupported direction: {direction}")
     if horizon not in {5, 15, 30, 60}:
         raise ValueError(f"Unsupported holding horizon: {horizon}")
-    outcome_column = f"fwd_return_{horizon}m_pct"
-    outcome = outcome_column if direction == "long" else f"-{outcome_column}"
-    sampling_filter = "TRUE"
-    if entry_stride_minutes > 1:
-        sampling_filter = f"mod(minute_of_day - {int(entry_anchor_minute)}, {int(entry_stride_minutes)}) = 0"
+    where, condition_params = _condition_sql(conditions)
+    outcome_col = f"fwd_return_{horizon}m_pct"
+    gross = outcome_col if direction == "long" else f"-{outcome_col}"
+    sampling = "TRUE" if entry_stride_minutes == 1 else (
+        f"mod(minute_of_day - {int(entry_anchor_minute)}, {int(entry_stride_minutes)}) = 0"
+    )
     query = f"""
         WITH base AS MATERIALIZED (
-            SELECT symbol,trade_date,
-                ({outcome})::double precision AS outcome_gross,
-                (({outcome}) - %s::double precision)::double precision AS outcome
+            SELECT symbol,trade_date,({gross})::double precision AS gross_outcome,
+                (({gross})-%s::double precision)::double precision AS net_outcome
             FROM ra_intraday_features
             WHERE feature_set_id=%s
               AND bar_ts >= (%s::date::timestamp AT TIME ZONE 'America/New_York')
               AND bar_ts < (((%s::date + 1)::timestamp) AT TIME ZONE 'America/New_York')
               AND trade_date BETWEEN %s AND %s
-              AND {outcome_column} IS NOT NULL
-              AND ({sampling_filter})
+              AND mod(abs(hashtext(symbol)::bigint), {SYMBOL_BUCKETS}) >= %s
+              AND mod(abs(hashtext(symbol)::bigint), {SYMBOL_BUCKETS}) < %s
+              AND {outcome_col} IS NOT NULL
+              AND ({sampling})
               AND ({where})
-        ), totals AS (
-            SELECT count(*)::bigint AS observations,count(DISTINCT symbol)::integer AS symbols,
-                count(DISTINCT trade_date)::integer AS dates,avg(outcome_gross)::double precision AS gross_avg_pct,
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY outcome)::double precision AS median_pct,
-                avg((outcome>0)::integer)::double precision*100 AS win_rate_pct,
-                CASE WHEN stddev_samp(outcome)>0
-                     THEN avg(outcome)/stddev_samp(outcome)*sqrt(count(*)) END::double precision AS t_stat,
-                CASE WHEN abs(sum(outcome) FILTER (WHERE outcome<0))>0
-                     THEN sum(outcome) FILTER (WHERE outcome>0)
-                          /abs(sum(outcome) FILTER (WHERE outcome<0)) END::double precision AS profit_factor,
-                percentile_cont(0.05) WITHIN GROUP (ORDER BY outcome)::double precision AS p05_pct,
-                min(outcome)::double precision AS worst_pct
+        ), metrics AS (
+            SELECT count(*)::bigint AS observations,
+                COALESCE(sum(gross_outcome),0)::double precision AS gross_sum,
+                COALESCE(sum(net_outcome),0)::double precision AS net_sum,
+                COALESCE(sum(net_outcome*net_outcome),0)::double precision AS net_sum_squares,
+                count(*) FILTER (WHERE net_outcome>0)::bigint AS wins,
+                COALESCE(sum(net_outcome) FILTER (WHERE net_outcome>0),0)::double precision AS positive_sum,
+                COALESCE(abs(sum(net_outcome) FILTER (WHERE net_outcome<0)),0)::double precision AS negative_sum_abs,
+                min(net_outcome)::double precision AS worst_pct
             FROM base
         ), sym AS (
-            SELECT max(n) AS max_n FROM (SELECT symbol,count(*) n FROM base GROUP BY symbol) x
+            SELECT COALESCE(jsonb_object_agg(symbol,n),'{{}}'::jsonb) AS symbol_counts
+            FROM (SELECT symbol,count(*)::bigint n FROM base GROUP BY symbol) x
         ), dat AS (
-            SELECT max(n) AS max_n FROM (SELECT trade_date,count(*) n FROM base GROUP BY trade_date) x
+            SELECT COALESCE(jsonb_object_agg(trade_date::text,n),'{{}}'::jsonb) AS date_counts
+            FROM (SELECT trade_date,count(*)::bigint n FROM base GROUP BY trade_date) x
+        ), hist AS (
+            SELECT COALESCE(jsonb_object_agg(hist_bin::text,n),'{{}}'::jsonb) AS histogram
+            FROM (
+                SELECT greatest({HISTOGRAM_MIN_BIN},least({HISTOGRAM_MAX_BIN},floor(net_outcome*10)::integer)) AS hist_bin,
+                    count(*)::bigint AS n
+                FROM base GROUP BY 1
+            ) x
         )
-        SELECT t.*,100.0*sym.max_n/NULLIF(t.observations,0) AS max_symbol_share_pct,
-            100.0*dat.max_n/NULLIF(t.observations,0) AS max_date_share_pct
-        FROM totals t CROSS JOIN sym CROSS JOIN dat
+        SELECT m.*,sym.symbol_counts,dat.date_counts,hist.histogram
+        FROM metrics m CROSS JOIN sym CROSS JOIN dat CROSS JOIN hist
     """
+    sample_params = (0.2, "feature", date.today(), date.today(), date.today(), date.today(), 0, 256, *condition_params)
+    validate_sql_bindings(query, sample_params, name="sealed partial query")
     return query, condition_params
 
 
-def _exact_stats(
-    feature_set_id: str,
-    conditions: list[dict[str, Any]],
-    direction: str,
-    horizon: int,
-    start: date,
-    end: date,
-    cost_pct: float,
-    *,
-    entry_stride_minutes: int,
-    entry_anchor_minute: int,
-) -> dict[str, Any]:
-    query, condition_params = _exact_stats_query(
-        conditions,
-        direction,
-        horizon,
-        entry_stride_minutes=entry_stride_minutes,
-        entry_anchor_minute=entry_anchor_minute,
-        cost_pct=cost_pct,
+def _is_timeout(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, DiscoveryQueryTimeout) or "statement timeout" in text or "wall-clock" in text
+
+
+def _is_retryable_database_error(exc: Exception) -> bool:
+    """Return True for transient database failures that are safe to replay.
+
+    Every discovery write is idempotent at chunk level: the exact partial/sample
+    slice is deleted before replay and the chunk owns a unique key. That makes
+    deadlocks, serialization failures, short lock timeouts and dropped pooled
+    connections retryable without mixing partial statistics.
+    """
+    text = str(exc).lower()
+    markers = (
+        "deadlock detected",
+        "could not serialize access",
+        "serialization failure",
+        "lock timeout",
+        "canceling statement due to lock timeout",
+        "connection is closed",
+        "connection reset",
+        "server closed the connection",
+        "terminating connection",
+        "ssl connection has been closed",
     )
-    params = (float(cost_pct), feature_set_id, start, end, start, end, *condition_params)
-    validate_sql_bindings(query, params, name="sealed exact-statistics query")
+    return any(marker in text for marker in markers)
+
+
+def _retry_chunk(table: str, chunk_id: int, error: Exception, job_id: str, event_type: str, attempts: int) -> bool:
+    maximum = max(1, int(get_settings().discovery_query_retries))
+    if not _is_retryable_database_error(error) or attempts >= maximum:
+        return False
+    delay = min(10.0, 0.75 * (2 ** max(0, attempts - 1)) + random.random())
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SET LOCAL statement_timeout = '{int(get_settings().discovery_statement_timeout_seconds)}s'")
-            cur.execute("SET LOCAL jit = off")
-            cur.execute(query, params)
+            cur.execute(
+                f"UPDATE {table} SET status='pending',error=%s WHERE id=%s",
+                (f"Transient database error; retrying after {delay:.1f}s: {error}", chunk_id),
+            )
+        conn.commit()
+    add_event(
+        job_id, event_type, f"Transient database error; chunk will retry after {delay:.1f}s.",
+        level="warning", details={"chunk_id": chunk_id, "attempt": attempts, "error": str(error)},
+    )
+    clock.sleep(delay)
+    return True
+
+
+def _execute_guarded(
+    job_id: str, query: str, params: tuple[Any, ...], *, fetch: str = "none", name: str
+) -> Any:
+    validate_sql_bindings(query, params, name=name)
+    settings = get_settings()
+    statement_timeout = max(30, int(settings.discovery_statement_timeout_seconds))
+    wall_timeout = max(statement_timeout + 5, int(settings.discovery_wall_timeout_seconds))
+    cancel_grace = max(3, int(settings.discovery_cancel_grace_seconds))
+    with connection() as conn:
+        with conn.cursor() as pid_cur:
+            pid_cur.execute("SELECT pg_backend_pid() AS pid")
+            backend_pid = int(pid_cur.fetchone()["pid"])
+        stop = threading.Event()
+        interrupted: dict[str, str | None] = {"action": None}
+        started = clock.monotonic()
+
+        def interrupt(action: str) -> None:
+            if interrupted["action"] is not None:
+                return
+            interrupted["action"] = action
+            try:
+                conn.cancel()
+            except Exception:
+                pass
+            if not stop.wait(cancel_grace):
+                try:
+                    with connection() as killer:
+                        with killer.cursor() as cur:
+                            cur.execute("SELECT pg_terminate_backend(%s)", (backend_pid,))
+                        killer.commit()
+                except Exception:
+                    pass
+
+        def monitor() -> None:
+            while not stop.wait(2.0):
+                try:
+                    with connection() as control:
+                        with control.cursor() as cur:
+                            cur.execute("UPDATE ra_jobs SET heartbeat_at=now() WHERE id=%s RETURNING status", (job_id,))
+                            row = cur.fetchone()
+                        control.commit()
+                    status = row["status"] if row else "cancel_requested"
+                    if status in {"pause_requested", "cancel_requested"}:
+                        interrupt("pause" if status == "pause_requested" else "cancel")
+                        return
+                except Exception:
+                    pass
+                if clock.monotonic() - started >= wall_timeout:
+                    interrupt("timeout")
+                    return
+
+        thread = threading.Thread(target=monitor, name=f"discovery-v2-{name}", daemon=True)
+        thread.start()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}s'")
+                cur.execute("SET LOCAL lock_timeout = '30s'")
+                cur.execute("SET LOCAL jit = off")
+                cur.execute(query, params)
+                if fetch == "one":
+                    result = cur.fetchone()
+                elif fetch == "all":
+                    result = cur.fetchall()
+                elif fetch == "rowcount":
+                    result = cur.rowcount or 0
+                else:
+                    result = None
+            conn.commit()
+            return result
+        except Exception as exc:
+            conn.rollback()
+            if interrupted["action"] in {"pause", "cancel"}:
+                raise JobInterrupted(interrupted["action"]) from exc
+            if interrupted["action"] == "timeout":
+                raise DiscoveryQueryTimeout(f"{name} exceeded the {wall_timeout}-second wall-clock limit") from exc
+            raise
+        finally:
+            stop.set()
+            thread.join(timeout=3)
+
+
+def _merge_json_counts(target: dict[str, int], value: Any) -> None:
+    if not value:
+        return
+    for key, count in dict(value).items():
+        target[str(key)] = target.get(str(key), 0) + int(count or 0)
+
+
+def _hist_quantile(histogram: dict[str, int], q: float, observations: int) -> float | None:
+    if observations <= 0 or not histogram:
+        return None
+    threshold = max(1, math.ceil(q * observations))
+    cumulative = 0
+    for bin_id in sorted((int(key) for key in histogram)):
+        cumulative += int(histogram.get(str(bin_id), histogram.get(bin_id, 0)) or 0)
+        if cumulative >= threshold:
+            if bin_id <= HISTOGRAM_MIN_BIN:
+                return HISTOGRAM_MIN_BIN / 10.0
+            if bin_id >= HISTOGRAM_MAX_BIN:
+                return HISTOGRAM_MAX_BIN / 10.0
+            return (bin_id + 0.5) / 10.0
+    return None
+
+
+def _merge_partial_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = str(row["group_key"])
+        merged = groups.setdefault(key, {
+            "group_key": key, "group_values": dict(row["group_values"] or {}),
+            "observations": 0, "gross_sum": 0.0, "net_sum": 0.0,
+            "net_sum_squares": 0.0, "wins": 0, "positive_sum": 0.0,
+            "negative_sum_abs": 0.0, "worst_pct": None,
+            "histogram": {}, "symbol_counts": {}, "date_counts": {},
+        })
+        merged["observations"] += int(row["observations"] or 0)
+        for field in ("gross_sum", "net_sum", "net_sum_squares", "positive_sum", "negative_sum_abs"):
+            merged[field] += float(row[field] or 0)
+        merged["wins"] += int(row["wins"] or 0)
+        worst = finite_or_none(row.get("worst_pct"))
+        if worst is not None:
+            merged["worst_pct"] = worst if merged["worst_pct"] is None else min(merged["worst_pct"], worst)
+        _merge_json_counts(merged["histogram"], row.get("histogram"))
+        _merge_json_counts(merged["symbol_counts"], row.get("symbol_counts"))
+        _merge_json_counts(merged["date_counts"], row.get("date_counts"))
+    return groups
+
+
+def _finalise_stats(merged: dict[str, Any]) -> dict[str, Any]:
+    n = int(merged.get("observations") or 0)
+    if n <= 0:
+        return {}
+    net_sum = float(merged["net_sum"])
+    net_mean = net_sum / n
+    gross_mean = float(merged["gross_sum"]) / n
+    variance = None
+    if n > 1:
+        variance = max(0.0, (float(merged["net_sum_squares"]) - net_sum * net_sum / n) / (n - 1))
+    stdev = math.sqrt(variance) if variance is not None else None
+    t_stat = net_mean / stdev * math.sqrt(n) if stdev and stdev > 0 else None
+    symbols = dict(merged.get("symbol_counts") or {})
+    dates = dict(merged.get("date_counts") or {})
+    return {
+        "observations": n,
+        "symbols": len(symbols),
+        "dates": len(dates),
+        "gross_avg_pct": finite_or_none(gross_mean),
+        "net_avg_pct": finite_or_none(net_mean),
+        "median_pct": finite_or_none(_hist_quantile(merged["histogram"], 0.5, n)),
+        "win_rate_pct": finite_or_none(100.0 * int(merged["wins"]) / n),
+        "t_stat": finite_or_none(t_stat),
+        "profit_factor": finite_or_none(float(merged["positive_sum"]) / float(merged["negative_sum_abs"])) if float(merged["negative_sum_abs"]) > 0 else None,
+        "p05_pct": finite_or_none(_hist_quantile(merged["histogram"], 0.05, n)),
+        "worst_pct": finite_or_none(merged.get("worst_pct")),
+        "max_symbol_share_pct": finite_or_none(100.0 * max(symbols.values()) / n) if symbols else None,
+        "max_date_share_pct": finite_or_none(100.0 * max(dates.values()) / n) if dates else None,
+        "statistics_method": STATISTICS_METHOD,
+    }
+
+
+def _rank_score(discovery: dict[str, Any], validation: dict[str, Any] | None) -> float:
+    d_net = float(discovery.get("net_avg_pct") or 0)
+    d_t = max(float(discovery.get("t_stat") or 0), 0)
+    concentration = max(0.05, 1 - float(discovery.get("max_symbol_share_pct") or 100) / 100)
+    concentration *= max(0.05, 1 - float(discovery.get("max_date_share_pct") or 100) / 100)
+    score = d_net * math.log1p(float(discovery.get("observations") or 0)) * max(0.25, d_t) * concentration
+    if validation:
+        v_net = float(validation.get("net_avg_pct") or 0)
+        if v_net <= 0:
+            score *= 0.1
+        else:
+            stability = 1 - min(abs(d_net - v_net) / max(abs(d_net), abs(v_net), 0.01), 1)
+            score *= (0.5 + 0.5 * stability) * min(1.5, max(0.25, float(validation.get("t_stat") or 0)))
+    return finite_or_none(score) or 0.0
+
+
+def _conditions(dimensions: list[Dimension], values: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    conditions: list[dict[str, Any]] = []
+    descriptions: list[str] = []
+    for dimension in dimensions:
+        label = values.get(dimension.name)
+        if label is None or label not in dimension.labels:
+            return [], []
+        condition, description = dimension.labels[label]
+        conditions.append(dict(condition))
+        descriptions.append(description)
+    return conditions, descriptions
+
+
+def _plain_rule(direction: str, descriptions: list[str], horizon: int) -> str:
+    if not descriptions:
+        raise ValueError("A rule requires at least one condition")
+    verb = "Buy" if direction == "long" else "Short"
+    joined = ", ".join(descriptions[:-1]) + (f" and {descriptions[-1]}" if len(descriptions) > 1 else descriptions[0])
+    return f"{verb} when {joined}; exit after {horizon} minutes."
+
+
+def _ensure_discovery_run(job_id: str, config: DiscoveryConfig) -> tuple[str, bool]:
+    stored_config = {**config.model_dump(mode="json"), "engine_version": DISCOVERY_VERSION,
+                     "rule_definition_version": RULE_DEFINITION_VERSION,
+                     "statistics_method": STATISTICS_METHOD}
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,config FROM ra_discovery_runs WHERE job_id=%s", (job_id,))
+            existing = cur.fetchone()
+            reset = False
+            if existing:
+                run_id = str(existing["id"])
+                prior = dict(existing.get("config") or {})
+                reset = prior.get("engine_version") != DISCOVERY_VERSION
+                cur.execute("UPDATE ra_discovery_runs SET status='running',completed_at=NULL,config=%s WHERE id=%s", (Jsonb(stored_config), run_id))
+                if reset:
+                    cur.execute("DELETE FROM ra_candidate_rules WHERE discovery_run_id=%s", (run_id,))
+                    cur.execute("DELETE FROM ra_discovery_samples WHERE discovery_run_id=%s", (run_id,))
+                    cur.execute("DELETE FROM ra_discovery_sample_chunks WHERE discovery_run_id=%s", (run_id,))
+                    cur.execute("DELETE FROM ra_discovery_tasks WHERE discovery_run_id=%s", (run_id,))
+                else:
+                    cur.execute("UPDATE ra_discovery_sample_chunks SET status='pending',error=NULL WHERE discovery_run_id=%s AND status IN ('running','failed','cancelled')", (run_id,))
+                    cur.execute("UPDATE ra_discovery_task_chunks SET status='pending',error=NULL WHERE discovery_task_id IN (SELECT id FROM ra_discovery_tasks WHERE discovery_run_id=%s) AND status IN ('running','failed','cancelled')", (run_id,))
+            else:
+                cur.execute("INSERT INTO ra_discovery_runs(job_id,feature_set_id,name,config) VALUES (%s,%s,%s,%s) RETURNING id", (job_id, config.feature_set_id, config.name, Jsonb(stored_config)))
+                run_id = str(cur.fetchone()["id"])
+                reset = True
+        conn.commit()
+    return run_id, reset
+
+
+def _prepare_tasks_and_chunks(run_id: str, config: DiscoveryConfig, base_minutes: int) -> None:
+    periods = [("discovery", config.discovery_start, config.discovery_end)]
+    if config.validation_start and config.validation_end:
+        periods.append(("validation", config.validation_start, config.validation_end))
+    ranges = _bucket_ranges(config.symbol_shards)
+    with connection() as conn:
+        with conn.cursor() as cur:
+            for family in config.families:
+                for direction in config.directions:
+                    for horizon in config.holding_horizons_minutes:
+                        cur.execute("""
+                            INSERT INTO ra_discovery_tasks(discovery_run_id,family,direction,holding_horizon_minutes,engine_version,stage)
+                            VALUES (%s,%s,%s,%s,%s,'partial_scan')
+                            ON CONFLICT(discovery_run_id,family,direction,holding_horizon_minutes)
+                            DO UPDATE SET engine_version=excluded.engine_version
+                            RETURNING id
+                        """, (run_id, family, direction, horizon, DISCOVERY_VERSION))
+                        task_id = int(cur.fetchone()["id"])
+                        for period_label, start, end in periods:
+                            for chunk_start, chunk_end in _date_chunks(start, end, config.date_chunk_days):
+                                for bucket_start, bucket_end in ranges:
+                                    cur.execute("""
+                                        INSERT INTO ra_discovery_task_chunks(
+                                            discovery_task_id,period_label,chunk_start,chunk_end,bucket_start,bucket_end
+                                        ) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING
+                                    """, (task_id, period_label, chunk_start, chunk_end, bucket_start, bucket_end))
+            sample_stride = base_minutes if config.entry_sampling_mode == "all_bars" else min(config.holding_horizons_minutes)
+            for period_label, start, end in periods:
+                for chunk_start, chunk_end in _date_chunks(start, end, config.date_chunk_days):
+                    for bucket_start, bucket_end in ranges:
+                        cur.execute("""
+                            INSERT INTO ra_discovery_sample_chunks(
+                                discovery_run_id,period_label,sample_stride_minutes,
+                                chunk_start,chunk_end,bucket_start,bucket_end
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING
+                        """, (run_id, period_label, sample_stride, chunk_start, chunk_end, bucket_start, bucket_end))
+        conn.commit()
+
+
+def _progress(job_id: str, run_id: str, phase: str) -> None:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    (SELECT count(*) FROM ra_discovery_sample_chunks WHERE discovery_run_id=%s AND status='completed') +
+                    (SELECT count(*) FROM ra_discovery_task_chunks c JOIN ra_discovery_tasks t ON t.id=c.discovery_task_id WHERE t.discovery_run_id=%s AND c.status='completed') AS done,
+                    (SELECT count(*) FROM ra_discovery_sample_chunks WHERE discovery_run_id=%s AND status<>'split') +
+                    (SELECT count(*) FROM ra_discovery_task_chunks c JOIN ra_discovery_tasks t ON t.id=c.discovery_task_id WHERE t.discovery_run_id=%s AND c.status<>'split') AS total
+            """, (run_id, run_id, run_id, run_id))
             row = cur.fetchone()
         conn.rollback()
-    return _normalise_stats(dict(row), cost_pct)
+    set_progress(job_id, phase, int(row["done"] or 0), int(row["total"] or 0), result={"discovery_run_id": run_id})
 
+
+def _split_sample_chunk(chunk: dict[str, Any]) -> None:
+    start, end = chunk["chunk_start"], chunk["chunk_end"]
+    b0, b1 = int(chunk["bucket_start"]), int(chunk["bucket_end"])
+    if start < end:
+        middle = start + timedelta(days=(end-start).days//2)
+        children = [(start,middle,b0,b1),(middle+timedelta(days=1),end,b0,b1)]
+    elif b1-b0 > 1:
+        middle=(b0+b1)//2
+        children=[(start,end,b0,middle),(start,end,middle,b1)]
+    else:
+        message = "A one-day, one-bucket sample chunk still exceeded the query timeout"
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE ra_discovery_sample_chunks SET status='failed',error=%s WHERE id=%s", (message, chunk["id"]))
+            conn.commit()
+        raise RuntimeError(message)
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ra_discovery_sample_chunks SET status='split',error='Automatically split after timeout' WHERE id=%s", (chunk["id"],))
+            for cstart,cend,cb0,cb1 in children:
+                cur.execute("""INSERT INTO ra_discovery_sample_chunks(discovery_run_id,period_label,sample_stride_minutes,chunk_start,chunk_end,bucket_start,bucket_end)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                    (chunk["discovery_run_id"],chunk["period_label"],chunk["sample_stride_minutes"],cstart,cend,cb0,cb1))
+        conn.commit()
+
+
+def _split_task_chunk(chunk: dict[str, Any]) -> None:
+    start, end = chunk["chunk_start"], chunk["chunk_end"]
+    b0, b1 = int(chunk["bucket_start"]), int(chunk["bucket_end"])
+    if start < end:
+        middle = start + timedelta(days=(end-start).days//2)
+        children = [(start,middle,b0,b1),(middle+timedelta(days=1),end,b0,b1)]
+    elif b1-b0 > 1:
+        middle=(b0+b1)//2
+        children=[(start,end,b0,middle),(start,end,middle,b1)]
+    else:
+        message = "A one-day, one-bucket discovery chunk still exceeded the query timeout"
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE ra_discovery_task_chunks SET status='failed',error=%s WHERE id=%s", (message, chunk["id"]))
+            conn.commit()
+        raise RuntimeError(message)
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ra_discovery_task_chunks SET status='split',error='Automatically split after timeout' WHERE id=%s", (chunk["id"],))
+            for cstart,cend,cb0,cb1 in children:
+                cur.execute("""INSERT INTO ra_discovery_task_chunks(discovery_task_id,period_label,chunk_start,chunk_end,bucket_start,bucket_end)
+                    VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                    (chunk["discovery_task_id"],chunk["period_label"],cstart,cend,cb0,cb1))
+        conn.commit()
+
+
+def _build_samples(job_id: str, run_id: str, config: DiscoveryConfig, feature_set_id: str, base_minutes: int) -> None:
+    while True:
+        check_control(job_id)
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT * FROM ra_discovery_sample_chunks WHERE discovery_run_id=%s AND status IN ('pending','failed') ORDER BY period_label,chunk_start,bucket_start LIMIT 1""", (run_id,))
+                row=cur.fetchone()
+                if row:
+                    cur.execute("UPDATE ra_discovery_sample_chunks SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,now()),error=NULL WHERE id=%s", (row["id"],))
+            conn.commit()
+        if not row:
+            return
+        chunk=dict(row)
+        stride = int(chunk["sample_stride_minutes"])
+        query=_sample_insert_query(config.holding_horizons_minutes,stride,570)
+        try:
+            # A retry may have committed only before its status update. Delete the exact slice first.
+            with connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""DELETE FROM ra_discovery_samples WHERE discovery_run_id=%s AND period_label=%s AND trade_date BETWEEN %s AND %s AND symbol_bucket >= %s AND symbol_bucket < %s""",
+                        (run_id,chunk["period_label"],chunk["chunk_start"],chunk["chunk_end"],chunk["bucket_start"],chunk["bucket_end"]))
+                conn.commit()
+            params=(run_id,chunk["period_label"],feature_set_id,chunk["chunk_start"],chunk["chunk_end"],chunk["chunk_start"],chunk["chunk_end"],chunk["bucket_start"],chunk["bucket_end"])
+            rows=_execute_guarded(job_id,query,params,fetch="rowcount",name=f"sample-{chunk['id']}")
+            with connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE ra_discovery_sample_chunks SET status='completed',rows_written=%s,completed_at=now(),error=NULL WHERE id=%s", (rows,chunk["id"]))
+                conn.commit()
+            _progress(job_id,run_id,f"sampling {chunk['period_label']} · every {stride}m · {chunk['chunk_start']} to {chunk['chunk_end']}")
+        except JobInterrupted:
+            with connection() as conn:
+                with conn.cursor() as cur: cur.execute("UPDATE ra_discovery_sample_chunks SET status='pending' WHERE id=%s",(chunk["id"],))
+                conn.commit()
+            raise
+        except Exception as exc:
+            if _is_timeout(exc):
+                _split_sample_chunk(chunk)
+                add_event(job_id,"sample_chunk_split",str(exc),level="warning",details={"chunk_id":chunk["id"]})
+            elif _retry_chunk(
+                "ra_discovery_sample_chunks", int(chunk["id"]), exc, job_id,
+                "sample_chunk_retry", int(chunk.get("attempts") or 0) + 1,
+            ):
+                continue
+            else:
+                with connection() as conn:
+                    with conn.cursor() as cur: cur.execute("UPDATE ra_discovery_sample_chunks SET status='failed',error=%s WHERE id=%s",(str(exc),chunk["id"]))
+                    conn.commit()
+                raise
+
+
+def _analyze_discovery_samples(job_id: str, run_id: str) -> None:
+    """Refresh planner statistics after bulk sample materialisation.
+
+    Without an immediate ANALYZE, PostgreSQL can treat a newly populated table
+    as tiny and repeatedly choose whole-table scans for bounded chunk queries.
+    Failure to analyse is non-fatal because every scan remains bounded and can
+    split, but it is surfaced as a warning.
+    """
+    try:
+        _execute_guarded(
+            job_id,
+            "ANALYZE ra_discovery_samples",
+            (),
+            fetch="none",
+            name=f"analyze-samples-{run_id}",
+        )
+        add_event(job_id, "discovery_samples_analyzed", "PostgreSQL planner statistics refreshed for staged samples.")
+    except JobInterrupted:
+        raise
+    except Exception as exc:
+        add_event(
+            job_id, "discovery_samples_analyze_warning",
+            "Planner statistics refresh did not complete; bounded scans will continue.",
+            level="warning", details={"error": str(exc)},
+        )
+
+
+def _scan_partials(job_id: str, run_id: str, config: DiscoveryConfig) -> None:
+    cost_pct=config.round_trip_cost_bps/100.0
+    while True:
+        check_control(job_id)
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT c.*,t.family,t.direction,t.holding_horizon_minutes
+                    FROM ra_discovery_task_chunks c JOIN ra_discovery_tasks t ON t.id=c.discovery_task_id
+                    WHERE t.discovery_run_id=%s AND c.status IN ('pending','failed')
+                    ORDER BY t.id,c.period_label,c.chunk_start,c.bucket_start LIMIT 1
+                """,(run_id,))
+                row=cur.fetchone()
+                if row:
+                    cur.execute("UPDATE ra_discovery_task_chunks SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,now()),error=NULL WHERE id=%s",(row["id"],))
+                    cur.execute("UPDATE ra_discovery_tasks SET status='running',stage='partial_scan',started_at=COALESCE(started_at,now()),error=NULL WHERE id=%s",(row["discovery_task_id"],))
+            conn.commit()
+        if not row:
+            return
+        chunk=dict(row); spec=FAMILIES[chunk["family"]]
+        horizon = int(chunk["holding_horizon_minutes"])
+        # The sample table is built at the minimum required cadence. Each task
+        # applies its own horizon cadence; all-bars mode deliberately keeps every
+        # materialised entry.
+        stride = 1 if config.entry_sampling_mode == "all_bars" else horizon
+        query=_partial_insert_query(spec["dimensions"],spec["filter"],chunk["direction"],horizon,stride,570)
+        params=(cost_pct,run_id,chunk["period_label"],chunk["chunk_start"],chunk["chunk_end"],chunk["bucket_start"],chunk["bucket_end"],chunk["id"])
+        try:
+            with connection() as conn:
+                with conn.cursor() as cur: cur.execute("DELETE FROM ra_discovery_partials WHERE discovery_task_chunk_id=%s",(chunk["id"],))
+                conn.commit()
+            groups=_execute_guarded(job_id,query,params,fetch="rowcount",name=f"scan-{chunk['id']}")
+            with connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COALESCE(sum(observations),0)::bigint AS n FROM ra_discovery_partials WHERE discovery_task_chunk_id=%s",(chunk["id"],))
+                    obs=int(cur.fetchone()["n"] or 0)
+                    cur.execute("UPDATE ra_discovery_task_chunks SET status='completed',groups_written=%s,observations_scanned=%s,completed_at=now(),error=NULL WHERE id=%s",(groups,obs,chunk["id"]))
+                conn.commit()
+            _progress(job_id,run_id,f"scanning {chunk['family']} · {chunk['direction']} · {chunk['holding_horizon_minutes']}m · {chunk['period_label']}")
+        except JobInterrupted:
+            with connection() as conn:
+                with conn.cursor() as cur: cur.execute("UPDATE ra_discovery_task_chunks SET status='pending' WHERE id=%s",(chunk["id"],))
+                conn.commit()
+            raise
+        except Exception as exc:
+            if _is_timeout(exc):
+                _split_task_chunk(chunk)
+                add_event(job_id,"discovery_chunk_split",str(exc),level="warning",details={"chunk_id":chunk["id"]})
+            elif _retry_chunk(
+                "ra_discovery_task_chunks", int(chunk["id"]), exc, job_id,
+                "discovery_chunk_retry", int(chunk.get("attempts") or 0) + 1,
+            ):
+                continue
+            else:
+                with connection() as conn:
+                    with conn.cursor() as cur: cur.execute("UPDATE ra_discovery_task_chunks SET status='failed',error=%s WHERE id=%s",(str(exc),chunk["id"]))
+                    conn.commit()
+                raise
+
+
+def _load_task_period(task_id: int, period_label: str) -> dict[str, dict[str, Any]]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT p.* FROM ra_discovery_partials p
+                JOIN ra_discovery_task_chunks c ON c.id=p.discovery_task_chunk_id
+                WHERE c.discovery_task_id=%s AND c.period_label=%s AND c.status='completed'
+                ORDER BY p.group_key
+            """,(task_id,period_label))
+            rows=[dict(r) for r in cur.fetchall()]
+        conn.rollback()
+    return _merge_partial_rows(rows)
+
+
+def _write_candidates(job_id: str, run_id: str, config: DiscoveryConfig, base_minutes: int) -> tuple[int,int]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ra_discovery_tasks WHERE discovery_run_id=%s ORDER BY id",(run_id,))
+            tasks=[dict(r) for r in cur.fetchall()]
+            cur.execute("DELETE FROM ra_candidate_rules WHERE discovery_run_id=%s",(run_id,))
+        conn.commit()
+    family_candidates: dict[str,list[dict[str,Any]]]={family:[] for family in config.families}
+    groups_tested=0
+    for task in tasks:
+        discovery_groups=_load_task_period(int(task["id"]),"discovery")
+        validation_groups=_load_task_period(int(task["id"]),"validation") if config.validation_start else {}
+        groups_tested += len(discovery_groups)
+        spec=FAMILIES[task["family"]]
+        retained_for_task=0
+        for key,merged in discovery_groups.items():
+            ds=_finalise_stats(merged)
+            if not ds or ds["observations"]<config.minimum_observations or ds["symbols"]<config.minimum_symbols or ds["dates"]<config.minimum_dates or ds["max_symbol_share_pct"]>config.maximum_symbol_concentration_pct or ds["max_date_share_pct"]>config.maximum_date_concentration_pct or (ds["net_avg_pct"] or 0)<=0:
+                continue
+            if config.validation_start:
+                vs = _finalise_stats(validation_groups[key]) if key in validation_groups else {
+                    "observations": 0, "symbols": 0, "dates": 0,
+                    "gross_avg_pct": None, "net_avg_pct": 0.0, "median_pct": None,
+                    "win_rate_pct": None, "t_stat": None, "profit_factor": None,
+                    "p05_pct": None, "worst_pct": None,
+                    "max_symbol_share_pct": None, "max_date_share_pct": None,
+                    "statistics_method": STATISTICS_METHOD,
+                }
+            else:
+                vs = {}
+            conditions,descriptions=_conditions(spec["dimensions"],merged["group_values"])
+            if not conditions: continue
+            # Persist the family-level eligibility filter as structured conditions
+            # as well as the grouped bins. This guarantees sealed evaluation uses
+            # the exact same intersection, including thresholds that cut through a
+            # wider display bin (for example range position >= 0.5).
+            conditions.extend(dict(item) for item in spec.get("constraints", []))
+            descriptions.extend(str(item) for item in spec.get("constraint_descriptions", []))
+            item={"task":task,"ds":ds,"vs":vs,"conditions":conditions,"plain":_plain_rule(task["direction"],descriptions,int(task["holding_horizon_minutes"]))}
+            item["score"]=_rank_score(ds,vs or None)
+            family_candidates[task["family"]].append(item);retained_for_task+=1
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE ra_discovery_tasks SET status='completed',stage='merged',groups_tested=%s,candidates_retained=%s,completed_at=now(),error=NULL WHERE id=%s",(len(discovery_groups),retained_for_task,task["id"]))
+            conn.commit()
+    selected=[]
+    for family,items in family_candidates.items():
+        items.sort(key=lambda x:x["score"],reverse=True)
+        selected.extend(items[:config.top_candidates_per_family])
+    selected_per_task: dict[int, int] = {}
+    for item in selected:
+        task_id = int(item["task"]["id"])
+        selected_per_task[task_id] = selected_per_task.get(task_id, 0) + 1
+    with connection() as conn:
+        with conn.cursor() as cur:
+            for task in tasks:
+                cur.execute("UPDATE ra_discovery_tasks SET candidates_retained=%s WHERE id=%s", (selected_per_task.get(int(task["id"]), 0), task["id"]))
+        conn.commit()
+    stride_by_horizon=lambda h: base_minutes if config.entry_sampling_mode=="all_bars" else h
+    with connection() as conn:
+        with conn.cursor() as cur:
+            for item in selected:
+                t=item["task"];ds=item["ds"];vs=item["vs"];h=int(t["holding_horizon_minutes"])
+                cur.execute("""
+                    INSERT INTO ra_candidate_rules(
+                        discovery_run_id,feature_set_id,family,direction,holding_horizon_minutes,
+                        entry_sampling_mode,entry_stride_minutes,entry_anchor_minute,rule_definition_version,
+                        statistics_method,engine_version,conditions,plain_english_rule,rank_score,
+                        discovery_observations,discovery_symbols,discovery_dates,discovery_gross_avg_pct,
+                        discovery_net_avg_pct,discovery_median_pct,discovery_win_rate_pct,discovery_t_stat,
+                        discovery_profit_factor,discovery_p05_pct,discovery_worst_pct,
+                        discovery_max_symbol_share_pct,discovery_max_date_share_pct,
+                        validation_observations,validation_symbols,validation_dates,validation_gross_avg_pct,
+                        validation_net_avg_pct,validation_median_pct,validation_win_rate_pct,validation_t_stat,
+                        validation_profit_factor,validation_p05_pct,validation_worst_pct,
+                        validation_max_symbol_share_pct,validation_max_date_share_pct
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,570,%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,(
+                    run_id,config.feature_set_id,t["family"],t["direction"],h,
+                    config.entry_sampling_mode,stride_by_horizon(h),RULE_DEFINITION_VERSION,
+                    STATISTICS_METHOD,DISCOVERY_VERSION,Jsonb(item["conditions"]),item["plain"],item["score"],
+                    ds.get("observations"),ds.get("symbols"),ds.get("dates"),ds.get("gross_avg_pct"),ds.get("net_avg_pct"),ds.get("median_pct"),ds.get("win_rate_pct"),ds.get("t_stat"),ds.get("profit_factor"),ds.get("p05_pct"),ds.get("worst_pct"),ds.get("max_symbol_share_pct"),ds.get("max_date_share_pct"),
+                    vs.get("observations"),vs.get("symbols"),vs.get("dates"),vs.get("gross_avg_pct"),vs.get("net_avg_pct"),vs.get("median_pct"),vs.get("win_rate_pct"),vs.get("t_stat"),vs.get("profit_factor"),vs.get("p05_pct"),vs.get("worst_pct"),vs.get("max_symbol_share_pct"),vs.get("max_date_share_pct"),
+                ))
+            cur.execute("UPDATE ra_discovery_runs SET status='completed',candidates_tested=%s,candidates_retained=%s,completed_at=now() WHERE id=%s",(groups_tested,len(selected),run_id))
+        conn.commit()
+    add_event(job_id,"discovery_merge_completed",f"Merged {groups_tested:,} grouped tests and retained {len(selected):,} candidates.",details={"statistics_method":STATISTICS_METHOD})
+    return groups_tested,len(selected)
+
+
+def run_discovery(job_id: str, config: DiscoveryConfig) -> dict[str, Any]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status,min_trade_date,max_trade_date,config FROM ra_feature_sets WHERE id=%s",(config.feature_set_id,))
+            feature=cur.fetchone()
+        conn.rollback()
+    if not feature or feature["status"]!="completed": raise RuntimeError("The selected feature set does not exist or is not completed")
+    periods=[(config.discovery_start,config.discovery_end)] + ([(config.validation_start,config.validation_end)] if config.validation_start else [])
+    if any(s<feature["min_trade_date"] or e>feature["max_trade_date"] for s,e in periods): raise ValueError(f"Dates must remain within the feature set: {feature['min_trade_date']} to {feature['max_trade_date']}")
+    fcfg=dict(feature.get("config") or {});base_minutes=timeframe_minutes(str(fcfg.get("timeframe") or "1Min"))
+    if str(fcfg.get("session") or "regular")!="regular": raise ValueError("Discovery v2 currently requires a regular-session feature set")
+    available={int(x) for x in fcfg.get("outcome_horizons_minutes",[5,15,30,60])}
+    missing=set(config.holding_horizons_minutes)-available
+    if missing: raise ValueError(f"Feature set is missing outcome horizons: {sorted(missing)}")
+    run_id,reset=_ensure_discovery_run(job_id,config)
+    _prepare_tasks_and_chunks(run_id,config,base_minutes)
+    if reset: add_event(job_id,"discovery_engine_v2_reset","The withdrawn monolithic scan was reset. Existing feature rows were preserved.",level="warning",details={"engine_version":DISCOVERY_VERSION})
+    _progress(job_id,run_id,"preparing staged discovery")
+    _build_samples(job_id,run_id,config,str(config.feature_set_id),base_minutes)
+    _analyze_discovery_samples(job_id,run_id)
+    _scan_partials(job_id,run_id,config)
+    check_control(job_id)
+    _progress(job_id,run_id,"merging partial statistics")
+    tested,retained=_write_candidates(job_id,run_id,config,base_minutes)
+    result={"discovery_run_id":run_id,"candidates_tested":tested,"candidates_retained":retained,"engine_version":DISCOVERY_VERSION,"statistics_method":STATISTICS_METHOD}
+    set_progress(job_id,"complete",1,1,result=result)
+    return json_safe(result)
+
+
+def _sealed_chunks(job_id: str, candidate: dict[str, Any], start: date, end: date, shards: int, days: int) -> None:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            for cstart,cend in _date_chunks(start,end,days):
+                for b0,b1 in _bucket_ranges(shards):
+                    cur.execute("""INSERT INTO ra_sealed_chunks(job_id,candidate_id,chunk_start,chunk_end,bucket_start,bucket_end)
+                        VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",(job_id,candidate["id"],cstart,cend,b0,b1))
+            cur.execute("UPDATE ra_sealed_chunks SET status='pending',error=NULL WHERE job_id=%s AND status IN ('running','failed','cancelled')",(job_id,))
+        conn.commit()
 
 
 def run_sealed_evaluation(job_id: str, config: SealedEvaluationConfig) -> dict[str, Any]:
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT c.*,d.config AS discovery_config,
-                    f.min_trade_date AS feature_min_date,f.max_trade_date AS feature_max_date
-                FROM ra_candidate_rules c
-                JOIN ra_discovery_runs d ON d.id=c.discovery_run_id
-                JOIN ra_feature_sets f ON f.id=c.feature_set_id
-                WHERE c.id=%s
-                """,
-                (config.candidate_id,),
-            )
-            candidate = cur.fetchone()
+            cur.execute("""SELECT c.*,d.config discovery_config,f.min_trade_date feature_min_date,f.max_trade_date feature_max_date
+                FROM ra_candidate_rules c JOIN ra_discovery_runs d ON d.id=c.discovery_run_id JOIN ra_feature_sets f ON f.id=c.feature_set_id WHERE c.id=%s""",(config.candidate_id,))
+            row=cur.fetchone()
         conn.rollback()
-    if not candidate:
-        raise RuntimeError("Candidate does not exist")
-    discovery_config = candidate["discovery_config"]
-    boundary = discovery_config.get("validation_end") or discovery_config["discovery_end"]
-    if config.sealed_start.isoformat() <= boundary:
-        raise ValueError(f"Sealed period must begin after {boundary}")
-    if config.sealed_start < candidate["feature_min_date"] or config.sealed_end > candidate["feature_max_date"]:
-        raise ValueError(
-            f"Sealed dates must remain within the feature set: "
-            f"{candidate['feature_min_date']} to {candidate['feature_max_date']}"
-        )
-    cost_pct = float(discovery_config["round_trip_cost_bps"]) / 100.0
-    set_progress(job_id, "evaluating sealed period", 0, 1)
-    candidate_rule_version = str(candidate.get("rule_definition_version") or "legacy")
-    if candidate_rule_version != RULE_DEFINITION_VERSION:
-        raise ValueError(
-            "This candidate was generated by an older rule definition and cannot be sealed under "
-            f"{RULE_DEFINITION_VERSION}. Rerun discovery with the audited engine first."
-        )
-    stats = _exact_stats(
-        str(candidate["feature_set_id"]), candidate["conditions"], candidate["direction"],
-        int(candidate["holding_horizon_minutes"]), config.sealed_start, config.sealed_end, cost_pct,
-        entry_stride_minutes=int(candidate.get("entry_stride_minutes") or 1),
-        entry_anchor_minute=int(candidate.get("entry_anchor_minute") or 570),
-    )
+    if not row: raise RuntimeError("Candidate does not exist")
+    candidate=dict(row);dcfg=dict(candidate["discovery_config"] or {})
+    boundary=dcfg.get("validation_end") or dcfg["discovery_end"]
+    if config.sealed_start.isoformat()<=str(boundary): raise ValueError(f"Sealed period must begin after {boundary}")
+    if config.sealed_start<candidate["feature_min_date"] or config.sealed_end>candidate["feature_max_date"]: raise ValueError("Sealed dates must remain within the feature set")
+    if candidate.get("rule_definition_version")!=RULE_DEFINITION_VERSION or candidate.get("engine_version")!=DISCOVERY_VERSION: raise ValueError("Candidate was generated by a withdrawn discovery engine and must be rediscovered")
+    shards=int(dcfg.get("symbol_shards",4));days=int(dcfg.get("date_chunk_days",3))
+    _sealed_chunks(job_id,candidate,config.sealed_start,config.sealed_end,shards,days)
+    query,condition_params=_sealed_partial_query(candidate["conditions"],candidate["direction"],int(candidate["holding_horizon_minutes"]),int(candidate["entry_stride_minutes"]),int(candidate["entry_anchor_minute"]))
+    cost=float(dcfg["round_trip_cost_bps"])/100.0
+    while True:
+        check_control(job_id)
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM ra_sealed_chunks WHERE job_id=%s AND status IN ('pending','failed') ORDER BY chunk_start,bucket_start LIMIT 1",(job_id,));r=cur.fetchone()
+                if r: cur.execute("UPDATE ra_sealed_chunks SET status='running',attempts=attempts+1,error=NULL WHERE id=%s",(r["id"],))
+            conn.commit()
+        if not r: break
+        chunk=dict(r);params=(cost,candidate["feature_set_id"],chunk["chunk_start"],chunk["chunk_end"],chunk["chunk_start"],chunk["chunk_end"],chunk["bucket_start"],chunk["bucket_end"],*condition_params)
+        try:
+            stats=dict(_execute_guarded(job_id,query,params,fetch="one",name=f"sealed-{chunk['id']}") or {})
+            with connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""UPDATE ra_sealed_chunks SET status='completed',observations=%s,gross_sum=%s,net_sum=%s,net_sum_squares=%s,wins=%s,positive_sum=%s,negative_sum_abs=%s,worst_pct=%s,histogram=%s,symbol_counts=%s,date_counts=%s,completed_at=now(),error=NULL WHERE id=%s""",
+                        (stats.get("observations",0),stats.get("gross_sum",0),stats.get("net_sum",0),stats.get("net_sum_squares",0),stats.get("wins",0),stats.get("positive_sum",0),stats.get("negative_sum_abs",0),stats.get("worst_pct"),Jsonb(stats.get("histogram") or {}),Jsonb(stats.get("symbol_counts") or {}),Jsonb(stats.get("date_counts") or {}),chunk["id"]))
+                conn.commit()
+        except JobInterrupted:
+            with connection() as conn:
+                with conn.cursor() as cur: cur.execute("UPDATE ra_sealed_chunks SET status='pending' WHERE id=%s",(chunk["id"],))
+                conn.commit()
+            raise
+        except Exception as exc:
+            if _is_timeout(exc) and (chunk["chunk_start"]<chunk["chunk_end"] or int(chunk["bucket_end"])-int(chunk["bucket_start"])>1):
+                with connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE ra_sealed_chunks SET status='split',error=%s WHERE id=%s",(str(exc),chunk["id"]))
+                        if chunk["chunk_start"]<chunk["chunk_end"]:
+                            mid=chunk["chunk_start"]+timedelta(days=(chunk["chunk_end"]-chunk["chunk_start"]).days//2);children=[(chunk["chunk_start"],mid,chunk["bucket_start"],chunk["bucket_end"]),(mid+timedelta(days=1),chunk["chunk_end"],chunk["bucket_start"],chunk["bucket_end"])]
+                        else:
+                            mid=(int(chunk["bucket_start"])+int(chunk["bucket_end"]))//2;children=[(chunk["chunk_start"],chunk["chunk_end"],chunk["bucket_start"],mid),(chunk["chunk_start"],chunk["chunk_end"],mid,chunk["bucket_end"])]
+                        for a,b,c,d in children: cur.execute("INSERT INTO ra_sealed_chunks(job_id,candidate_id,chunk_start,chunk_end,bucket_start,bucket_end) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",(job_id,candidate["id"],a,b,c,d))
+                    conn.commit()
+            elif _is_timeout(exc):
+                with connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE ra_sealed_chunks SET status='failed',error=%s WHERE id=%s", (str(exc), chunk["id"]))
+                    conn.commit()
+                raise RuntimeError("A one-day, one-bucket sealed chunk still exceeded the query timeout") from exc
+            elif _retry_chunk(
+                "ra_sealed_chunks", int(chunk["id"]), exc, job_id,
+                "sealed_chunk_retry", int(chunk.get("attempts") or 0) + 1,
+            ):
+                continue
+            else:
+                with connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE ra_sealed_chunks SET status='failed',error=%s WHERE id=%s", (str(exc), chunk["id"]))
+                    conn.commit()
+                raise
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FILTER(WHERE status='completed') done,count(*) FILTER(WHERE status<>'split') total FROM ra_sealed_chunks WHERE job_id=%s",(job_id,));p=cur.fetchone()
+            conn.rollback()
+        set_progress(job_id,"evaluating sealed period",p["done"],p["total"])
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE ra_candidate_rules SET workflow_status='sealed_tested',sealed_start=%s,sealed_end=%s,
-                    sealed_observations=%s,sealed_net_avg_pct=%s,sealed_median_pct=%s,sealed_win_rate_pct=%s,
-                    sealed_t_stat=%s,sealed_profit_factor=%s,sealed_evaluated_at=now() WHERE id=%s
-                """,
-                (
-                    config.sealed_start, config.sealed_end, stats.get("observations"), stats.get("net_avg_pct"),
-                    stats.get("median_pct"), stats.get("win_rate_pct"), stats.get("t_stat"),
-                    stats.get("profit_factor"), config.candidate_id,
-                ),
-            )
+            cur.execute("SELECT observations,gross_sum,net_sum,net_sum_squares,wins,positive_sum,negative_sum_abs,worst_pct,histogram,symbol_counts,date_counts FROM ra_sealed_chunks WHERE job_id=%s AND status='completed'",(job_id,));rows=[dict(x) for x in cur.fetchall()]
+        conn.rollback()
+    merged=_merge_partial_rows([{**x,"group_key":"sealed","group_values":{}} for x in rows]);stats=_finalise_stats(merged["sealed"] if "sealed" in merged else {})
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE ra_candidate_rules SET workflow_status='sealed_tested',sealed_start=%s,sealed_end=%s,sealed_observations=%s,sealed_net_avg_pct=%s,sealed_median_pct=%s,sealed_win_rate_pct=%s,sealed_t_stat=%s,sealed_profit_factor=%s,sealed_evaluated_at=now() WHERE id=%s""",
+                (config.sealed_start,config.sealed_end,stats.get("observations"),stats.get("net_avg_pct"),stats.get("median_pct"),stats.get("win_rate_pct"),stats.get("t_stat"),stats.get("profit_factor"),config.candidate_id))
         conn.commit()
-    result = {"candidate_id": config.candidate_id, "sealed_start": config.sealed_start, "sealed_end": config.sealed_end, **stats}
-    add_event(job_id, "sealed_evaluation_completed", "Sealed candidate evaluation completed.", details=result)
-    set_progress(job_id, "complete", 1, 1, result=result)
+    result={"candidate_id":config.candidate_id,"sealed_start":config.sealed_start,"sealed_end":config.sealed_end,**stats}
+    add_event(job_id,"sealed_evaluation_completed","Sealed candidate evaluation completed using staged partial aggregates.",details=result)
+    set_progress(job_id,"complete",1,1,result=result)
     return json_safe(result)

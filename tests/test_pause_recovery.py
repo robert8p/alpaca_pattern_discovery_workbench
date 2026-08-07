@@ -31,3 +31,20 @@ def test_recovered_and_resumed_jobs_can_be_reclaimed_after_attempt_three():
     main = Path('app/main.py').read_text(encoding='utf-8')
     assert 'attempts=GREATEST(attempts-1,0)' in jobs
     assert 'attempts=0' in main
+
+
+def test_cancelled_discovery_chunks_are_retryable():
+    source = Path("app/discovery.py").read_text(encoding="utf-8")
+    assert "status IN ('running','failed','cancelled')" in source
+    assert "ra_discovery_sample_chunks SET status='pending'" in source
+    assert "ra_discovery_task_chunks SET status='pending'" in source
+    assert "ra_sealed_chunks SET status='pending'" in source
+
+
+def test_stale_paused_jobs_release_running_subtasks():
+    source = Path("app/jobs.py").read_text(encoding="utf-8")
+    assert "Recovered after paused worker restart" in source
+    assert "UPDATE ra_discovery_sample_chunks SET status='pending'" in source
+    assert "UPDATE ra_discovery_task_chunks SET status='pending'" in source
+    assert "UPDATE ra_sealed_chunks SET status='pending'" in source
+    assert "UPDATE ra_feature_batches SET status='pending'" in source

@@ -15,7 +15,7 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "2.0.0"
 SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
@@ -151,17 +151,28 @@ def _schema_state(cur: Any) -> dict[str, bool]:
             to_regprocedure('public.ra_ensure_feature_partitions(date,date)') IS NOT NULL AS partition_fn_ok,
             EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='ra_feature_batches' AND column_name='symbols'
-            ) AS batch_symbols_ok,
+                WHERE table_schema='public' AND table_name='ra_candidate_rules'
+                  AND column_name='entry_stride_minutes'
+            ) AS methodology_ok,
+            to_regclass('public.ra_discovery_samples') IS NOT NULL AS discovery_samples_ok,
+            to_regclass('public.ra_discovery_sample_chunks') IS NOT NULL AS sample_chunks_ok,
+            to_regclass('public.ra_discovery_task_chunks') IS NOT NULL AS task_chunks_ok,
+            to_regclass('public.ra_discovery_partials') IS NOT NULL AS partials_ok,
+            to_regclass('public.ra_sealed_chunks') IS NOT NULL AS sealed_chunks_ok,
             EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='ra_jobs' AND column_name='heartbeat_at'
-            ) AS heartbeat_ok,
+                WHERE table_schema='public' AND table_name='ra_discovery_sample_chunks'
+                  AND column_name='sample_stride_minutes'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='ra_discovery_samples'
+                  AND column_name='fwd_return_60m_pct'
+            ) AS v2_sample_layout_ok,
             EXISTS (
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='ra_candidate_rules'
-                  AND column_name='entry_stride_minutes'
-            ) AS methodology_ok
+                  AND column_name='statistics_method'
+            ) AS v2_candidate_columns_ok
         """
     )
     row = cur.fetchone()
@@ -173,8 +184,9 @@ def _schema_is_compatible(cur: Any) -> bool:
     return bool(state and all(state.values()))
 
 
-def _core_schema_is_compatible(state: dict[str, bool]) -> bool:
-    return bool(state and all(value for key, value in state.items() if key != "methodology_ok"))
+def _v1_core_is_compatible(state: dict[str, bool]) -> bool:
+    required = {"jobs_ok", "batches_ok", "features_ok", "partition_fn_ok"}
+    return bool(state and all(state.get(key) for key in required))
 
 
 def _apply_v110_methodology_migration(cur: Any) -> None:
@@ -184,13 +196,32 @@ def _apply_v110_methodology_migration(cur: Any) -> None:
     cur.execute("ALTER TABLE ra_candidate_rules ADD COLUMN IF NOT EXISTS rule_definition_version text NOT NULL DEFAULT 'legacy'")
 
 
+
+
+def _drop_incompatible_v2_discovery_tables(cur: Any) -> None:
+    """Remove only withdrawn draft-v2 staging tables before recreating them.
+
+    Runs, jobs, feature sets and candidates remain. The next retry resets legacy
+    discovery artefacts under the final engine definition.
+    """
+    cur.execute("DROP TABLE IF EXISTS ra_discovery_partials CASCADE")
+    cur.execute("DROP TABLE IF EXISTS ra_discovery_task_chunks CASCADE")
+    cur.execute("DROP TABLE IF EXISTS ra_discovery_samples CASCADE")
+    cur.execute("DROP TABLE IF EXISTS ra_discovery_sample_chunks CASCADE")
+    cur.execute("DROP TABLE IF EXISTS ra_sealed_chunks CASCADE")
+
+def _apply_v200_discovery_migration(cur: Any) -> None:
+    migration_path = Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.0.0.sql"
+    cur.execute(migration_path.read_text(encoding="utf-8"))
+
+
 def execute_schema() -> None:
     schema_path = Path(__file__).resolve().parent.parent / "sql" / "schema.sql"
     try:
         with connection() as conn:
             with conn.cursor() as cur:
-                # Serialize startup migration decisions across web/worker instances.
                 cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA_MIGRATION_LOCK,))
+                cur.execute("SET LOCAL lock_timeout = '30s'")
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS ra_schema_versions (
@@ -204,33 +235,25 @@ def execute_schema() -> None:
                 already_applied = cur.fetchone() is not None
                 if already_applied and _schema_is_compatible(cur):
                     conn.commit()
-                    logger.info("Pattern Discovery Workbench schema %s already installed and compatible; startup DDL skipped", SCHEMA_VERSION)
+                    logger.info("Pattern Discovery Workbench schema %s already installed; startup DDL skipped", SCHEMA_VERSION)
                     return
-                if already_applied:
-                    logger.warning(
-                        "Schema version %s is recorded but compatibility checks failed; repairing the incomplete migration",
-                        SCHEMA_VERSION,
-                    )
 
                 state = _schema_state(cur)
-                if state and all(state.values()):
-                    cur.execute(
-                        "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                        (SCHEMA_VERSION, SCHEMA_VERSION),
-                    )
-                    conn.commit()
-                    logger.info("Existing workbench schema marked compatible with %s; startup DDL skipped", SCHEMA_VERSION)
-                    return
-
-                if _core_schema_is_compatible(state):
-                    # Existing v1 schema: apply only the four metadata columns.
-                    # Do not replay table/index/trigger DDL against feature jobs.
-                    _apply_v110_methodology_migration(cur)
+                if _v1_core_is_compatible(state):
+                    # Apply only targeted, idempotent migrations. Replaying the full
+                    # schema against live feature jobs caused earlier lock inversions.
+                    if not state.get("methodology_ok"):
+                        _apply_v110_methodology_migration(cur)
+                    if (state.get("discovery_samples_ok") or state.get("sample_chunks_ok")) and not state.get("v2_sample_layout_ok"):
+                        _drop_incompatible_v2_discovery_tables(cur)
+                    _apply_v200_discovery_migration(cur)
                 else:
-                    # Fresh or materially incomplete database: install the full schema once.
                     cur.execute(schema_path.read_text(encoding="utf-8"))
+
+                if not _schema_is_compatible(cur):
+                    raise RuntimeError("Schema migration completed but v2 compatibility checks still failed")
                 cur.execute(
-                    "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                    "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT DO UPDATE SET app_version=excluded.app_version,applied_at=now()",
                     (SCHEMA_VERSION, SCHEMA_VERSION),
                 )
             conn.commit()
@@ -242,7 +265,6 @@ def execute_schema() -> None:
             f"Configured target: {target['host']}:{target['port']} ({target['mode']})."
         ) from exc
     logger.info("Pattern Discovery Workbench schema %s is ready", SCHEMA_VERSION)
-
 
 def close_pool() -> None:
     global _pool

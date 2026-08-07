@@ -74,6 +74,16 @@ def recover_stale_jobs() -> int:
                 (stale,),
             )
             running_count = cur.rowcount or 0
+            if running_count:
+                cur.execute(
+                    "UPDATE ra_discovery_sample_chunks SET status='pending',error=COALESCE(error,'Recovered after worker restart') WHERE status='running' AND discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id IN (SELECT id FROM ra_jobs WHERE status='queued' AND phase='recovered'))"
+                )
+                cur.execute(
+                    "UPDATE ra_discovery_task_chunks SET status='pending',error=COALESCE(error,'Recovered after worker restart') WHERE status='running' AND discovery_task_id IN (SELECT t.id FROM ra_discovery_tasks t JOIN ra_discovery_runs r ON r.id=t.discovery_run_id WHERE r.job_id IN (SELECT id FROM ra_jobs WHERE status='queued' AND phase='recovered'))"
+                )
+                cur.execute(
+                    "UPDATE ra_sealed_chunks SET status='pending',error=COALESCE(error,'Recovered after worker restart') WHERE status='running' AND job_id IN (SELECT id FROM ra_jobs WHERE status='queued' AND phase='recovered')"
+                )
 
             cur.execute(
                 """
@@ -81,10 +91,54 @@ def recover_stale_jobs() -> int:
                     heartbeat_at=now()
                 WHERE status='pause_requested'
                   AND (heartbeat_at IS NULL OR heartbeat_at < now() - (%s * interval '1 second'))
+                RETURNING id,job_type
                 """,
                 (stale,),
             )
-            paused_count = cur.rowcount or 0
+            paused = cur.fetchall()
+            paused_count = len(paused)
+            for row in paused:
+                if row['job_type'] == 'feature_build':
+                    cur.execute(
+                        """
+                        UPDATE ra_feature_batches SET status='pending',
+                            error=COALESCE(error,'Recovered after paused worker restart')
+                        WHERE status='running'
+                          AND feature_chunk_id IN (
+                              SELECT c.id FROM ra_feature_chunks c
+                              JOIN ra_feature_sets f ON f.id=c.feature_set_id
+                              WHERE f.job_id=%s
+                          )
+                        """,
+                        (row['id'],),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE ra_feature_chunks SET status='pending',
+                            error=COALESCE(error,'Recovered after paused worker restart')
+                        WHERE status='running'
+                          AND feature_set_id IN (SELECT id FROM ra_feature_sets WHERE job_id=%s)
+                        """,
+                        (row['id'],),
+                    )
+                elif row['job_type'] == 'discovery_scan':
+                    cur.execute(
+                        "UPDATE ra_discovery_sample_chunks SET status='pending',error=COALESCE(error,'Recovered after paused worker restart') WHERE status='running' AND discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s)",
+                        (row['id'],),
+                    )
+                    cur.execute(
+                        "UPDATE ra_discovery_task_chunks SET status='pending',error=COALESCE(error,'Recovered after paused worker restart') WHERE status='running' AND discovery_task_id IN (SELECT t.id FROM ra_discovery_tasks t JOIN ra_discovery_runs r ON r.id=t.discovery_run_id WHERE r.job_id=%s)",
+                        (row['id'],),
+                    )
+                    cur.execute(
+                        "UPDATE ra_discovery_tasks SET status='pending',error=COALESCE(error,'Recovered after paused worker restart') WHERE status='running' AND discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s)",
+                        (row['id'],),
+                    )
+                elif row['job_type'] == 'sealed_evaluation':
+                    cur.execute(
+                        "UPDATE ra_sealed_chunks SET status='pending',error=COALESCE(error,'Recovered after paused worker restart') WHERE status='running' AND job_id=%s",
+                        (row['id'],),
+                    )
 
             cur.execute(
                 """
@@ -123,6 +177,14 @@ def recover_stale_jobs() -> int:
                     cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (row['id'],))
                     cur.execute(
                         "UPDATE ra_discovery_tasks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','running','failed')",
+                        (row['id'],),
+                    )
+                    cur.execute(
+                        "UPDATE ra_discovery_sample_chunks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','running','failed')",
+                        (row['id'],),
+                    )
+                    cur.execute(
+                        "UPDATE ra_discovery_task_chunks SET status='cancelled' WHERE discovery_task_id IN (SELECT t.id FROM ra_discovery_tasks t JOIN ra_discovery_runs r ON r.id=t.discovery_run_id WHERE r.job_id=%s) AND status IN ('pending','running','failed')",
                         (row['id'],),
                     )
         conn.commit()

@@ -1,105 +1,105 @@
-# Architecture
+# Architecture — Pattern Discovery Workbench 2.0.0
+
+## System boundary
 
 ```text
-Alpaca Rapid Discovery Loader
-        │
-        ▼
-Supabase rd_bars / rd_assets
-        │  SELECT only
-        ▼
-Pattern Workbench web
-        │
-        ├── validates typed configurations
-        ├── runs database SQL preflight
-        ├── queues ra_jobs
-        └── controls pause/resume/cancel/retry
-        │
-        ▼
-Pattern Workbench worker
-        │
-        ├── quality scans
-        ├── liquidity-ranked universes
-        ├── date- and symbol-batched features
-        ├── checkpointed discovery
-        └── explicit sealed evaluations
-        │
-        ▼
-Supabase ra_* analysis tables
+Rapid Discovery Loader              Pattern Discovery Workbench
+──────────────────────              ───────────────────────────
+rd_bars                 ──read──▶   quality / universe / features
+rd_assets               ──read──▶   staged discovery
+rd_jobs / rd_tasks      ──read──▶   sealed evaluation
+                                      │
+                                      ▼
+                                ra_* analysis tables
 ```
 
-## Trust boundaries
+The workbench does not write to loader-owned `rd_` tables.
 
-### Raw-data boundary
+## Services
 
-The workbench application issues reads only against `rd_` objects. All analysis writes use `ra_` objects. A static release check rejects `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` or `ALTER` operations against `rd_` names.
+### Web service
 
-### Web boundary
+- FastAPI dashboard and API.
+- Validates typed job configurations.
+- Runs local and PostgreSQL planning preflight before accepting discovery or sealed jobs.
+- Queues jobs and exposes status, events, chunks, candidates and system health.
 
-The web service handles authentication, typed configuration, preflight, job creation, inspection and controls. Long-running analysis never executes inside a normal web request.
+### Worker
 
-### Worker boundary
+- Claims one background job using `FOR UPDATE SKIP LOCKED`.
+- Executes quality, universe, feature, discovery or sealed workflows.
+- Maintains heartbeat and supports pause, resume, cancel and stale-worker recovery.
+- Uses the Supabase Primary Session pooler on port 5432.
 
-The worker claims one durable job at a time. Feature work checkpoints at date-chunk and symbol-batch level. Discovery checkpoints at family, direction and holding-horizon level.
+## Discovery v2 persistence model
 
-### Database boundary
+### `ra_discovery_runs`
 
-Supabase stores raw bars, analysis lineage and durable recovery state. PostgreSQL performs the window functions and grouped statistics and is normally the main compute constraint.
+One logical discovery run per job. Stores the immutable user configuration plus engine, rule-definition and statistics-method versions.
 
-## SQL release gate
+### `ra_discovery_sample_chunks`
 
-There are three layers:
+Resumable instructions for materialising narrow rows by:
 
-1. **Binding parser:** every parameterised SQL string is checked using Psycopg's `%s/%b/%t/%%` grammar and exact parameter count.
-2. **Generated-query preflight:** all six families × two directions × four horizons × two sampling modes are generated for grouped and exact statistics. Feature and universe INSERT queries are also generated.
-3. **Database preflight:** PostgreSQL is asked to `EXPLAIN` the production queries before discovery or sealed-test jobs are accepted. CI uses exhaustive mode; the dashboard uses a representative fast mode.
+- discovery/validation period
+- sample stride, chosen as the smallest requested horizon
+- date range
+- deterministic symbol-bucket range
 
-The query-definition hash is exposed in System checks so the deployed web and worker methodology can be identified.
+### `ra_discovery_samples`
 
-## Analysis lineage
+Narrow source table containing identifiers, predictors required by current families and all four supported forward-return columns on each sampled row. It is indexed by run, period, date and symbol bucket. Holding-period tasks select the relevant forward-return column and apply their own entry cadence.
 
-```text
-ra_universe_runs
-    └── ra_feature_sets
-            └── ra_discovery_runs
-                    └── ra_candidate_rules
-```
+### `ra_discovery_tasks`
 
-The dashboard blocks deletion of an upstream object while dependent downstream objects exist. Direct SQL deletion remains governed by the schema's foreign keys and should not be used in normal operation.
+One family × direction × holding-horizon combination.
 
-## Anti-leakage and consistency controls
+### `ra_discovery_task_chunks`
 
-- Predictors use current or historical data only.
-- Future labels use `fwd_` prefixes.
-- Same-minute baselines use preceding dates only.
-- Exact elapsed-time checks prevent sparse bars from masquerading as fixed-minute returns.
-- Discovery, validation and sealed periods share the same condition boundaries.
-- Candidate metadata freezes entry sampling mode, stride and anchor.
-- Round-trip costs are applied identically before median, win rate, t-statistic, profit factor and tail calculations.
-- Sealed evaluation rejects legacy candidates.
-- Validation begins strictly after discovery; sealed evaluation begins after validation or discovery where no validation period exists.
-- Interpretable rule families currently require regular-session feature sets.
+Resumable bounded scans for one task and one period. A timeout changes the parent to `split` and creates two smaller children.
 
-## Job resilience
+### `ra_discovery_partials`
 
-### Features
+One row per candidate group per completed task chunk. It contains mergeable sufficient statistics and exact symbol/date count maps.
 
-- Date chunks
-- Symbol batches
-- Persistent completion state
-- Server-side timeout and independent wall-clock watchdog
-- Pause/cancel monitoring
-- Automatic batch splitting down to one symbol
-- Deadlock, serialization and lock-timeout retries
-- Advisory locking per feature set
+### `ra_candidate_rules`
 
-### Discovery
+Shortlisted results after all partials are merged. Each candidate freezes:
 
-- Family × direction × horizon tasks
-- Server-side timeout and wall-clock watchdog
-- Pause/cancel monitoring
-- Timeout retry with jitter
-- Engine-version reset so incompatible task results are never mixed
+- exact conditions
+- direction and horizon
+- entry sampling mode, stride and anchor
+- rule-definition version
+- statistics method
+- discovery and validation metrics
 
-## Schema migration
+### `ra_sealed_chunks`
 
-Schema version 1.1.0 adds four candidate-methodology fields. Existing compatible databases receive only this minimal migration; the full table/index DDL is not replayed during active feature work.
+Bounded partial evaluations of one promoted candidate over its untouched sealed period.
+
+## Failure and replay semantics
+
+- Before replaying a sample slice, rows for that exact run/period/date/bucket slice are deleted.
+- Before replaying a scan chunk, partials owned by that chunk are deleted.
+- Primary and unique keys prevent duplicate observations or partial groups.
+- Statement timeout: 180 seconds by default.
+- Independent wall-clock watchdog: 210 seconds.
+- Pause/cancel is checked every two seconds and cancels the active PostgreSQL backend.
+- Timeouts split by date first, then symbol bucket.
+- Deadlocks, serialization failures, lock timeouts and dropped pooled connections retry with jittered backoff.
+- Completed siblings remain committed.
+
+## Migration strategy
+
+Schema version `2.0.0` uses a targeted idempotent migration. Existing live analysis tables are not recreated and the full schema is not replayed when compatibility checks pass. A PostgreSQL advisory lock serialises startup migration.
+
+## Performance design
+
+The v2 engine deliberately avoids:
+
+- `percentile_cont` over the full discovery period
+- full-period `count(distinct ...)` for every candidate group
+- one monolithic family query
+- re-reading the wide feature table for every family
+
+The wide feature source is read only during sample materialisation and sealed evaluation. Family scans operate on bounded ranges of the narrow sample table.

@@ -24,7 +24,7 @@ from app.models import (
 )
 from app.utils import json_safe
 
-VERSION = "1.1.0"
+VERSION = "2.0.0"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -219,11 +219,16 @@ def job_detail(job_id: str, _: str = Depends(require_auth)) -> dict[str, Any]:
             elif job["job_type"] == "discovery_scan":
                 cur.execute(
                     """
-                    SELECT family,direction,holding_horizon_minutes,status,groups_tested,
-                        candidates_retained,attempts,error,started_at,completed_at
-                    FROM ra_discovery_tasks
-                    WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s)
-                    ORDER BY id
+                    SELECT t.family,t.direction,t.holding_horizon_minutes,t.status,t.stage,t.groups_tested,
+                        t.candidates_retained,t.attempts,t.error,t.started_at,t.completed_at,
+                        count(c.id) FILTER (WHERE c.status<>'split') AS scan_chunks,
+                        count(c.id) FILTER (WHERE c.status='completed') AS completed_scan_chunks,
+                        COALESCE(sum(c.observations_scanned),0)::bigint AS observations_scanned
+                    FROM ra_discovery_tasks t
+                    LEFT JOIN ra_discovery_task_chunks c ON c.discovery_task_id=t.id
+                    WHERE t.discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s)
+                    GROUP BY t.id
+                    ORDER BY t.id
                     """,
                     (jid,),
                 )
@@ -300,7 +305,9 @@ def job_action(job_id: str, action: str, _: str = Depends(require_auth)) -> dict
                 )
             elif target == "cancelled" and row["job_type"] == "discovery_scan":
                 cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (jid,))
-                cur.execute("UPDATE ra_discovery_tasks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','failed')", (jid,))
+                cur.execute("UPDATE ra_discovery_tasks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','running','failed')", (jid,))
+                cur.execute("UPDATE ra_discovery_sample_chunks SET status='cancelled' WHERE discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s) AND status IN ('pending','running','failed')", (jid,))
+                cur.execute("UPDATE ra_discovery_task_chunks SET status='cancelled' WHERE discovery_task_id IN (SELECT t.id FROM ra_discovery_tasks t JOIN ra_discovery_runs r ON r.id=t.discovery_run_id WHERE r.job_id=%s) AND status IN ('pending','running','failed')", (jid,))
             cur.execute("INSERT INTO ra_job_events(job_id,event_type,message) VALUES (%s,%s,%s)", (jid, f"action_{action}", f"Action requested: {action}."))
         conn.commit()
     return {"ok": True, "status": target}

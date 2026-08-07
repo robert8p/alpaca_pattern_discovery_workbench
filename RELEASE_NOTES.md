@@ -1,92 +1,25 @@
 # Release notes
 
-## 1.1.0 — Fully audited SQL and analytical-consistency release
+## 2.0.0 — Staged discovery-engine rebuild
 
-- Withdraws v1.0.7 candidate results and versions the new rule definition as `2026-08-audited-v1`.
-- Replaces human bucket labels inside SQL with machine-safe category codes, eliminating literal-percent Psycopg failures.
-- Validates Psycopg placeholder grammar and exact parameter counts for every generated query.
-- Adds 194-query local preflight coverage across all families, directions, horizons, sampling modes, exact statistics, feature generation and universe generation.
-- Adds PostgreSQL `EXPLAIN` preflight; discovery and sealed jobs are blocked when deployed SQL cannot be planned.
-- Adds PostgreSQL 16 synthetic end-to-end CI: schema, universe, feature set, discovery, candidate metadata and sealed evaluation.
-- Makes numeric bucket boundaries explicit, contiguous and identical in discovery, validation and sealed testing.
-- Handles missing predictor values explicitly rather than assigning them to terminal buckets.
-- Freezes sampling mode, stride, anchor and rule-definition version on each candidate.
-- Applies round-trip costs consistently before median, win rate, t-statistic, profit factor, lower tail and worst-return metrics.
-- Rejects legacy candidates during sealed evaluation.
-- Requires regular-session features and verifies that every requested forward horizon exists.
-- Adds timestamp-prunable bounds to universe and quality paths and validates the exact feature/universe production queries.
-- Adds dependency-safe dashboard deletion.
-- Adds minimal schema migration rather than replaying full DDL on an existing compatible database.
+- Replaces monolithic discovery queries with a staged, resumable engine.
+- Materialises narrow sampled rows once per period at the smallest required cadence, storing all requested outcomes on each row to avoid horizon-level duplication.
+- Splits discovery by date and deterministic symbol bucket.
+- Persists mergeable partial statistics for every rule group.
+- Replaces full-period exact percentile sorts with a documented 0.1-percentage-point mergeable histogram.
+- Retains exact means, variance components, win counts, profit-factor components, worst return and symbol/date concentration counts.
+- Automatically splits timed-out chunks down to one day and one virtual symbol bucket.
+- Adds transient retries for deadlocks, serialization failures, lock timeouts and dropped pooled connections.
+- Adds independent statement and wall-clock limits for sample, scan and sealed chunks.
+- Preserves completed feature sets and resets only withdrawn 1.x discovery artefacts on retry.
+- Adds targeted schema migration `2.0.0` for the new sample, partial and sealed tables.
+- Updates dashboard controls for date chunk size and initial symbol shards.
+- Adds generated-query, static binding, raw-write, migration and real PostgreSQL workflow tests.
 
-Existing completed feature data remains usable. Existing discovery runs reset and rerun on retry so audited and legacy results cannot mix.
+### Compatibility
 
-## 1.0.7 — Non-overlapping and watchdog-protected discovery
+No loader or feature rebuild is required. Existing candidate results from the withdrawn 1.x discovery engines must be rediscovered before sealed evaluation.
 
-- Samples discovery entries at the holding-period cadence by default: every 5, 15, 30 or 60 minutes rather than every one-minute bar.
-- Removes severe outcome overlap and reduces pseudo-replication in candidate statistics.
-- Adds UTC timestamp bounds alongside trade-date bounds so PostgreSQL can prune monthly feature partitions.
-- Materializes only the sampled discovery rows before grouped statistics are calculated.
-- Adds a discovery-query heartbeat, responsive Pause/Cancel, a ten-minute server timeout and an eleven-minute wall-clock watchdog.
-- Retries one transient discovery timeout automatically with jittered backoff.
-- Shows whether the worker is scanning the discovery or validation period and the active entry cadence.
-- Resets earlier completed discovery tasks on the first v1.0.7 retry so one run cannot mix legacy every-minute results with non-overlapping results.
+## 1.1.0 — Withdrawn monolithic engine
 
-No feature rebuild or database schema migration is required.
-
-## 1.0.6 — Deadlock-safe startup and feature writes
-
-- Stops rerunning the full table/index/trigger schema on every web and worker startup once the installed schema is compatible.
-- Records the installed schema version in `ra_schema_versions`.
-- Creates feature partitions once per date chunk instead of once per symbol batch.
-- Serializes writes to the same feature set with a PostgreSQL advisory transaction lock.
-- Automatically retries deadlocks, lock timeouts and serialization conflicts with jittered backoff.
-- Preserves completed chunks and batches when retrying the existing failed feature job.
-
-No feature-table rebuild is required.
-
-## 1.0.5 — Hard feature-batch watchdog
-
-- Adds an independent 11-minute wall-clock watchdog for every feature SQL batch.
-- Keeps job and feature-batch heartbeats fresh while PostgreSQL is working.
-- Cancels and automatically splits a batch when the wall-clock deadline is exceeded.
-- Force-terminates only the stuck worker backend if ordinary cancellation does not return within 15 seconds.
-- Allows timed-out batches to split down to one symbol when necessary.
-- Reduces the server-side statement timeout to 10 minutes and adds a 60-second lock timeout.
-- Makes stale attempt 3 recoverable after a worker restart.
-- Resuming a paused job now resets its claim-attempt counter safely.
-- Completed date chunks and completed symbol batches remain unchanged.
-
-No database migration is required.
-
-## 1.0.4 — Responsive pause and stale-control recovery
-
-- Cancels an in-flight PostgreSQL feature batch when Pause or Cancel is requested.
-- Returns the interrupted symbol batch and date chunk to `pending`, preserving completed work.
-- Reconciles stale `pause_requested` jobs to `paused` after a worker restart.
-- Reconciles stale `cancel_requested` jobs to `cancelled` after a worker restart.
-- Bumps the feature definition version to 1.0.4; no database migration is required.
-
-## 1.0.3 — Writable-primary connection recovery
-
-- Rejects Supabase transaction-pooler URLs on port 6543 for this persistent worker.
-- Resets leaked `default_transaction_read_only` session state when PostgreSQL connections are opened.
-- Explicitly starts workbench transactions in read-write mode.
-- Detects Supabase read-replica endpoints and returns a precise configuration error.
-- Adds credential-free database target and read/write diagnostics to Health and System checks.
-- Removes the unnecessary `CREATE EXTENSION pgcrypto` startup statement.
-- Preserves all v1.0.2 feature chunks and symbol-batch checkpoints.
-
-No data migration or feature rebuild is required.
-
-## 1.0.2 — Resumable symbol-batched feature generation
-
-- Splits every feature date chunk into configurable symbol batches (default 100 symbols).
-- Persists batch-level completion so retries do not rebuild successful symbol batches.
-- Uses UTC timestamp bounds for PostgreSQL partition pruning instead of date expressions on `bar_ts`.
-- Adds batch progress to job details.
-- Automatically migrates existing databases with `ra_feature_batches`.
-- Existing v1.0.1 failed jobs can be retried; completed date chunks remain intact.
-
-## 1.0.1 — Nullable universe regex fix
-
-- Explicitly casts optional universe regex parameters as PostgreSQL text.
+Version 1.1.0 corrected SQL binding and methodological-consistency defects, but its whole-period grouped query architecture was not suitable for the production-sized one-minute dataset. Its candidate results are treated as legacy by 2.0.0.

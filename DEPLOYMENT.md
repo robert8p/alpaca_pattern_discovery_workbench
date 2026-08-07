@@ -1,172 +1,142 @@
-# Deployment and upgrade guide — v1.1.0
+# Deployment and upgrade guide — v2.0.0
 
-This is a separate Render application and GitHub repository, but it uses the **same Supabase database** as the Alpaca Rapid Discovery Loader.
+## Before deployment
 
-## 1. Replace the repository
+1. Extract `alpaca_pattern_discovery_workbench_v2.0.0.zip` into the existing private GitHub repository.
+2. Preserve hidden files, especially `.github/workflows/ci.yml` and `.python-version`.
+3. Commit and push.
+4. Open **GitHub → Actions → release-gate**.
+5. Do not deploy until the workflow is green.
 
-1. Extract `alpaca_pattern_discovery_workbench_v1.1.0.zip`.
-2. Replace the contents of the existing workbench repository.
-3. Include hidden paths:
-   - `.python-version`
-   - `.gitignore`
-   - `.env.example`
-   - `.github/workflows/ci.yml`
-4. Do not upload `.env` or any credentials.
-5. Commit and push.
+The release gate starts PostgreSQL 16 and tests schema installation, universe generation, feature generation, SQL planning, staged discovery, candidate metadata and sealed evaluation.
 
-## 2. Require the GitHub release gate
+## Render services
 
-Open the repository's **Actions** tab and wait for `release-gate` to pass.
-
-It runs:
-
-- Python compilation
-- JavaScript syntax validation
-- Unit and static-integrity tests
-- PostgreSQL 16 synthetic end-to-end integration
-- Exhaustive PostgreSQL planning of 194 generated production queries
-- Release audit, raw-table write scan and version consistency checks
-
-Do not deploy a commit whose workflow is red.
-
-## 3. Database connection
-
-Both Render services must use the same writable Supabase **Primary Session pooler** URL on port 5432:
+Deploy the same commit to both:
 
 ```text
-postgresql://postgres.PROJECT_REF:YOUR_PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres?sslmode=require
+alpaca-pattern-workbench-web
+alpaca-pattern-workbench-worker
 ```
 
-Do not use:
-
-- Port 6543 transaction pooling
-- A read replica
-- A role that cannot create/update `ra_` objects
-
-## 4. Render services
-
-The Blueprint defines:
-
-- `alpaca-pattern-workbench-web`
-- `alpaca-pattern-workbench-worker`
-
-Both pin:
+Both must use the same writable Supabase Primary Session-pooler URL:
 
 ```text
-PYTHON_VERSION=3.12.7
+postgresql://postgres.PROJECT_REF:PASSWORD@...pooler.supabase.com:5432/postgres?sslmode=require
+```
+
+Do not use port 6543 or a read-replica endpoint.
+
+## Required environment variables
+
+### Both services
+
+```text
+DATABASE_URL=<same Primary Session-pooler URL>
 AUTO_MIGRATE=true
-```
-
-The existing `DATABASE_URL` and `APP_PASSWORD` values have `sync: false`; Blueprint updates do not replace them. Verify them manually in Render.
-
-## 5. Timeout settings
-
-The Blueprint supplies:
-
-```text
+PYTHON_VERSION=3.12.7
 DATABASE_STATEMENT_TIMEOUT_SECONDS=600
-FEATURE_BATCH_WALL_TIMEOUT_SECONDS=660
-FEATURE_CANCEL_GRACE_SECONDS=15
-FEATURE_MIN_SYMBOL_BATCH_SIZE=1
-FEATURE_DB_CONFLICT_RETRIES=5
-DISCOVERY_STATEMENT_TIMEOUT_SECONDS=600
-DISCOVERY_WALL_TIMEOUT_SECONDS=660
+DISCOVERY_STATEMENT_TIMEOUT_SECONDS=180
+DISCOVERY_WALL_TIMEOUT_SECONDS=210
 DISCOVERY_CANCEL_GRACE_SECONDS=15
-DISCOVERY_QUERY_RETRIES=2
+DISCOVERY_QUERY_RETRIES=3
+LOG_LEVEL=INFO
 ```
 
-Do not increase these simply to conceal a query that is failing to make progress. The watchdogs and batching exist to expose and divide oversized work.
-
-## 6. Deploy
-
-Deploy both services from the same commit. Confirm their logs show:
+### Web service
 
 ```text
-Python 3.12.7
-version 1.1.0
+APP_USERNAME=admin
+APP_PASSWORD=<strong unique password>
 ```
 
-The schema upgrade is minimal. It adds candidate methodology metadata and records schema version 1.1.0. Existing `rd_` bars and completed feature rows are unchanged.
+### Worker service
 
-## 7. Mandatory deployed preflight
+```text
+WORKER_POLL_SECONDS=3
+WORKER_STALE_SECONDS=300
+MAX_JOB_ATTEMPTS=3
+FEATURE_BATCH_WALL_TIMEOUT_SECONDS=660
+FEATURE_MIN_SYMBOL_BATCH_SIZE=1
+FEATURE_CANCEL_GRACE_SECONDS=15
+FEATURE_DB_CONFLICT_RETRIES=5
+```
 
-Open **System → Run checks**.
+The updated `render.yaml` supplies all non-secret defaults.
 
-Require all of the following:
+## Migration
 
-- Database target is port 5432
-- `is_replica=false`
-- Transaction read-only settings are `off`
-- `rd_bars` and `rd_assets` exist
-- `ra_` schema is ready
-- Worker heartbeat is current
-- SQL preflight reports `ok=true`
-- A query-definition hash is displayed
-- PostgreSQL plans are greater than zero
+On first 2.0.0 startup, one service obtains a PostgreSQL advisory lock and applies `sql/migrations/2.0.0.sql`. It creates only the new `ra_` discovery objects and metadata columns.
 
-The API refuses new discovery and sealed-test jobs if this preflight fails.
+It does not modify:
 
-## 8. Existing feature set
+- `rd_bars`
+- `rd_assets`
+- existing universe symbols
+- completed `ra_intraday_features`
 
-Your completed June/July regular-session feature set does **not** need rebuilding. Feature definition 1.1.0 changes release validation and metadata, not the stored predictor semantics used by the existing set.
+After migration, later starts detect schema 2.0.0 and skip DDL.
 
-Keep the existing feature set unless its own quality or coverage is suspect.
+## Deployment checks
 
-## 9. Existing failed discovery run
+After both services deploy:
 
-Open **Initial interpretable rule scan** and click **Retry** only after:
+1. Confirm web and worker show version `2.0.0`.
+2. Open **System → Run checks**.
+3. Confirm:
+   - database port 5432
+   - `is_replica=false`
+   - transaction read-only values are `off`
+   - all v2 objects exist
+   - SQL preflight reports `ok=true`
+4. Confirm the worker heartbeat is current.
 
-1. GitHub Actions is green.
-2. Web and worker both show 1.1.0.
-3. System SQL preflight passes.
+## Resuming the existing failed discovery job
 
-On retry, progress will reset from the old partial result to `0/48`. This is deliberate. The workbench deletes legacy candidates and reruns every discovery task using one consistent v1.1.0 methodology.
+Your completed June/July feature set remains valid.
 
-The feature table is not rebuilt.
+1. Open the failed **Initial interpretable rule scan**.
+2. Click **Retry**.
+3. Expect discovery progress to reset because the 1.x monolithic results are incompatible.
+4. Do not recreate the feature set.
 
-## 10. Acceptance sequence
+The v2 job will proceed through:
 
-For the existing data:
+```text
+sampling discovery/validation rows
+→ bounded partial scans
+→ merging partial statistics
+→ candidate completion
+```
 
-1. Run System checks.
-2. Inspect the feature-set coverage.
-3. Retry the existing discovery scan.
-4. Confirm task progress advances through all 48 combinations.
-5. Review candidates only after the run status is `completed`.
-6. Shortlist a candidate based on net return, samples, concentration and validation—not win rate alone.
-7. Trigger sealed evaluation only after the candidate definition is frozen.
+Progress now counts sample and scan chunks, so the denominator will be much larger than the old `48` task count. That is expected and is what makes recovery granular.
 
-## 11. Recovery behaviour
+## Recommended settings for the existing run
 
-- Pause and Cancel cancel in-flight database work through an independent monitor.
-- Worker restarts reconcile stale control states.
-- Feature retries preserve completed chunks and symbol batches.
-- Discovery retries preserve compatible completed tasks; an engine-version change resets all tasks.
-- Legacy candidates cannot be sealed.
-- Upstream analysis assets cannot be deleted through the dashboard while dependants exist.
+An existing job retains its saved configuration. For new scans, use:
 
-## 12. Troubleshooting
+```text
+Entry sampling: non-overlapping
+Scan date chunk: 3 days
+Symbol shards: 4
+```
 
-### SQL preflight fails
+For an unusually constrained Supabase compute tier, start with 1 day and 8 shards. The engine will also split automatically after a timeout.
 
-Do not queue analysis. Open System details and inspect the exact missing object or failed PostgreSQL plan. Confirm both services are on the same 1.1.0 commit and database.
+## Troubleshooting
 
-### Worker is absent
+### A chunk times out
 
-Check the worker's `DATABASE_URL`, startup migration log and heartbeat. The web service cannot execute queued analysis on its own.
+The parent chunk should become `split` and two smaller children should appear. Completed chunks remain intact. A one-day, one-bucket timeout is terminal and identifies a database-capacity or query-plan problem requiring inspection.
 
-### Read-only transaction
+### Deadlock, serialization or short lock timeout
 
-Replace `DATABASE_URL` on both services with the Supabase Primary Session pooler on port 5432 and redeploy.
+The chunk is returned to `pending` and retried with jittered backoff up to `DISCOVERY_QUERY_RETRIES` total attempts.
 
-### Feature timeout
+### Pause remains requested
 
-The worker automatically splits symbol batches. Retry the same feature job; do not recreate it. Completed work is retained.
+Redeploy/restart the 2.0.0 worker. Startup recovery converts stale control states and returns active chunks to `pending`.
 
-### Discovery timeout
+### Preflight blocks a job
 
-The task retries once with jitter. If it still fails, inspect database compute and the selected every-bar/non-overlapping sampling mode. Non-overlapping is the recommended default.
-
-### Old percent-placeholder failure
-
-That defect belongs to v1.0.7 and earlier. v1.1.0 uses machine-safe category codes and validates all generated SQL through Psycopg grammar and PostgreSQL preflight before execution.
+Do not bypass it. Open **System**, inspect the exact missing object or PostgreSQL planning error, and confirm both services use the same 2.0.0 commit and database.
