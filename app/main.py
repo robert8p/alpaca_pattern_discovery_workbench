@@ -26,7 +26,7 @@ from app.models import (
 )
 from app.utils import json_safe
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -232,6 +232,30 @@ def job_detail(job_id: str, _: str = Depends(require_auth)) -> dict[str, Any]:
                     WHERE t.discovery_run_id IN (SELECT id FROM ra_discovery_runs WHERE job_id=%s)
                     GROUP BY t.id
                     ORDER BY t.id
+                    """,
+                    (jid,),
+                )
+                chunks = cur.fetchall()
+            elif job["job_type"] == "robustness_analysis":
+                cur.execute(
+                    """
+                    SELECT variant_key,trade_date,
+                        CASE
+                            WHEN count(*) FILTER (WHERE status='failed') > 0 THEN 'failed'
+                            WHEN count(*) FILTER (WHERE status='running') > 0 THEN 'running'
+                            WHEN count(*) FILTER (WHERE status='pending') > 0 THEN 'pending'
+                            WHEN count(*) FILTER (WHERE status='cancelled') > 0 THEN 'cancelled'
+                            ELSE 'completed'
+                        END AS status,
+                        count(*) FILTER (WHERE status<>'split') AS chunks,
+                        count(*) FILTER (WHERE status='completed') AS completed_chunks,
+                        COALESCE(sum(rows_written) FILTER (WHERE status='completed'),0)::bigint AS rows_written,
+                        max(attempts) AS max_attempts,
+                        max(error) FILTER (WHERE status='failed') AS error
+                    FROM ra_robustness_chunks
+                    WHERE robustness_run_id IN (SELECT id FROM ra_robustness_runs WHERE job_id=%s)
+                    GROUP BY variant_key,trade_date
+                    ORDER BY trade_date,variant_key
                     """,
                     (jid,),
                 )

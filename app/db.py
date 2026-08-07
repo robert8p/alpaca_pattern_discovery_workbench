@@ -15,8 +15,8 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
-SCHEMA_VERSION = "2.2.0"
-APP_VERSION = "2.2.0"
+SCHEMA_VERSION = "2.3.0"
+APP_VERSION = "2.3.0"
 SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
@@ -203,6 +203,12 @@ def _schema_state(cur: Any) -> dict[str, bool]:
             AND to_regclass('public.ra_robustness_runs') IS NOT NULL
             AND to_regclass('public.ra_robustness_observations') IS NOT NULL
             AND to_regclass('public.ra_robustness_results') IS NOT NULL
+            AND to_regclass('public.ra_robustness_chunks') IS NOT NULL
+            AND to_regclass('public.ra_robustness_samples') IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='ra_robustness_runs' AND column_name='engine_version'
+            )
             AND EXISTS (
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='ra_discovery_partials' AND column_name='best_pct'
@@ -263,6 +269,11 @@ def _apply_v220_coverage_migration(cur: Any) -> None:
     cur.execute(migration_path.read_text(encoding="utf-8"))
 
 
+def _apply_v230_robustness_migration(cur: Any) -> None:
+    migration_path = Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.3.0.sql"
+    cur.execute(migration_path.read_text(encoding="utf-8"))
+
+
 def execute_schema() -> None:
     schema_path = Path(__file__).resolve().parent.parent / "sql" / "schema.sql"
     try:
@@ -300,6 +311,7 @@ def execute_schema() -> None:
                         _drop_incompatible_v2_discovery_tables(cur)
                     _apply_v200_discovery_migration(cur)
                     _apply_v220_coverage_migration(cur)
+                    _apply_v230_robustness_migration(cur)
                 else:
                     cur.execute(schema_path.read_text(encoding="utf-8"))
 

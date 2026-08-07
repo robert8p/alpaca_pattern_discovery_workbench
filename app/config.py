@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     discovery_wall_timeout_seconds: int = Field(default=210, alias="DISCOVERY_WALL_TIMEOUT_SECONDS")
     discovery_cancel_grace_seconds: int = Field(default=15, alias="DISCOVERY_CANCEL_GRACE_SECONDS")
     discovery_query_retries: int = Field(default=3, alias="DISCOVERY_QUERY_RETRIES")
+    robustness_initial_symbol_shards: int = Field(default=4, alias="ROBUSTNESS_INITIAL_SYMBOL_SHARDS")
+    robustness_query_retries: int = Field(default=3, alias="ROBUSTNESS_QUERY_RETRIES")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
 

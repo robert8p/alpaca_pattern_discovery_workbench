@@ -133,7 +133,7 @@ def test_complete_postgres_workflow():
 
     preflight = database_sql_preflight(force=True, exhaustive=True)
     assert preflight["ok"] is True
-    assert preflight["database_plans"] == 389
+    assert preflight["database_plans"] == 772
 
     discovery_config = DiscoveryConfig(
         name="Synthetic audited discovery",
@@ -199,7 +199,7 @@ def test_complete_postgres_workflow():
     close_pool()
 
 
-def test_upgrade_from_v211_schema_to_v220():
+def test_upgrade_from_v211_schema_to_v230():
     """Exercise the real production upgrade path from the last shipped schema."""
     import psycopg
     from pathlib import Path
@@ -219,13 +219,42 @@ def test_upgrade_from_v211_schema_to_v220():
     execute_schema()
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.2.0'")
-            assert cur.fetchone()["app_version"] == "2.2.0"
+            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.3.0'")
+            assert cur.fetchone()["app_version"] == "2.3.0"
             cur.execute("SELECT to_regclass('public.ra_robustness_runs') AS runs,to_regclass('public.ra_robustness_observations') AS observations,to_regclass('public.ra_robustness_results') AS results")
             row=cur.fetchone()
             assert row['runs'] and row['observations'] and row['results']
             cur.execute("SELECT defined_variant_count,campaign_definition_version FROM ra_discovery_runs LIMIT 0")
             cur.execute("SELECT variants_defined_campaign,multiple_testing_adjusted_p,sealed_feature_set_id FROM ra_candidate_rules LIMIT 0")
             cur.execute("SELECT relative_trade_count_20bar,activity_impact_change_ratio,opening_range_position,touched_session_high FROM ra_discovery_samples LIMIT 0")
+        conn.rollback()
+    close_pool()
+
+
+def test_upgrade_from_v220_schema_to_v230():
+    import psycopg
+    from pathlib import Path
+    from app.config import get_settings
+    from app.db import close_pool, execute_schema, connection
+
+    os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+    get_settings.cache_clear()
+    close_pool()
+    url = os.environ["TEST_DATABASE_URL"]
+    legacy_schema = (Path(__file__).resolve().parent / "fixtures" / "schema_v2.2.0.sql").read_text(encoding="utf-8")
+    with psycopg.connect(url, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("CREATE SCHEMA public")
+            cur.execute(legacy_schema)
+    execute_schema()
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.3.0'")
+            assert cur.fetchone()["app_version"] == "2.3.0"
+            cur.execute("SELECT to_regclass('public.ra_robustness_chunks') AS chunks,to_regclass('public.ra_robustness_samples') AS samples")
+            row=cur.fetchone()
+            assert row["chunks"] and row["samples"]
+            cur.execute("SELECT engine_version FROM ra_robustness_runs LIMIT 0")
         conn.rollback()
     close_pool()

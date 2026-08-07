@@ -89,3 +89,13 @@ def test_discovery_coverage_surfaces_integrity_limitations():
     for token in ("historical_universe", "corporate_actions", "quotes", "market_sector"):
         assert token in main
     assert "Known integrity limitations" in javascript
+
+
+def test_robustness_v2_schema_and_blueprint_are_present():
+    schema=(ROOT / "sql" / "schema.sql").read_text(encoding="utf-8")
+    migration=(ROOT / "sql" / "migrations" / "2.3.0.sql").read_text(encoding="utf-8")
+    blueprint=(ROOT / "render.yaml").read_text(encoding="utf-8")
+    for token in ("ra_robustness_chunks", "ra_robustness_samples", "variant_key", "bucket_start", "bucket_end"):
+        assert token in schema and token in migration
+    assert blueprint.count("ROBUSTNESS_INITIAL_SYMBOL_SHARDS") == 2
+    assert blueprint.count("ROBUSTNESS_QUERY_RETRIES") == 2

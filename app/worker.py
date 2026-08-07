@@ -19,7 +19,7 @@ from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
@@ -44,8 +44,12 @@ def _mark_related(job: dict[str, Any], status: str) -> None:
                         (job["id"],),
                     )
             elif job["job_type"] == "robustness_analysis":
+                if status == "paused":
+                    cur.execute("UPDATE ra_robustness_chunks SET status='pending' WHERE robustness_run_id IN (SELECT id FROM ra_robustness_runs WHERE job_id=%s) AND status='running'", (job["id"],))
                 if status in {"cancelled", "failed"}:
                     cur.execute("UPDATE ra_robustness_runs SET status=%s,completed_at=CASE WHEN %s='cancelled' THEN now() ELSE completed_at END WHERE job_id=%s", (status, status, job["id"]))
+                if status == "cancelled":
+                    cur.execute("UPDATE ra_robustness_chunks SET status='cancelled' WHERE robustness_run_id IN (SELECT id FROM ra_robustness_runs WHERE job_id=%s) AND status IN ('pending','running','failed')", (job["id"],))
             elif job["job_type"] == "discovery_scan":
                 if status == "cancelled":
                     cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (job["id"],))

@@ -20,7 +20,7 @@ from app.discovery import (
 )
 from app.features import _feature_sql
 from app.models import FeatureBuildConfig, UniverseBuildConfig
-from app.robustness import _observation_query
+from app.robustness import _development_observation_query, _observation_query
 from app.sql_validation import validate_sql_bindings
 from app.universe import _universe_sql
 
@@ -86,19 +86,27 @@ def generated_queries() -> list[tuple[str, str, tuple[Any, ...]]]:
                     sealed_params = (_NIL_UUID, _SAMPLE_DATE, _SAMPLE_DATE,
                                      _SAMPLE_DATE, _SAMPLE_DATE, 0, 256, 0.2, *condition_params)
                     queries.append((f"sealed:{family}:{direction}:{horizon}:{stride}", sealed_query, sealed_params))
+                    robustness_query, robustness_condition_params = _observation_query(
+                        conditions, direction, horizon, stride, 570, 0
+                    )
+                    robustness_params = (
+                        _NIL_UUID, _SAMPLE_DATE, _SAMPLE_DATE, _SAMPLE_DATE, 0, 256,
+                        *robustness_condition_params, 0, horizon,
+                    )
+                    queries.append((f"robustness-holdout:{family}:{direction}:{horizon}:{stride}", robustness_query, robustness_params))
+                    robustness_dev_query, robustness_dev_condition_params = _development_observation_query(
+                        conditions, direction, horizon, stride, 570, 0
+                    )
+                    robustness_dev_params = (
+                        _NIL_UUID, "discovery", _SAMPLE_DATE, 0, 256,
+                        *robustness_dev_condition_params, _NIL_UUID, 0, horizon,
+                    )
+                    queries.append((f"robustness-development:{family}:{direction}:{horizon}:{stride}", robustness_dev_query, robustness_dev_params))
 
     feature_query, feature_params = _sample_feature_query()
     queries.append(("feature-build", feature_query, feature_params))
     universe_query, universe_params = _sample_universe_query()
     queries.append(("universe-build", universe_query, universe_params))
-    robustness_conditions = _sample_conditions("activity_absorption")
-    robustness_query, robustness_condition_params = _observation_query(
-        robustness_conditions, "long", 30, 30, 570, 0
-    )
-    queries.append((
-        "robustness:activity_absorption:long:30", robustness_query,
-        (_NIL_UUID, _SAMPLE_DATE, 0, 30, *robustness_condition_params),
-    ))
     return queries
 
 
@@ -142,6 +150,8 @@ def database_sql_preflight(*, force: bool = False, exhaustive: bool = False) -> 
                         to_regclass('public.ra_sealed_chunks') IS NOT NULL AS sealed_chunks_ok,
                         to_regclass('public.ra_robustness_runs') IS NOT NULL AS robustness_runs_ok,
                         to_regclass('public.ra_robustness_results') IS NOT NULL AS robustness_results_ok,
+                        to_regclass('public.ra_robustness_chunks') IS NOT NULL AS robustness_chunks_ok,
+                        to_regclass('public.ra_robustness_samples') IS NOT NULL AS robustness_samples_ok,
                         (SELECT count(*) = 5 FROM information_schema.columns
                          WHERE table_schema='public' AND table_name='ra_discovery_runs'
                            AND column_name = ANY(ARRAY['campaign_name','hypothesis_ids','variant_count','defined_variant_count','campaign_definition_version']))
@@ -176,7 +186,8 @@ def database_sql_preflight(*, force: bool = False, exhaustive: bool = False) -> 
                     next(item for item in checks if item[0] == "partial:oversold_reversal:long:30:30"),
                     next(item for item in checks if item[0] == "sealed:oversold_reversal:long:30:30"),
                     next(item for item in checks if item[0] == "partial:activity_absorption:long:30:30"),
-                    next(item for item in checks if item[0] == "robustness:activity_absorption:long:30"),
+                    next(item for item in checks if item[0] == "robustness-holdout:activity_absorption:long:30:30"),
+                    next(item for item in checks if item[0] == "robustness-development:activity_absorption:long:30:30"),
                     next(item for item in checks if item[0] == "feature-build"),
                     next(item for item in checks if item[0] == "universe-build"),
                 ]

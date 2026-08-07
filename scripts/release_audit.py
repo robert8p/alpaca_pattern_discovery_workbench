@@ -22,9 +22,9 @@ from app.db import APP_VERSION, SCHEMA_VERSION
 from app.preflight import local_sql_preflight
 from app.sql_validation import SqlBindingError, inspect_psycopg_placeholders
 
-EXPECTED_APP_VERSION = "2.2.0"
+EXPECTED_APP_VERSION = "2.3.0"
 EXPECTED_DISCOVERY_VERSION = "2.2.0"
-EXPECTED_SCHEMA_VERSION = "2.2.0"
+EXPECTED_SCHEMA_VERSION = "2.3.0"
 
 
 def audit_sql_literals() -> int:
@@ -137,6 +137,7 @@ def audit_schema() -> None:
     schema = (ROOT / "sql/schema.sql").read_text(encoding="utf-8")
     migration_v2 = (ROOT / "sql/migrations/2.0.0.sql").read_text(encoding="utf-8")
     migration_pack = (ROOT / "sql/migrations/2.2.0.sql").read_text(encoding="utf-8")
+    migration_robustness = (ROOT / "sql/migrations/2.3.0.sql").read_text(encoding="utf-8")
     v2_required = (
         "ra_discovery_samples", "ra_discovery_sample_chunks", "ra_discovery_task_chunks",
         "ra_discovery_partials", "ra_sealed_chunks", "sample_stride_minutes",
@@ -156,6 +157,13 @@ def audit_schema() -> None:
     for token in pack_required:
         if token not in schema or token not in migration_pack:
             raise RuntimeError(f"Coverage-pack schema or migration is missing {token}")
+    robustness_required = (
+        "ra_robustness_chunks", "ra_robustness_samples", "engine_version",
+        "variant_key", "bucket_start", "bucket_end",
+    )
+    for token in robustness_required:
+        if token not in schema or token not in migration_robustness:
+            raise RuntimeError(f"Robustness-v2 schema or migration is missing {token}")
     if "CREATE TABLE IF NOT EXISTS rd_" in schema:
         raise RuntimeError("Schema creates raw rd_ tables")
 

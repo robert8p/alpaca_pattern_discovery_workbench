@@ -37,6 +37,10 @@ services:
         value: "15"
       - key: DISCOVERY_QUERY_RETRIES
         value: "3"
+      - key: ROBUSTNESS_INITIAL_SYMBOL_SHARDS
+        value: "4"
+      - key: ROBUSTNESS_QUERY_RETRIES
+        value: "3"
       - key: LOG_LEVEL
         value: INFO
 
@@ -78,6 +82,10 @@ services:
       - key: DISCOVERY_CANCEL_GRACE_SECONDS
         value: "15"
       - key: DISCOVERY_QUERY_RETRIES
+        value: "3"
+      - key: ROBUSTNESS_INITIAL_SYMBOL_SHARDS
+        value: "4"
+      - key: ROBUSTNESS_QUERY_RETRIES
         value: "3"
       - key: LOG_LEVEL
         value: INFO

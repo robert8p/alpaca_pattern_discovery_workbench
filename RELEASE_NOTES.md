@@ -1,5 +1,15 @@
 # Release notes
 
+## 2.3.0 — Robustness Engine v2
+
+- Replaces whole-date robustness queries with persistent variant × date × symbol-bucket chunks.
+- Reuses staged Discovery samples for development-period robustness.
+- Automatically splits timed-out symbol buckets and retries transient database errors.
+- Persists every robustness variant observation so retries/redeployments resume incomplete work only.
+- Adds robustness chunk visibility in Job details.
+- Adds targeted schema migration `2.3.0`; no raw data, feature-set or candidate rebuild is required.
+
+
 ## 2.2.0 — Research Integrity + Discovery Coverage Pack 1
 
 - Preserves the six existing Discovery family definitions and completed historical candidates.

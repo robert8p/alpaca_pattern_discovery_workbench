@@ -84,6 +84,9 @@ def recover_stale_jobs() -> int:
                 cur.execute(
                     "UPDATE ra_sealed_chunks SET status='pending',error=COALESCE(error,'Recovered after worker restart') WHERE status='running' AND job_id IN (SELECT id FROM ra_jobs WHERE status='queued' AND phase='recovered')"
                 )
+                cur.execute(
+                    "UPDATE ra_robustness_chunks SET status='pending',error=COALESCE(error,'Recovered after worker restart') WHERE status='running' AND robustness_run_id IN (SELECT id FROM ra_robustness_runs WHERE job_id IN (SELECT id FROM ra_jobs WHERE status='queued' AND phase='recovered'))"
+                )
 
             cur.execute(
                 """
@@ -141,6 +144,7 @@ def recover_stale_jobs() -> int:
                     )
                 elif row['job_type'] == 'robustness_analysis':
                     cur.execute("UPDATE ra_robustness_runs SET status='running' WHERE job_id=%s", (row['id'],))
+                    cur.execute("UPDATE ra_robustness_chunks SET status='pending',error=COALESCE(error,'Recovered after paused worker restart') WHERE status='running' AND robustness_run_id IN (SELECT id FROM ra_robustness_runs WHERE job_id=%s)", (row['id'],))
 
             cur.execute(
                 """
@@ -177,6 +181,7 @@ def recover_stale_jobs() -> int:
                     )
                 elif row['job_type'] == 'robustness_analysis':
                     cur.execute("UPDATE ra_robustness_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (row['id'],))
+                    cur.execute("UPDATE ra_robustness_chunks SET status='cancelled' WHERE robustness_run_id IN (SELECT id FROM ra_robustness_runs WHERE job_id=%s) AND status IN ('pending','running','failed')", (row['id'],))
                 elif row['job_type'] == 'discovery_scan':
                     cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (row['id'],))
                     cur.execute(

@@ -1,6 +1,13 @@
-# Alpaca Pattern Discovery Workbench 2.2.0
+# Alpaca Pattern Discovery Workbench 2.3.0
 
 A button-driven research companion to the Alpaca Rapid Discovery Loader. It reads the existing `rd_` market-data tables and writes only to versioned `ra_` research tables in the same Supabase database.
+
+
+## 2.3.0 — Robustness Engine v2
+
+Robustness analysis is now bounded and resumable. Each robustness variant is split by trading date and deterministic symbol bucket, persisted in `ra_robustness_chunks`, and writes its observations to `ra_robustness_samples`. Development-mode robustness reuses the already-materialised `ra_discovery_samples` rather than recalculating signal state across the full feature table. Any timed-out bucket is split automatically and completed buckets survive retry or redeployment.
+
+This release does not change Discovery family definitions or require rebuilding completed feature sets/candidates.
 
 ## 2.2.0 — Research Integrity + Discovery Coverage Pack 1
 
@@ -120,11 +127,11 @@ ra_candidate_rules      │
         └── explicit sealed evaluation
 ```
 
-The staged Discovery engine remains timeout-resistant: samples and family scans are chunked by date and deterministic symbol bucket, with committed partials surviving pause/retry/redeployment.
+Both Discovery and Robustness are timeout-resistant: work is chunked by date and deterministic symbol bucket, with committed chunks surviving pause/retry/redeployment.
 
 ## Deployment
 
-See `DEPLOYMENT.md`. Existing `rd_` bars, feature rows, universes and completed candidate results are preserved. The first 2.2.0 startup applies the targeted idempotent migration `sql/migrations/2.2.0.sql`.
+See `DEPLOYMENT.md`. Existing `rd_` bars, feature rows, universes and completed candidate results are preserved. The first 2.3.0 startup applies the existing 2.2.0 coverage migration if needed and then the targeted idempotent `sql/migrations/2.3.0.sql` robustness migration.
 
 ## Release validation
 

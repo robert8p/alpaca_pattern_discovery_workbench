@@ -1,173 +1,112 @@
-# Alpaca Pattern Discovery Workbench 2.2.0 — Research Integrity & Coverage Audit
+# Alpaca Pattern Discovery Workbench v2.3.0 — Robustness Engine v2 Audit
 
 ## Scope
 
-This release implements the smallest high-value expansion agreed after the pre-coding inventory against the user's **Expand Alpaca Workbench Discovery Coverage** brief (`Pasted text(9).txt`). The release does not attempt to manufacture unavailable sector, quote, halt, event, relationship or overseas-market data.
+This release rebuilds the Robustness Lab execution engine after a production development-period run failed at 239/258 steps with `canceling statement due to statement timeout`.
 
-The objectives are:
+Discovery family definitions, completed feature sets, frozen universes, candidate definitions and raw `rd_` data are unchanged.
 
-1. preserve completed historical Discovery definitions;
-2. strengthen candidate evidence before further expansion;
-3. make compatible historical/forward holdout replay possible without changing frozen rules;
-4. add versioned tests for the highest-value hypotheses that can be addressed with the feature data already present;
-5. record campaign/test multiplicity explicitly; and
-6. keep `rd_` loader data read-only.
+## Root cause of the v2.2.0 timeout
 
-## Existing Discovery definitions preserved
+The v2.2.0 Robustness Lab was not using the bounded Discovery architecture. It executed one query per full trading date for each entry-delay or neighbourhood variant. Each query reconstructed signal state from `ra_intraday_features`, including joins/window calculations and holding-horizon excursion calculations. The failing run had completed:
 
-The six previously implemented families remain unchanged in their eligibility/filter definitions:
+- all configured entry-delay passes;
+- the complete relaxed-neighbourhood pass; and
+- part of the tightened-neighbourhood pass.
 
-- `time_of_day`
-- `oversold_reversal`
-- `momentum_continuation`
-- `vwap_reversion`
-- `gap_behavior`
-- `volume_shock`
+The progress value 239/258 therefore represented in-memory loop progress, not 239 durable robustness tasks. Only base observations were persisted. Non-base delay/neighbourhood results were held in memory until finalisation, so a failed v2.2.0 run could not resume from step 240.
 
-Existing completed candidate rows are not rewritten. Earlier staged-v2 candidates remain readable by the audited Robustness/holdout replay path.
+## v2.3.0 architecture
 
-## Coverage Pack 1
+Robustness now uses persistent, bounded work units:
 
-The release adds six new, separately versioned families:
+`variant × trade date × deterministic symbol bucket`
 
-| Family | Hypothesis mapping | Coverage claim | What remains absent |
-|---|---|---|---|
-| `dip_repair` | H01 | PARTIAL | higher-low transition, true VWAP reclaim transition, quote-spread/depth repair, market/sector recovery |
-| `compression_expansion` | H03 | PARTIAL | market/sector confirmation and quote spread percentile |
-| `gap_state` | H04/H05 | PARTIAL | quote liquidity, sector-relative state, explicit earnings classification |
-| `activity_absorption` | H06 | PARTIAL | market/sector direction and quote/depth confirmation |
-| `price_efficiency` | H07 | PARTIAL | broad-market regime and market-cap segmentation |
-| `new_high_liquidity_divergence` | H12 | PARTIAL | quote spread/depth and true order-book liquidity confirmation |
+New tables:
 
-These families use only information available at or before the completed signal bar. Forward outcomes remain separate target fields.
+- `ra_robustness_chunks`
+- `ra_robustness_samples`
 
-## Hypotheses deliberately not approximated
+Every completed chunk commits its observations independently. Parent chunks can be split into smaller symbol-bucket ranges after a timeout. Worker restart, pause and retry release only incomplete chunks back to `pending`.
 
-The Workbench continues to flag rather than imitate missing data:
+### Development-mode optimisation
 
-- H09–H11: frozen 14:00/17:00 activation/trigger history from the 13.8 Research Lab.
-- H13–H14: point-in-time halt/resumption events.
-- H25–H27: point-in-time sector/ETF membership, weights and market capitalisation.
-- H28: customer/supplier relationships and exposure.
-- H29: home-market listing plus FX data.
-- H30–H34: timestamped news/earnings/attention events.
-- H35: secondary-offering events/pricing/dilution.
-- H36: index/rebalance events and closing-auction flow estimates.
+When robustness replays a candidate against its original completed feature set, the engine reads the already-materialised `ra_discovery_samples`. It does not reconstruct signal state from the complete intraday feature table.
 
-H02/H08 market-only variants are identified as the next data-ready extension once SPY/benchmark-relative features are added.
+Development mode therefore starts with one bucket covering the entire symbol universe per date/variant. If a date still exceeds the timeout, that date is automatically split by deterministic symbol bucket.
 
-## Research-integrity changes
+### Historical-holdout mode
 
-### Campaign accounting
+A compatible external feature set has no pre-existing Discovery sample table for the candidate. Holdout robustness therefore reconstructs the required signal fields from `ra_intraday_features`, but each query is bounded to one date and one symbol-bucket range. Holdouts start with four symbol shards by default and can split further on timeout.
 
-Every new Discovery campaign records:
+## Statistical behaviour
 
-- campaign name and definition version;
-- hypothesis IDs and versions;
-- `variant_count`: grouped parameter combinations that actually appeared and were statistically tested;
-- `defined_variant_count`: the larger parameter grid defined before seeing results, including zero-observation combinations;
-- corresponding tested/defined counts on each retained candidate.
+The Robustness Lab outputs are unchanged in interpretation. It continues to calculate:
 
-The current Bonferroni normal-approximation adjustment uses the actual statistical test count. The larger defined grid is retained as a conservative audit of search complexity rather than being silently discarded.
+- exact gross/net observation returns;
+- date-clustered t-statistic;
+- leave-one-date-out minimum expectancy;
+- cost sensitivity;
+- entry-delay sensitivity;
+- relaxed/exact/tightened threshold-neighbourhood results;
+- liquidity-tier and price-group breakdowns;
+- date/month/year/symbol breakdowns;
+- top 1%, 5% and 10% contribution;
+- missing-outcome rate;
+- holding-horizon MFE and MAE.
 
-### Candidate distribution output
+The candidate rule, direction, holding horizon, entry stride and entry anchor remain frozen.
 
-New candidates additionally record p25, p75, p95 and best observation for Discovery and validation, alongside the existing mean, median, p05, worst observation, win rate, profit factor, t-statistic and concentration metrics.
+## Migration safety
 
-### Robustness Lab
+The targeted `sql/migrations/2.3.0.sql` migration is additive and idempotent. It:
 
-Existing and new candidates can be replayed without rediscovery. The lab provides:
+- adds `engine_version` to `ra_robustness_runs`;
+- creates the two new robustness-v2 tables and indexes;
+- adds the robustness-chunk update trigger.
 
-- exact return distribution;
-- ordinary and date-clustered t-statistics;
-- leave-one-date-out minimum net expectancy;
-- date, month and year breakdowns;
-- symbol, liquidity-tier and price-group breakdowns;
-- top 1%, 5% and 10% return contribution;
-- 20/25/30/40 bps cost sensitivity by default;
-- 0/1/2/5 minute entry-delay sensitivity by default;
-- relaxed/exact/tightened threshold-neighbourhood sensitivity;
-- explicit candidate-signal count, missing-outcome count and missing-data rate;
-- holding-horizon MFE and MAE calculated from completed post-entry bars.
+It does not modify `rd_` raw tables, completed `ra_intraday_features`, frozen universes or candidate rule definitions.
 
-Open-ended thresholds such as `>=3%` and `<-3%` are explicitly perturbed by neighbourhood testing; they are no longer incorrectly treated as unchanged.
+The startup compatibility check now requires the full v2.3.0 robustness surface. A partially applied migration is therefore repaired rather than treated as complete.
 
-Robustness verdicts are research-stage only: `REJECT`, `WEAK`, `PROMISING`, `HISTORICAL_HOLDOUT`.
+## Retry semantics for the existing failed run
 
-### Compatible feature-set replay
+The old 239/258 progress cannot be preserved because v2.2.0 never persisted the non-base subtests. After deployment, retrying that job creates the new robustness chunks and replays the diagnostics using v2.3.0.
 
-A holdout or sealed feature set must preserve:
-
-- the same frozen universe ID;
-- timeframe;
-- feed;
-- adjustment;
-- session;
-- liquidity-tier selection;
-- predictor horizons;
-- time-of-day baseline definition; and
-- the candidate's required outcome horizon.
-
-Operational chunk/batch settings may differ. Both the server and Candidate UI enforce/filter this compatibility.
-
-### Provenance deletion safeguards
-
-A feature-set job cannot be deleted while Discovery, Robustness or sealed-test evidence depends on it. This prevents an apparently tidy cleanup from destroying the provenance required to reproduce candidate evidence.
-
-## Known integrity limitations still visible in the app
-
-1. **Historical universe:** current frozen universes do not yet reconstruct point-in-time active/delisted membership for earlier dates.
-2. **Corporate actions:** raw prices avoid back-adjustment leakage, but explicit point-in-time split/dividend event exclusions are not yet available.
-3. **Quotes:** bid-ask spread, depth and quote size are absent.
-4. **Market/sector context:** benchmark-relative and point-in-time sector states require enrichment.
-
-A historical replay using today's frozen universe is therefore evidence about that frozen population; it should not be represented as an unbiased point-in-time estimate of the entire historical US equity universe.
-
-## Migration hardening
-
-The 2.2.0 migration is targeted and idempotent. Startup compatibility now verifies the full coverage-pack surface rather than a small subset of columns. A partially applied migration is therefore repaired instead of being silently accepted.
-
-The PostgreSQL CI suite contains a dedicated upgrade test that installs the exact shipped **v2.1.1 schema fixture**, runs the v2.2.0 migration path and checks the new candidate, sample, robustness and schema-version objects.
+Once a v2.3.0 run begins, completed chunks are durable. A subsequent timeout/restart retries only incomplete/split chunks.
 
 ## Release gate executed locally
 
-Against the exact source tree before packaging:
+The exact working tree used for packaging passed:
 
-- **73 automated tests passed**.
-- **2 PostgreSQL-backed tests skipped locally** because the assembly environment does not provide a PostgreSQL server/Psycopg installation.
-- Python compilation passed.
-- JavaScript syntax validation passed.
-- **240 literal SQL statements** passed Psycopg placeholder inspection.
-- **192 statically countable SQL bindings** passed placeholder/parameter matching.
-- **6 `ON CONFLICT ... DO UPDATE` statements** passed explicit-conflict-target validation.
-- **389 generated production-query combinations** passed binding validation.
-- Raw `rd_` write-protection scan passed.
-- Browser-native Candidate export regression remains in place.
-- Candidate export format is now `1.1` and includes robustness output.
-- No packaged credentials were found.
+- 78 automated tests;
+- 3 PostgreSQL integration tests skipped locally because this assembly environment does not provide PostgreSQL/Psycopg;
+- Python compilation;
+- JavaScript syntax validation;
+- 258 literal SQL statements inspected;
+- 208 statically countable SQL bindings checked;
+- 6 PostgreSQL `ON CONFLICT ... DO UPDATE` statements checked for explicit targets;
+- 772 generated production-query binding checks;
+- all Discovery family/direction/horizon/sampling combinations for both robustness query paths;
+- raw `rd_` write-protection scan;
+- credential scan.
 
-Generated-query definition hash at final local audit:
+Generated-query definition hash:
 
-`ca70df12bf30ec43...`
+`df4c164dfe34f544`
 
-## Mandatory database-backed release gate
+## PostgreSQL CI gates
 
-The local environment cannot execute the two PostgreSQL integration tests. The included GitHub Actions workflow provisions PostgreSQL 16 and runs them with the real Psycopg driver. They cover:
+The repository includes GitHub Actions with PostgreSQL 16 and the real Psycopg driver. Three integration tests are intentionally gated there:
 
-1. clean schema installation → universe → features → exhaustive query planning → all Discovery families → Robustness Lab → sealed evaluation; and
-2. the exact v2.1.1 → v2.2.0 schema upgrade path.
+1. the complete synthetic Workbench workflow, including Robustness Lab;
+2. upgrade from the shipped v2.1.1 schema through the current v2.3.0 schema;
+3. upgrade from the actual shipped v2.2.0 schema to v2.3.0, verifying `ra_robustness_chunks`, `ra_robustness_samples` and the robustness engine-version column.
 
-**Do not deploy the commit unless GitHub Actions `release-gate` is green.**
+Deployment should proceed only from a commit whose GitHub `release-gate` is green.
 
-## Data/rerun impact
+## Remaining limitations
 
-- No `rd_` raw data rebuild is required.
-- Existing frozen universes remain intact.
-- Existing completed feature sets contain the underlying fields required by Coverage Pack 1; they do not need rebuilding for the new Discovery families.
-- Existing candidates do not need rediscovery to use Robustness Lab.
-- To test the new H01/H03/H04–H07/H12 families, create a **new Discovery campaign** from a compatible completed feature set rather than modifying a completed historical run.
-- A new historical/forward holdout feature set is only compatible when it preserves the frozen feature definition described above.
-
-## Interpretation rule
-
-Nothing produced by Discovery or Robustness Lab is labelled “validated.” Sealed evaluation remains a separate explicit action and the candidate definition cannot be re-optimised after sealed evidence is revealed.
+- The local assembly environment did not execute PostgreSQL integration tests; they must pass in GitHub Actions before Render deployment.
+- A terminal one-date/one-symbol-bucket query can still fail if the database itself cannot execute that minimal slice within its timeout. The job will expose that exact terminal slice rather than hanging or losing other completed work.
+- Historical holdout reconstruction is necessarily more expensive than development robustness because it cannot reuse the original Discovery samples, but it is now bounded and automatically splittable.

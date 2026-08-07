@@ -98,3 +98,31 @@ def test_threshold_perturbation_changes_open_ended_bins():
     assert _perturb_conditions(ge,10,"tightened")[0]["low"] == 3.3
     assert _perturb_conditions(lt,10,"relaxed")[0]["high"] == -2.7
     assert _perturb_conditions(lt,10,"tightened")[0]["high"] == -3.3
+
+
+def test_development_query_uses_staged_discovery_samples_and_bucket_bounds():
+    from app.robustness import _development_observation_query
+    q, params = _development_observation_query([
+        {"column":"ret_30m_pct","operator":"gte","value":3}
+    ], "short", 15, 15, 570, 0)
+    assert "FROM ra_discovery_samples s" in q
+    assert "s.symbol_bucket >= %s AND s.symbol_bucket < %s" in q
+    assert "f.feature_set_id=%s" not in q
+    assert params == (3,)
+
+
+def test_holdout_query_is_bounded_by_date_and_symbol_bucket():
+    q, _ = _observation_query([
+        {"column":"ret_30m_pct","operator":"gte","value":3}
+    ], "short", 15, 15, 570, 0)
+    assert "f.trade_date=%s" in q
+    assert "hashtext(f.symbol)" in q
+    assert ">= %s" in q and "< %s" in q
+
+
+def test_robustness_variant_specs_include_each_delay_and_two_neighbourhoods():
+    from app.models import RobustnessAnalysisConfig
+    from app.robustness import _variant_specs
+    cfg=RobustnessAnalysisConfig(candidate_id="00000000-0000-0000-0000-000000000001",entry_delays_minutes=[0,1,2,5])
+    specs=_variant_specs(cfg,[{"column":"ret_30m_pct","operator":"gte","value":3}])
+    assert set(specs)=={"delay:0","delay:1","delay:2","delay:5","neighbour:relaxed","neighbour:tightened"}

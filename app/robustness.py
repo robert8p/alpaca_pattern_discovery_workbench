@@ -8,16 +8,19 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from app.config import get_settings
 from app.db import connection
 from app.discovery import (
-    SYMBOL_BUCKETS, _condition_sql, _execute_guarded,
+    SYMBOL_BUCKETS, DiscoveryQueryTimeout, _bucket_ranges, _condition_sql,
+    _execute_guarded, _is_retryable_database_error, _is_timeout,
 )
-from app.jobs import add_event, check_control, set_progress
+from app.jobs import JobInterrupted, add_event, check_control, set_progress
 from app.models import RobustnessAnalysisConfig
 from app.sql_validation import validate_sql_bindings
 from app.utils import ensure_feature_set_compatibility, finite_or_none, json_safe
 
-ROBUSTNESS_VERSION = "1.0.0"
+ROBUSTNESS_VERSION = "2.0.0"
+ROBUSTNESS_ENGINE_VERSION = "2.3.0"
 SUPPORTED_RULE_DEFINITIONS = {
     "2026-08-staged-v2",
     "2026-08-coverage-pack1-v1",
@@ -66,8 +69,8 @@ def _perturb_conditions(conditions: list[dict[str, Any]], pct: float, mode: str)
         elif op in {"gte", "gt", "lte", "lt"} and isinstance(c.get("value"), (int, float)):
             value = float(c["value"])
             if value != 0:
-                strict_positive = op in {"gte", "gt"} and value > 0 or op in {"lte", "lt"} and value < 0
-                strict_negative = op in {"lte", "lt"} and value > 0 or op in {"gte", "gt"} and value < 0
+                strict_positive = (op in {"gte", "gt"} and value > 0) or (op in {"lte", "lt"} and value < 0)
+                strict_negative = (op in {"lte", "lt"} and value > 0) or (op in {"gte", "gt"} and value < 0)
                 if mode == "relaxed":
                     c["value"] = value * (1.0 - factor if strict_positive else 1.0 + factor if strict_negative else 1.0)
                 else:
@@ -86,27 +89,83 @@ def _perturb_conditions(conditions: list[dict[str, Any]], pct: float, mode: str)
     return out
 
 
-def _observation_query(
-    conditions: list[dict[str, Any]], direction: str, horizon: int,
-    stride: int, anchor: int, delay: int,
-) -> tuple[str, tuple[Any, ...]]:
-    where, condition_params = _condition_sql(conditions, alias="s")
+def _sampling_sql(stride: int, anchor: int, alias: str = "s") -> str:
+    if stride < 1:
+        raise ValueError("Entry stride must be at least one minute")
+    return "TRUE" if stride == 1 else f"mod({alias}.minute_of_day - {int(anchor)}, {int(stride)}) = 0"
+
+
+def _return_sql(direction: str, horizon: int) -> tuple[str, str, str]:
     if direction not in {"long", "short"}:
         raise ValueError("Direction must be long or short")
     if horizon not in {5, 15, 30, 60}:
         raise ValueError("Unsupported holding horizon")
-    sampling = "TRUE" if stride == 1 else f"mod(s.minute_of_day - {int(anchor)}, {int(stride)}) = 0"
     outcome = f"e.fwd_return_{horizon}m_pct"
-    gross = outcome if direction == "long" else f"-{outcome}"
     if direction == "long":
-        mfe = "(exc.max_high/NULLIF(e.close,0)-1)*100"
-        mae = "(exc.min_low/NULLIF(e.close,0)-1)*100"
-    else:
-        mfe = "-(exc.min_low/NULLIF(e.close,0)-1)*100"
-        mae = "-(exc.max_high/NULLIF(e.close,0)-1)*100"
+        return outcome, "(exc.max_high/NULLIF(e.close,0)-1)*100", "(exc.min_low/NULLIF(e.close,0)-1)*100"
+    return f"-{outcome}", "-(exc.min_low/NULLIF(e.close,0)-1)*100", "-(exc.max_high/NULLIF(e.close,0)-1)*100"
+
+
+def _development_observation_query(
+    conditions: list[dict[str, Any]], direction: str, horizon: int,
+    stride: int, anchor: int, delay: int,
+) -> tuple[str, tuple[Any, ...]]:
+    where, condition_params = _condition_sql(conditions, alias="s")
+    sampling = _sampling_sql(stride, anchor, "s")
+    gross, mfe, mae = _return_sql(direction, horizon)
+    query = f"""
+        WITH signal AS MATERIALIZED (
+            SELECT s.*
+            FROM ra_discovery_samples s
+            WHERE s.discovery_run_id=%s
+              AND s.period_label=%s
+              AND s.trade_date=%s
+              AND s.symbol_bucket >= %s AND s.symbol_bucket < %s
+              AND ({sampling})
+              AND ({where})
+        )
+        SELECT s.symbol_bucket,s.symbol,s.bar_ts,s.trade_date,s.minute_of_day,s.liquidity_tier,
+            COALESCE(s.price_group,CASE WHEN e.close < 5 THEN 'lt_5' WHEN e.close < 10 THEN '5_10'
+                 WHEN e.close < 25 THEN '10_25' WHEN e.close < 100 THEN '25_100' ELSE 'ge_100' END) AS price_group,
+            ({gross})::double precision AS gross_return_pct,
+            ({mfe})::double precision AS mfe_pct,
+            ({mae})::double precision AS mae_pct
+        FROM signal s
+        LEFT JOIN ra_intraday_features e
+          ON e.feature_set_id=%s AND e.symbol=s.symbol
+         AND e.bar_ts=s.bar_ts+(%s::integer * interval '1 minute')
+        LEFT JOIN LATERAL (
+            SELECT max(x.high) AS max_high,min(x.low) AS min_low
+            FROM ra_intraday_features x
+            WHERE x.feature_set_id=e.feature_set_id AND x.symbol=e.symbol
+              AND x.bar_ts>e.bar_ts
+              AND x.bar_ts<=e.bar_ts+(%s::integer * interval '1 minute')
+        ) exc ON TRUE
+        ORDER BY s.symbol,s.bar_ts
+    """
+    sample_params = ("run", "discovery", date.today(), 0, 256, *condition_params, "feature", delay, horizon)
+    validate_sql_bindings(query, sample_params, name="robustness development observation query")
+    return query, tuple(condition_params)
+
+
+def _observation_query(
+    conditions: list[dict[str, Any]], direction: str, horizon: int,
+    stride: int, anchor: int, delay: int,
+) -> tuple[str, tuple[Any, ...]]:
+    """Build the bounded feature-table query used for cross-feature-set holdouts.
+
+    Unlike the withdrawn robustness query, this statement is always constrained
+    to one trade date and one deterministic symbol bucket range.
+    """
+    where, condition_params = _condition_sql(conditions, alias="s")
+    sampling = _sampling_sql(stride, anchor, "s")
+    gross, mfe, mae = _return_sql(direction, horizon)
     query = f"""
         WITH source AS MATERIALIZED (
             SELECT f.*,
+                mod(abs(hashtext(f.symbol)::bigint), {SYMBOL_BUCKETS})::smallint AS symbol_bucket,
+                CASE WHEN f.close < 5 THEN 'lt_5' WHEN f.close < 10 THEN '5_10'
+                     WHEN f.close < 25 THEN '10_25' WHEN f.close < 100 THEN '25_100' ELSE 'ge_100' END AS price_group,
                 CASE WHEN f.ret_5m_pct IS NOT NULL AND f.relative_volume_20bar > 0
                      THEN abs(f.ret_5m_pct)/f.relative_volume_20bar END AS activity_adjusted_return_5m,
                 CASE WHEN p.ret_5m_pct IS NOT NULL AND p.relative_volume_20bar > 0
@@ -120,8 +179,12 @@ def _observation_query(
               ON p.feature_set_id=f.feature_set_id AND p.symbol=f.symbol
              AND p.bar_ts=f.bar_ts-interval '5 minutes'
             WHERE f.feature_set_id=%s
+              AND f.bar_ts >= (%s::date::timestamp AT TIME ZONE 'America/New_York')
+              AND f.bar_ts < (((%s::date + 1)::timestamp) AT TIME ZONE 'America/New_York')
               AND f.trade_date=%s
-        ), signal AS MATERIALIZED (
+              AND mod(abs(hashtext(f.symbol)::bigint), {SYMBOL_BUCKETS}) >= %s
+              AND mod(abs(hashtext(f.symbol)::bigint), {SYMBOL_BUCKETS}) < %s
+        ), enriched AS (
             SELECT source.*,
                 CASE WHEN activity_adjusted_return_5m IS NOT NULL AND prior_activity_adjusted_return_5m > 0
                      THEN activity_adjusted_return_5m/prior_activity_adjusted_return_5m END AS activity_impact_change_ratio,
@@ -138,10 +201,11 @@ def _observation_query(
                 (high>=cumulative_high) AS touched_session_high,
                 (low<=cumulative_low) AS touched_session_low
             FROM source
+        ), signal AS MATERIALIZED (
+            SELECT s.* FROM enriched s
+            WHERE ({sampling}) AND ({where})
         )
-        SELECT s.symbol,s.bar_ts,s.trade_date,s.minute_of_day,s.liquidity_tier,
-            CASE WHEN COALESCE(e.close,s.close) < 5 THEN 'lt_5' WHEN COALESCE(e.close,s.close) < 10 THEN '5_10'
-                 WHEN COALESCE(e.close,s.close) < 25 THEN '10_25' WHEN COALESCE(e.close,s.close) < 100 THEN '25_100' ELSE 'ge_100' END AS price_group,
+        SELECT s.symbol_bucket,s.symbol,s.bar_ts,s.trade_date,s.minute_of_day,s.liquidity_tier,s.price_group,
             ({gross})::double precision AS gross_return_pct,
             ({mfe})::double precision AS mfe_pct,
             ({mae})::double precision AS mae_pct
@@ -156,14 +220,11 @@ def _observation_query(
               AND x.bar_ts>e.bar_ts
               AND x.bar_ts<=e.bar_ts+(%s::integer * interval '1 minute')
         ) exc ON TRUE
-        WHERE ({sampling})
-          AND ({where})
-        ORDER BY s.trade_date,s.symbol,s.bar_ts
+        ORDER BY s.symbol,s.bar_ts
     """
-    params = ("feature", date.today(), delay, horizon, *condition_params)
-    validate_sql_bindings(query, params, name="robustness observation query")
+    sample_params = ("feature", date.today(), date.today(), date.today(), 0, 256, *condition_params, delay, horizon)
+    validate_sql_bindings(query, sample_params, name="robustness bounded observation query")
     return query, tuple(condition_params)
-
 
 def _quantile(values: list[float], q: float) -> float | None:
     if not values:
@@ -287,6 +348,16 @@ def _verdict(summary: dict[str, Any], mode: str) -> str:
     return "PROMISING"
 
 
+
+def _variant_specs(config: RobustnessAnalysisConfig, conditions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    specs: dict[str, dict[str, Any]] = {}
+    for delay in config.entry_delays_minutes:
+        specs[f"delay:{int(delay)}"] = {"delay": int(delay), "conditions": [dict(x) for x in conditions]}
+    specs["neighbour:relaxed"] = {"delay": 0, "conditions": _perturb_conditions(conditions, config.neighbourhood_pct, "relaxed")}
+    specs["neighbour:tightened"] = {"delay": 0, "conditions": _perturb_conditions(conditions, config.neighbourhood_pct, "tightened")}
+    return specs
+
+
 def _ensure_run(job_id: str, candidate: dict[str, Any], target_feature_set_id: Any,
                 config: RobustnessAnalysisConfig, start: date, end: date) -> str:
     with connection() as conn:
@@ -295,17 +366,153 @@ def _ensure_run(job_id: str, candidate: dict[str, Any], target_feature_set_id: A
             row = cur.fetchone()
             if row:
                 run_id = str(row["id"])
-                cur.execute("DELETE FROM ra_robustness_observations WHERE robustness_run_id=%s", (run_id,))
                 cur.execute("DELETE FROM ra_robustness_results WHERE robustness_run_id=%s", (run_id,))
-                cur.execute("UPDATE ra_robustness_runs SET status='running',summary=NULL,verdict=NULL,completed_at=NULL,config=%s,start_date=%s,end_date=%s,target_feature_set_id=%s WHERE id=%s",
-                            (Jsonb(config.model_dump(mode="json")), start, end, target_feature_set_id, run_id))
+                cur.execute("""UPDATE ra_robustness_runs SET status='running',engine_version=%s,summary=NULL,verdict=NULL,completed_at=NULL,
+                    config=%s,start_date=%s,end_date=%s,target_feature_set_id=%s WHERE id=%s""",
+                    (ROBUSTNESS_ENGINE_VERSION,Jsonb(config.model_dump(mode="json")),start,end,target_feature_set_id,run_id))
+                cur.execute("UPDATE ra_robustness_chunks SET status='pending',error=NULL WHERE robustness_run_id=%s AND status IN ('running','failed','cancelled')", (run_id,))
             else:
-                cur.execute("""INSERT INTO ra_robustness_runs(job_id,candidate_id,source_feature_set_id,target_feature_set_id,mode,config,start_date,end_date)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                    (job_id,candidate["id"],candidate["feature_set_id"],target_feature_set_id,config.mode,Jsonb(config.model_dump(mode="json")),start,end))
+                cur.execute("""INSERT INTO ra_robustness_runs(job_id,candidate_id,source_feature_set_id,target_feature_set_id,mode,config,start_date,end_date,engine_version)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (job_id,candidate["id"],candidate["feature_set_id"],target_feature_set_id,config.mode,Jsonb(config.model_dump(mode="json")),start,end,ROBUSTNESS_ENGINE_VERSION))
                 run_id = str(cur.fetchone()["id"])
         conn.commit()
     return run_id
+
+
+def _initialise_chunks(run_id: str, dates: list[date], variant_keys: list[str], shards: int) -> None:
+    shards = max(1, min(SYMBOL_BUCKETS, int(shards)))
+    ranges = _bucket_ranges(shards)
+    rows = [(run_id,key,d,b0,b1) for key in variant_keys for d in dates for b0,b1 in ranges]
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany("""INSERT INTO ra_robustness_chunks(robustness_run_id,variant_key,trade_date,bucket_start,bucket_end)
+                VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""", rows)
+        conn.commit()
+
+
+def _claim_chunk(run_id: str) -> dict[str, Any] | None:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT * FROM ra_robustness_chunks WHERE robustness_run_id=%s AND status='pending'
+                ORDER BY trade_date,variant_key,bucket_start FOR UPDATE SKIP LOCKED LIMIT 1""", (run_id,))
+            row=cur.fetchone()
+            if row:
+                cur.execute("UPDATE ra_robustness_chunks SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,now()),error=NULL WHERE id=%s", (row["id"],))
+        conn.commit()
+    return dict(row) if row else None
+
+
+def _split_chunk(job_id: str, chunk: dict[str, Any], error: Exception) -> bool:
+    b0,b1=int(chunk["bucket_start"]),int(chunk["bucket_end"])
+    if b1-b0 <= 1:
+        return False
+    mid=(b0+b1)//2
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ra_robustness_chunks SET status='split',error=%s WHERE id=%s", (f"Automatically split after timeout: {error}",chunk["id"]))
+            for x0,x1 in ((b0,mid),(mid,b1)):
+                cur.execute("""INSERT INTO ra_robustness_chunks(robustness_run_id,variant_key,trade_date,bucket_start,bucket_end)
+                    VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                    (chunk["robustness_run_id"],chunk["variant_key"],chunk["trade_date"],x0,x1))
+        conn.commit()
+    add_event(job_id,"robustness_chunk_split","A robustness slice exceeded the timeout and was split automatically.",level="warning",
+              details={"chunk_id":chunk["id"],"variant":chunk["variant_key"],"date":str(chunk["trade_date"]),"bucket_start":b0,"bucket_end":b1})
+    return True
+
+
+def _retry_chunk(job_id: str, chunk: dict[str, Any], error: Exception) -> bool:
+    attempts=int(chunk.get("attempts") or 0)+1
+    maximum=max(1,int(get_settings().robustness_query_retries))
+    if not _is_retryable_database_error(error) or attempts >= maximum:
+        return False
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ra_robustness_chunks SET status='pending',error=%s WHERE id=%s", (f"Transient database error; retrying: {error}",chunk["id"]))
+        conn.commit()
+    add_event(job_id,"robustness_chunk_retry","Transient database error; robustness slice will retry.",level="warning",details={"chunk_id":chunk["id"],"attempt":attempts})
+    return True
+
+
+def _period_label(trade_date: date, dcfg: dict[str, Any]) -> str:
+    discovery_end=date.fromisoformat(str(dcfg["discovery_end"]))
+    return "discovery" if trade_date <= discovery_end else "validation"
+
+
+def _store_chunk_rows(run_id: str, variant_key: str, chunk: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""DELETE FROM ra_robustness_samples WHERE robustness_run_id=%s AND variant_key=%s AND trade_date=%s
+                AND symbol_bucket >= %s AND symbol_bucket < %s""",
+                (run_id,variant_key,chunk["trade_date"],chunk["bucket_start"],chunk["bucket_end"]))
+            if rows:
+                cur.executemany("""INSERT INTO ra_robustness_samples(
+                    robustness_run_id,variant_key,symbol_bucket,symbol,bar_ts,trade_date,minute_of_day,liquidity_tier,price_group,gross_return_pct,mfe_pct,mae_pct
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                    [(run_id,variant_key,r["symbol_bucket"],r["symbol"],r["bar_ts"],r["trade_date"],r["minute_of_day"],r.get("liquidity_tier"),r.get("price_group"),r.get("gross_return_pct"),r.get("mfe_pct"),r.get("mae_pct")) for r in rows])
+            cur.execute("UPDATE ra_robustness_chunks SET status='completed',rows_written=%s,completed_at=now(),error=NULL WHERE id=%s", (len(rows),chunk["id"]))
+        conn.commit()
+
+
+def _update_chunk_progress(job_id: str, run_id: str, chunk: dict[str, Any] | None = None) -> None:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT count(*) FILTER (WHERE status='completed') AS done,
+                count(*) FILTER (WHERE status<>'split') AS total FROM ra_robustness_chunks WHERE robustness_run_id=%s""", (run_id,))
+            stats=cur.fetchone()
+        conn.rollback()
+    phase="robustness"
+    if chunk:
+        phase=f"robustness · {chunk['variant_key']} · {chunk['trade_date']} · buckets {chunk['bucket_start']}-{chunk['bucket_end']-1}"
+    set_progress(job_id,phase,int(stats["done"] or 0),int(stats["total"] or 0))
+
+
+def _run_chunks(job_id: str, run_id: str, candidate: dict[str, Any], config: RobustnessAnalysisConfig,
+                target_id: str, dcfg: dict[str, Any], variants: dict[str, dict[str, Any]]) -> None:
+    direction=str(candidate["direction"]); horizon=int(candidate["holding_horizon_minutes"])
+    stride=int(candidate.get("entry_stride_minutes") or 1); anchor=int(candidate.get("entry_anchor_minute") or 570)
+    use_discovery_samples = str(target_id) == str(candidate["feature_set_id"]) and config.mode == "development"
+    while True:
+        check_control(job_id)
+        chunk=_claim_chunk(run_id)
+        if not chunk:
+            break
+        spec=variants[chunk["variant_key"]]
+        try:
+            if use_discovery_samples:
+                query,condition_params=_development_observation_query(spec["conditions"],direction,horizon,stride,anchor,int(spec["delay"]))
+                params=(candidate["discovery_run_id"],_period_label(chunk["trade_date"],dcfg),chunk["trade_date"],chunk["bucket_start"],chunk["bucket_end"],*condition_params,target_id,int(spec["delay"]),horizon)
+            else:
+                query,condition_params=_observation_query(spec["conditions"],direction,horizon,stride,anchor,int(spec["delay"]))
+                params=(target_id,chunk["trade_date"],chunk["trade_date"],chunk["trade_date"],chunk["bucket_start"],chunk["bucket_end"],*condition_params,int(spec["delay"]),horizon)
+            rows=[dict(r) for r in (_execute_guarded(job_id,query,params,fetch="all",name=f"robust-v2-{chunk['id']}") or [])]
+            _store_chunk_rows(run_id,chunk["variant_key"],chunk,rows)
+            _update_chunk_progress(job_id,run_id,chunk)
+        except JobInterrupted:
+            with connection() as conn:
+                with conn.cursor() as cur: cur.execute("UPDATE ra_robustness_chunks SET status='pending' WHERE id=%s",(chunk["id"],))
+                conn.commit()
+            raise
+        except Exception as exc:
+            if _is_timeout(exc) and _split_chunk(job_id,chunk,exc):
+                _update_chunk_progress(job_id,run_id,chunk)
+                continue
+            if _retry_chunk(job_id,chunk,exc):
+                continue
+            with connection() as conn:
+                with conn.cursor() as cur: cur.execute("UPDATE ra_robustness_chunks SET status='failed',error=%s WHERE id=%s",(str(exc),chunk["id"]))
+                conn.commit()
+            raise
+
+
+def _load_variant_rows(run_id: str, variant_key: str) -> list[dict[str, Any]]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT symbol,bar_ts,trade_date,minute_of_day,liquidity_tier,price_group,gross_return_pct,mfe_pct,mae_pct
+                FROM ra_robustness_samples WHERE robustness_run_id=%s AND variant_key=%s ORDER BY trade_date,symbol,bar_ts""", (run_id,variant_key))
+            rows=cur.fetchall()
+        conn.rollback()
+    return [dict(r) for r in rows]
 
 
 def run_robustness(job_id: str, config: RobustnessAnalysisConfig) -> dict[str, Any]:
@@ -314,124 +521,84 @@ def run_robustness(job_id: str, config: RobustnessAnalysisConfig) -> dict[str, A
             cur.execute("""SELECT c.*,d.config discovery_config,sf.config source_feature_config,sf.status source_status
                 FROM ra_candidate_rules c JOIN ra_discovery_runs d ON d.id=c.discovery_run_id
                 JOIN ra_feature_sets sf ON sf.id=c.feature_set_id WHERE c.id=%s""", (config.candidate_id,))
-            row = cur.fetchone()
+            row=cur.fetchone()
         conn.rollback()
     if not row:
         raise ValueError("Candidate does not exist")
-    candidate = dict(row)
+    candidate=dict(row)
     if candidate.get("rule_definition_version") not in SUPPORTED_RULE_DEFINITIONS:
         raise ValueError("Candidate rule definition is too old for audited robustness analysis")
-    dcfg = dict(candidate.get("discovery_config") or {})
-    target_id = config.target_feature_set_id or candidate["feature_set_id"]
+    dcfg=dict(candidate.get("discovery_config") or {})
+    target_id=str(config.target_feature_set_id or candidate["feature_set_id"])
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM ra_feature_sets WHERE id=%s", (target_id,))
-            target = cur.fetchone()
-            cur.execute("SELECT * FROM ra_feature_sets WHERE id=%s", (candidate["feature_set_id"],))
-            source = cur.fetchone()
+            cur.execute("SELECT * FROM ra_feature_sets WHERE id=%s",(target_id,)); target=cur.fetchone()
+            cur.execute("SELECT * FROM ra_feature_sets WHERE id=%s",(candidate["feature_set_id"],)); source=cur.fetchone()
         conn.rollback()
     if not target or target["status"] != "completed":
         raise ValueError("Target feature set must be completed")
-    _compatible(dict(source), dict(target), int(candidate["holding_horizon_minutes"]))
+    _compatible(dict(source),dict(target),int(candidate["holding_horizon_minutes"]))
 
-    development_start = date.fromisoformat(str(dcfg["discovery_start"]))
-    development_end = date.fromisoformat(str(dcfg.get("validation_end") or dcfg["discovery_end"]))
-    start = config.start_date or (development_start if config.mode == "development" else target["min_trade_date"])
-    end = config.end_date or (development_end if config.mode == "development" else target["max_trade_date"])
+    development_start=date.fromisoformat(str(dcfg["discovery_start"]))
+    development_end=date.fromisoformat(str(dcfg.get("validation_end") or dcfg["discovery_end"]))
+    start=config.start_date or (development_start if config.mode=="development" else target["min_trade_date"])
+    end=config.end_date or (development_end if config.mode=="development" else target["max_trade_date"])
     if start < target["min_trade_date"] or end > target["max_trade_date"]:
         raise ValueError("Robustness dates must remain inside the target feature set")
-    if config.mode == "development":
+    if config.mode=="development":
         if start < development_start or end > development_end:
             raise ValueError("Development robustness must stay inside the original discovery/validation development period")
-    else:
-        if not (end < development_start or start > development_end):
-            raise ValueError("Historical holdout must not overlap the original discovery/validation development period")
+    elif not (end < development_start or start > development_end):
+        raise ValueError("Historical holdout must not overlap the original discovery/validation development period")
 
-    run_id = _ensure_run(job_id, candidate, target_id, config, start, end)
-    direction = str(candidate["direction"]); horizon = int(candidate["holding_horizon_minutes"])
-    stride = int(candidate.get("entry_stride_minutes") or 1); anchor = int(candidate.get("entry_anchor_minute") or 570)
-    conditions = [dict(x) for x in (candidate.get("conditions") or [])]
-    base_cost = float(dcfg.get("round_trip_cost_bps") or 20)
-    dates = _dates(start, end)
-    total = len(dates) * len(config.entry_delays_minutes) + len(dates) * 2
-    progress = 0
-    all_by_delay: dict[int, list[dict[str, Any]]] = {d: [] for d in config.entry_delays_minutes}
+    run_id=_ensure_run(job_id,candidate,target_id,config,start,end)
+    conditions=[dict(x) for x in (candidate.get("conditions") or [])]
+    variants=_variant_specs(config,conditions)
+    dates=_dates(start,end)
+    use_staged_development = str(target_id) == str(candidate["feature_set_id"]) and config.mode == "development"
+    initial_shards = 1 if use_staged_development else int(get_settings().robustness_initial_symbol_shards)
+    _initialise_chunks(run_id,dates,list(variants),initial_shards)
+    _update_chunk_progress(job_id,run_id)
+    _run_chunks(job_id,run_id,candidate,config,target_id,dcfg,variants)
 
-    for delay in config.entry_delays_minutes:
-        query, condition_params = _observation_query(conditions, direction, horizon, stride, anchor, delay)
-        for trade_date in dates:
-            check_control(job_id)
-            params = (target_id, trade_date, delay, horizon, *condition_params)
-            rows = [dict(r) for r in (_execute_guarded(job_id, query, params, fetch="all", name=f"robust-{delay}-{trade_date}") or [])]
-            all_by_delay[delay].extend(rows)
-            if delay == 0 and rows:
-                valid_observations = [r for r in rows if r.get("gross_return_pct") is not None]
-                if valid_observations:
-                    with connection() as conn:
-                        with conn.cursor() as cur:
-                            cur.executemany("""INSERT INTO ra_robustness_observations(
-                                robustness_run_id,delay_minutes,symbol,bar_ts,trade_date,minute_of_day,liquidity_tier,price_group,gross_return_pct
-                            ) VALUES (%s,0,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
-                                [(run_id,r["symbol"],r["bar_ts"],r["trade_date"],r["minute_of_day"],r.get("liquidity_tier"),r.get("price_group"),r["gross_return_pct"]) for r in valid_observations])
-                        conn.commit()
-            progress += 1
-            set_progress(job_id, f"robustness · delay {delay}m · {trade_date}", progress, total)
-
-    neighbourhood_rows: dict[str, list[dict[str, Any]]] = {}
-    for mode in ("relaxed", "tightened"):
-        altered = _perturb_conditions(conditions, config.neighbourhood_pct, mode)
-        query, condition_params = _observation_query(altered, direction, horizon, stride, anchor, 0)
-        collected: list[dict[str, Any]] = []
-        for trade_date in dates:
-            check_control(job_id)
-            params = (target_id, trade_date, 0, horizon, *condition_params)
-            collected.extend(dict(r) for r in (_execute_guarded(job_id, query, params, fetch="all", name=f"neighbour-{mode}-{trade_date}") or []))
-            progress += 1
-            set_progress(job_id, f"robustness · {mode} thresholds · {trade_date}", progress, total)
-        neighbourhood_rows[mode] = collected
-
-    base_rows = all_by_delay.get(0, [])
-    summary = {
-        "robustness_version": ROBUSTNESS_VERSION,
-        "candidate_id": str(config.candidate_id),
-        "source_feature_set_id": str(candidate["feature_set_id"]),
-        "target_feature_set_id": str(target_id),
-        "mode": config.mode,
-        "start_date": start.isoformat(), "end_date": end.isoformat(),
-        "base": _metrics(base_rows, base_cost),
-        "cost_sensitivity": {str(int(c) if float(c).is_integer() else c): _metrics(base_rows, c) for c in config.round_trip_costs_bps},
-        "entry_delay_sensitivity": {str(d): _metrics(rows, base_cost) for d, rows in all_by_delay.items()},
-        "liquidity_tiers": _breakdown(base_rows, base_cost, "liquidity_tier"),
-        "price_groups": _breakdown(base_rows, base_cost, "price_group"),
-        "neighbourhood": {
-            "relaxed": _metrics(neighbourhood_rows["relaxed"], base_cost),
-            "exact": _metrics(base_rows, base_cost),
-            "tightened": _metrics(neighbourhood_rows["tightened"], base_cost),
-            "threshold_change_pct": config.neighbourhood_pct,
+    all_by_delay={int(d):_load_variant_rows(run_id,f"delay:{int(d)}") for d in config.entry_delays_minutes}
+    neighbourhood_rows={
+        "relaxed":_load_variant_rows(run_id,"neighbour:relaxed"),
+        "tightened":_load_variant_rows(run_id,"neighbour:tightened"),
+    }
+    base_rows=all_by_delay.get(0,[])
+    base_cost=float(dcfg.get("round_trip_cost_bps") or 20)
+    summary={
+        "robustness_version":ROBUSTNESS_VERSION,"engine_version":ROBUSTNESS_ENGINE_VERSION,
+        "candidate_id":str(config.candidate_id),"source_feature_set_id":str(candidate["feature_set_id"]),
+        "target_feature_set_id":str(target_id),"mode":config.mode,"start_date":start.isoformat(),"end_date":end.isoformat(),
+        "base":_metrics(base_rows,base_cost),
+        "cost_sensitivity":{str(int(c) if float(c).is_integer() else c):_metrics(base_rows,c) for c in config.round_trip_costs_bps},
+        "entry_delay_sensitivity":{str(d):_metrics(rows,base_cost) for d,rows in all_by_delay.items()},
+        "liquidity_tiers":_breakdown(base_rows,base_cost,"liquidity_tier"),
+        "price_groups":_breakdown(base_rows,base_cost,"price_group"),
+        "neighbourhood":{
+            "relaxed":_metrics(neighbourhood_rows["relaxed"],base_cost),"exact":_metrics(base_rows,base_cost),
+            "tightened":_metrics(neighbourhood_rows["tightened"],base_cost),"threshold_change_pct":config.neighbourhood_pct,
         },
     }
-    verdict = _verdict(summary, config.mode)
-    summary["verdict"] = verdict
-
+    verdict=_verdict(summary,config.mode); summary["verdict"]=verdict
+    results={
+        "cost_sensitivity":summary["cost_sensitivity"],"entry_delay":summary["entry_delay_sensitivity"],
+        "liquidity_tier":summary["liquidity_tiers"],"price_group":summary["price_groups"],
+        "date":_breakdown(base_rows,base_cost,"trade_date"),"month":_month_breakdown(base_rows,base_cost),
+        "year":_year_breakdown(base_rows,base_cost),"symbol":_breakdown(base_rows,base_cost,"symbol"),
+        "neighbourhood":summary["neighbourhood"],
+    }
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE ra_robustness_runs SET status='completed',observations=%s,verdict=%s,summary=%s,completed_at=now() WHERE id=%s",
-                        (len(base_rows), verdict, Jsonb(json_safe(summary)), run_id))
-            results = {
-                "cost_sensitivity": summary["cost_sensitivity"], "entry_delay": summary["entry_delay_sensitivity"],
-                "liquidity_tier": summary["liquidity_tiers"], "price_group": summary["price_groups"],
-                "date": _breakdown(base_rows, base_cost, "trade_date"),
-                "month": _month_breakdown(base_rows, base_cost),
-                "year": _year_breakdown(base_rows, base_cost),
-                "symbol": _breakdown(base_rows, base_cost, "symbol"),
-                "neighbourhood": summary["neighbourhood"], "summary": summary["base"],
-            }
-            for result_type, payload in results.items():
-                for key, value in (payload.items() if isinstance(payload, dict) and result_type not in {"summary"} else [("all", payload)]):
-                    cur.execute("INSERT INTO ra_robustness_results(robustness_run_id,result_type,result_key,metrics) VALUES (%s,%s,%s,%s) ON CONFLICT(robustness_run_id,result_type,result_key) DO UPDATE SET metrics=excluded.metrics",
-                                (run_id, result_type, str(key), Jsonb(json_safe(value))))
+                        (len(base_rows),verdict,Jsonb(json_safe(summary)),run_id))
+            for result_type,values in results.items():
+                for key,metrics in values.items():
+                    cur.execute("""INSERT INTO ra_robustness_results(robustness_run_id,result_type,result_key,metrics) VALUES (%s,%s,%s,%s)
+                        ON CONFLICT(robustness_run_id,result_type,result_key) DO UPDATE SET metrics=excluded.metrics""",
+                        (run_id,result_type,str(key),Jsonb(json_safe(metrics))))
         conn.commit()
-    add_event(job_id, "robustness_completed", f"Robustness analysis completed with verdict {verdict}.", details=summary)
-    result = {"robustness_run_id": run_id, "verdict": verdict, "observations": len(base_rows), "summary": summary}
-    set_progress(job_id, "complete", 1, 1, result=result)
-    return json_safe(result)
+    add_event(job_id,"robustness_completed",f"Robustness analysis completed with verdict {verdict}.",details=summary)
+    return {"robustness_run_id":run_id,"verdict":verdict,"observations":len(base_rows),"summary":summary}

@@ -1,12 +1,14 @@
-# Deployment and upgrade guide — v2.2.0
+# Deployment and upgrade guide — v2.3.0
 
 ## Purpose of this upgrade
+
+2.3.0 adds the bounded/resumable Robustness Engine v2 on top of the existing 2.2.0 Research Integrity + Coverage Pack. It preserves existing data.
 
 2.2.0 adds the Research Integrity + Discovery Coverage Pack 1, Robustness Lab and compatible cross-feature-set holdouts. It does not require rebuilding the existing loader data, frozen universes, completed feature sets or completed historical candidates.
 
 ## 1. Replace the repository
 
-1. Extract `alpaca_pattern_discovery_workbench_v2.2.0.zip`.
+1. Extract `alpaca_pattern_discovery_workbench_v2.3.0.zip`.
 2. Replace the contents of the existing private Workbench GitHub repository.
 3. Include hidden files, especially `.github/workflows/ci.yml` and `.python-version`.
 4. Commit and push.
@@ -42,19 +44,20 @@ Deploy the exact green GitHub commit to:
 - `alpaca-pattern-workbench-web`
 - `alpaca-pattern-workbench-worker`
 
-Confirm both report version `2.2.0`.
+Confirm both report version `2.3.0`.
 
 ## 5. Migration behaviour
 
-The first 2.2.0 startup obtains the existing PostgreSQL advisory migration lock and applies the targeted idempotent migration:
+The first 2.3.0 startup obtains the existing PostgreSQL advisory migration lock and applies the targeted idempotent migration:
 
 ```text
 sql/migrations/2.2.0.sql
+sql/migrations/2.3.0.sql
 ```
 
 It adds only `ra_` research metadata/results and additional Discovery staging columns. It does not write to or alter `rd_bars`.
 
-Subsequent starts detect schema version 2.2.0 and skip unnecessary startup DDL.
+Subsequent starts detect schema version 2.3.0 and skip unnecessary startup DDL.
 
 ## 6. Post-deploy preflight
 
@@ -147,3 +150,7 @@ If migration or SQL preflight fails, do not disable preflight. Capture the exact
 If a staged Discovery chunk times out, the existing v2 engine automatically divides the affected date/symbol slice. Completed partials remain committed.
 
 If a Robustness Lab query is interrupted, retrying is safe; it is a derived analysis and never writes to `rd_` data.
+
+## 10. Retrying a v2.2.0 robustness timeout
+
+The old 239/258 in-memory progress cannot be reused because v2.2.0 did not persist non-base robustness variants. After upgrading, click **Retry** on the failed robustness job. v2.3.0 creates persistent robustness chunks and reruns the robustness variants using the bounded engine. Future failures resume only incomplete chunks.

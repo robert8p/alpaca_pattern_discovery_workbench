@@ -1,4 +1,4 @@
-# Architecture — Pattern Discovery Workbench 2.2.0
+# Architecture — Pattern Discovery Workbench 2.3.0
 
 ## Design objective
 
@@ -28,7 +28,9 @@ Core layers:
 - `ra_discovery_tasks` / chunks / partials
 - `ra_candidate_rules`
 - `ra_robustness_runs`
-- `ra_robustness_observations`
+- `ra_robustness_observations` (legacy robustness evidence)
+- `ra_robustness_chunks`
+- `ra_robustness_samples`
 - `ra_robustness_results`
 - `ra_sealed_chunks`
 
@@ -47,7 +49,7 @@ Multiple-testing adjustment uses the exact number of statistical tests actually 
 
 ## Robustness Lab
 
-Robustness is a separate background job. It replays the candidate's frozen signal conditions one trading date at a time and computes exact observation-level results in Python. This avoids the large whole-period grouped queries that previously caused production timeouts.
+Robustness is a separate background job. v2.3.0 replays frozen conditions in bounded variant × date × symbol-bucket chunks. Development mode reads the already-materialised Discovery samples; cross-feature holdouts use bucket-bounded feature queries. Timed-out buckets split automatically, while completed buckets and observations remain committed.
 
 It supports development-period diagnostics and a non-overlapping historical holdout on another compatible feature set.
 
@@ -63,8 +65,8 @@ Sealed evaluation remains explicit. A candidate's frozen conditions, direction, 
 
 ## Versioning
 
-- Application version: `2.2.0`
-- Schema version: `2.2.0`
+- Application version: `2.3.0`
+- Schema version: `2.3.0`
 - Discovery engine version: `2.2.0`
 - New rule-definition version: `2026-08-coverage-pack1-v1`
 - Legacy staged-v2 candidates remain readable by the audited Robustness/holdout replay paths.

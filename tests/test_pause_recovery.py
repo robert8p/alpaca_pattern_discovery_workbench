@@ -48,3 +48,11 @@ def test_stale_paused_jobs_release_running_subtasks():
     assert "UPDATE ra_discovery_task_chunks SET status='pending'" in source
     assert "UPDATE ra_sealed_chunks SET status='pending'" in source
     assert "UPDATE ra_feature_batches SET status='pending'" in source
+
+
+def test_robustness_v2_recovery_releases_running_chunks():
+    jobs = Path('app/jobs.py').read_text(encoding='utf-8')
+    worker = Path('app/worker.py').read_text(encoding='utf-8')
+    assert "UPDATE ra_robustness_chunks SET status='pending'" in jobs
+    assert "Recovered after worker restart" in jobs
+    assert "UPDATE ra_robustness_chunks SET status='pending'" in worker
