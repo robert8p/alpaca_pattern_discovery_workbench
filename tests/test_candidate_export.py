@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import zipfile
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -48,12 +49,12 @@ def fixture_data():
 
 def test_candidate_export_contains_analysis_package():
     candidates, runs, tasks, features, universes, symbols = fixture_data()
-    payload = build_candidate_export_bundle(candidates=candidates, discovery_runs=runs, discovery_tasks=tasks, feature_sets=features, universes=universes, universe_symbols=symbols, filters={"status_filter": None}, app_version="2.1.0", exported_at=datetime(2026,8,7,11,0,tzinfo=UTC))
+    payload = build_candidate_export_bundle(candidates=candidates, discovery_runs=runs, discovery_tasks=tasks, feature_sets=features, universes=universes, universe_symbols=symbols, filters={"status_filter": None}, app_version="2.1.1", exported_at=datetime(2026,8,7,11,0,tzinfo=UTC))
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         assert set(archive.namelist()) == {"manifest.json","candidates.csv","candidates.json","discovery_runs.json","discovery_tasks.csv","feature_sets.json","universes.json","universe_symbols.csv","SUMMARY.md","README.txt","ANALYSIS_PROMPT.txt"}
         manifest=json.loads(archive.read("manifest.json"))
         assert manifest["candidate_count"] == 1
-        assert manifest["app_version"] == "2.1.0"
+        assert manifest["app_version"] == "2.1.1"
         rows=list(csv.DictReader(io.StringIO(archive.read("candidates.csv").decode("utf-8-sig"))))
         assert rows[0]["discovery_run_name"] == "Initial interpretable rule scan"
         assert json.loads(rows[0]["conditions_json"])["ret_30m_bucket"] == "lt_minus_3"
@@ -73,8 +74,15 @@ def test_candidate_tab_has_export_button_and_endpoint():
     html=(root/'app/templates/index.html').read_text()
     js=(root/'app/static/app.js').read_text()
     main=(root/'app/main.py').read_text()
-    assert 'id="candidate-export-btn"' in html
-    assert "$('#candidate-export-btn').addEventListener('click',downloadCandidateExport)" in js
+    assert 'id="candidate-export-form"' in html
+    assert 'action="/api/candidates/export"' in html
+    assert 'method="get"' in html
+    assert 'name="discovery_run_id"' in html
+    assert 'name="status_filter"' in html
+    assert 'id="candidate-export-btn" type="submit"' in html
+    assert 'downloadCandidateExport' not in js
+    assert 'URL.createObjectURL' not in js
+    assert 'response.blob()' not in js
     assert '@app.get("/api/candidates/export")' in main
 
 
@@ -83,12 +91,64 @@ def test_export_endpoint_is_read_only_and_versions_are_consistent():
     main=(root/'app/main.py').read_text()
     worker=(root/'app/worker.py').read_text()
     db=(root/'app/db.py').read_text()
-    assert 'VERSION = "2.1.0"' in main
-    assert 'VERSION = "2.1.0"' in worker
-    assert 'APP_VERSION = "2.1.0"' in db
+    assert 'VERSION = "2.1.1"' in main
+    assert 'VERSION = "2.1.1"' in worker
+    assert 'APP_VERSION = "2.1.1"' in db
     start=main.index('@app.get("/api/candidates/export")')
     end=main.index('@app.post("/api/candidates/{candidate_id}/actions/{action}")')
     block=main[start:end].lower()
     assert 'insert into' not in block
     assert 'update ' not in block
     assert 'delete from' not in block
+
+
+def test_export_endpoint_returns_browser_attachment(monkeypatch):
+    candidates, runs, tasks, features, universes, symbols = fixture_data()
+
+    class FakeCursor:
+        def __init__(self):
+            self.rows = []
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def execute(self, query, params=None):
+            sql = " ".join(str(query).split()).lower()
+            if "from ra_candidate_rules" in sql:
+                self.rows = candidates
+            elif "from ra_discovery_runs" in sql:
+                self.rows = runs
+            elif "from ra_discovery_tasks" in sql:
+                self.rows = tasks
+            elif "from ra_feature_sets" in sql:
+                self.rows = features
+            elif "from ra_universe_runs" in sql:
+                self.rows = universes
+            elif "from ra_analysis_universe" in sql:
+                self.rows = symbols
+            else:
+                raise AssertionError(f"Unexpected export SQL: {query}")
+        def fetchall(self):
+            return self.rows
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+        def rollback(self):
+            pass
+
+    @contextmanager
+    def fake_connection():
+        yield FakeConnection()
+
+    import app.main as main
+    monkeypatch.setattr(main, "connection", fake_connection)
+    response = main.export_candidates(discovery_run_id=None, status_filter=None, _="test")
+    assert response.status_code == 200
+    assert response.media_type == "application/zip"
+    assert response.headers["content-disposition"].startswith('attachment; filename="alpaca_initial-interpretable-rule-scan_')
+    assert response.headers["x-content-type-options"] == "nosniff"
+    with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["candidate_count"] == 1
+        assert manifest["app_version"] == "2.1.1"

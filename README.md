@@ -1,8 +1,8 @@
-# Alpaca Pattern Discovery Workbench 2.1.0
+# Alpaca Pattern Discovery Workbench 2.1.1
 
 A button-driven companion to the **Alpaca Rapid Discovery Loader**. It connects to the same Supabase PostgreSQL database, reads the loader's `rd_` market-data tables, and writes only to its own `ra_` analysis tables.
 
-Version 2.1.0 adds a self-contained Candidate Analysis Export to the staged v2 discovery engine. Completed discovery results, universes, feature sets and `rd_` bars do not need to be rebuilt.
+Version 2.1.1 keeps the Candidate Analysis Export and changes its browser transport to a native attachment download for cross-browser reliability. Completed discovery results, universes, feature sets and `rd_` bars do not need to be rebuilt.
 
 ## Why the discovery engine was rebuilt
 

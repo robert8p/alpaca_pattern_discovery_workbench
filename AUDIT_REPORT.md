@@ -1,53 +1,61 @@
-# Alpaca Pattern Discovery Workbench 2.1.0 — Release Audit
+# Alpaca Pattern Discovery Workbench 2.1.1 — Release Audit
 
 ## Scope
 
-Version 2.1.0 adds a read-only Candidate Analysis Export to the completed staged v2 discovery engine. It does not change rule discovery, feature generation, sealed evaluation or the database schema.
+Version 2.1.1 fixes the Candidate Analysis Export download transport. The ZIP payload, discovery engine, feature definitions, database schema, completed discovery results and sealed-test methodology are unchanged.
 
-## Export behaviour
+## Root cause
 
-The Candidate tab now provides **Download analysis export**. The endpoint respects the selected discovery-run and workflow-status filters and exports all matching candidates, including candidates beyond the dashboard's display limit.
+Version 2.1.0 used an asynchronous browser sequence: `fetch()` → `response.blob()` → `URL.createObjectURL()` → synthetic `a.click()`. Some browsers can block the final synthetic download because the original user activation is no longer considered active after the awaited network operation. This produces the observed symptom: the control can appear to do nothing even when the export endpoint itself is healthy.
 
-The ZIP contains:
+## Correction
 
-- `SUMMARY.md`
-- `candidates.csv`
-- `candidates.json`
-- `discovery_runs.json`
-- `discovery_tasks.csv`
-- `feature_sets.json`
-- `universes.json`
-- `universe_symbols.csv`
-- `README.txt`
-- `ANALYSIS_PROMPT.txt`
-- `manifest.json`
+The Candidate controls are now a native HTML GET form targeting `/api/candidates/export`.
 
-Candidate CSV rows are enriched with the frozen discovery/validation dates, round-trip cost assumption, minimum evidence thresholds and concentration limits from the discovery run.
+- `discovery_run_id` is a named GET field.
+- `status_filter` is a named GET field.
+- **Download analysis export** is a normal submit button.
+- The server returns the ZIP using `Content-Disposition: attachment`.
+- There is no `fetch()`, Blob, object URL, or synthetic click in the download path.
 
-## Data-safety review
+This preserves the browser's original user gesture and delegates file download to the browser's native attachment handling.
 
-- Export code only reads `ra_` analysis tables.
-- No `rd_` write operations were introduced.
-- No migration is required.
-- Existing completed discovery results are immediately exportable after deployment.
-- No database credentials, connection strings or service secrets are included in the export.
+## Regression controls
+
+The release suite verifies that:
+
+- the Candidate export control is a native GET form;
+- both Candidate filters are submitted to the export endpoint;
+- production JavaScript contains no `downloadCandidateExport`, `response.blob()` or `URL.createObjectURL` download path;
+- the actual FastAPI export handler returns HTTP 200, `application/zip`, `Content-Disposition: attachment` and a readable ZIP package;
+- the ZIP contains the candidate leaderboard, frozen rule definitions, discovery-run metadata, discovery tasks, feature-set metadata, universe metadata, included symbols, summary and analysis prompt;
+- the export endpoint is read-only;
+- application, worker and migration version markers agree.
 
 ## Release gate
 
-The exact packaged tree passed locally:
+Executed against the exact source tree packaged for release:
 
-- 51 automated tests passed.
-- 1 real-PostgreSQL integration test remains gated to CI because this assembly environment does not provide a PostgreSQL service.
-- Python compilation passed.
-- JavaScript syntax validation passed.
-- 220 literal SQL statements inspected.
-- 173 statically countable SQL bindings checked.
-- 5 `ON CONFLICT ... DO UPDATE` statements checked for explicit conflict targets.
-- 196 generated discovery-query combinations validated.
-- Candidate-export ZIP structure, CSV flattening, JSON condition preservation and filename behaviour tested.
-- Candidate export endpoint statically verified as read-only.
-- Raw `rd_` write-protection scan passed.
+- **53 automated tests passed**
+- **1 PostgreSQL integration test skipped** because this assembly environment has no PostgreSQL server
+- Python compilation passed
+- JavaScript syntax validation passed
+- 220 literal SQL statements inspected
+- 173 statically countable SQL bindings checked
+- 5 `ON CONFLICT ... DO UPDATE` statements checked for explicit conflict targets
+- 196 generated discovery-query combinations validated
+- Render Blueprint / Python 3.12.7 pin validated
+- Raw `rd_` write-protection scan passed
+- Candidate export server-response regression passed
+- Candidate export browser-transport regression passed
 
-## Remaining deployment proof
+The skipped PostgreSQL test is not material to this browser transport change; the repository retains the PostgreSQL CI workflow for database-backed release validation.
 
-The included GitHub Actions release gate should still be green before deployment. The candidate-export feature itself is a synchronous read-only web endpoint; it does not depend on the background worker to generate the export once candidates already exist.
+## Migration / rerun impact
+
+None.
+
+- No schema migration is required.
+- No feature set needs rebuilding.
+- No discovery scan needs rerunning.
+- Existing candidates are exported immediately after the web service is upgraded.

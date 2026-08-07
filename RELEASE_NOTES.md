@@ -1,5 +1,13 @@
 # Release notes
 
+## 2.1.1 — Browser-native candidate export download
+
+- Replaces the asynchronous `fetch()` → `Blob` → synthetic anchor-click download with a normal browser GET form.
+- Preserves the Candidate run and workflow-status filters as query parameters.
+- Lets the browser handle the server's `Content-Disposition: attachment` response directly.
+- Adds regression tests that prohibit reintroduction of the synthetic Blob-download path.
+- No database schema change, feature rebuild, or discovery rerun is required.
+
 ## 2.1.0 — Candidate analysis export
 
 - Adds **Download analysis export** to the Candidate tab.

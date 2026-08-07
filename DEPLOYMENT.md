@@ -1,5 +1,7 @@
 
-## 2.1.0 upgrade note
+## 2.1.1 upgrade note
+
+Candidate export now uses the browser's native attachment download rather than an asynchronous Blob/synthetic-click sequence. No database migration, feature rebuild, or discovery rerun is required.
 
 This release adds the Candidate Analysis Export and requires no database migration. Deploy both services from the same commit for consistent version reporting; the export endpoint itself runs on the web service. Existing completed discovery runs and candidates are immediately exportable after deployment.
 

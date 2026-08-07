@@ -44,6 +44,7 @@ main { min-width:0; padding: 0 34px 46px; }
 .topbar h1 { margin:0; font-size:29px; letter-spacing:-.03em; }
 .topbar p { margin:7px 0 0; color:var(--muted); }
 .top-actions { display:flex; gap:10px; }
+.candidate-export-form { margin:0; align-items:center; }
 .primary,.ghost,.text-btn,.preset,.icon-btn { border:0; border-radius:11px; transition:.18s ease; }
 .primary { padding:11px 16px; color:#041014; background:linear-gradient(135deg,var(--accent),#82f0d3); font-weight:800; box-shadow:0 8px 24px rgba(100,230,196,.14); }
 .primary:hover { transform:translateY(-1px); filter:brightness(1.05); }

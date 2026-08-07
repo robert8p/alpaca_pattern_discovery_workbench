@@ -45,3 +45,14 @@ def test_render_blueprint_pins_python_and_has_two_services():
     assert blueprint.count("value: 3.12.7") == 2
     assert "alpaca-pattern-workbench-web" in blueprint
     assert "alpaca-pattern-workbench-worker" in blueprint
+
+
+def test_candidate_export_uses_browser_native_attachment_transport():
+    html = (ROOT / "app" / "templates" / "index.html").read_text(encoding="utf-8")
+    javascript = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    assert '<form class="top-actions candidate-export-form" id="candidate-export-form" action="/api/candidates/export" method="get">' in html
+    assert 'name="discovery_run_id"' in html
+    assert 'name="status_filter"' in html
+    assert 'id="candidate-export-btn" type="submit"' in html
+    for forbidden in ("downloadCandidateExport", "URL.createObjectURL", "response.blob()"):
+        assert forbidden not in javascript

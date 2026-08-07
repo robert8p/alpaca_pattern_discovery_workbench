@@ -16,7 +16,7 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
 SCHEMA_VERSION = "2.0.0"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
