@@ -18,7 +18,7 @@ from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 

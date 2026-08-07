@@ -22,7 +22,7 @@ from app.db import APP_VERSION, SCHEMA_VERSION
 from app.preflight import local_sql_preflight
 from app.sql_validation import SqlBindingError, inspect_psycopg_placeholders
 
-EXPECTED_APP_VERSION = "2.0.1"
+EXPECTED_APP_VERSION = "2.1.0"
 EXPECTED_DISCOVERY_VERSION = "2.0.0"
 EXPECTED_SCHEMA_VERSION = "2.0.0"
 

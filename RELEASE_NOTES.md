@@ -1,5 +1,15 @@
 # Release notes
 
+## 2.1.0 — Candidate analysis export
+
+- Adds **Download analysis export** to the Candidate tab.
+- Export respects current discovery-run and workflow-status filters.
+- Produces a single ZIP designed to upload back into ChatGPT for analysis.
+- Includes `SUMMARY.md`, full candidate CSV/JSON, discovery configuration/tasks, feature-set provenance and relevant frozen universe symbols.
+- Embeds discovery/validation dates, round-trip cost and screening thresholds directly in the flattened candidate CSV.
+- Includes a ready-made `ANALYSIS_PROMPT.txt`.
+- Uses only read queries against existing analysis tables; no schema migration or discovery rerun is required.
+
 ## 2.0.1 — PostgreSQL migration-startup correction
 
 - Corrects the schema-version UPSERT to use the primary-key conflict target: `ON CONFLICT (version) DO UPDATE`.

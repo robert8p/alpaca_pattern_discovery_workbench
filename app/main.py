@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import secrets
+from datetime import UTC, datetime
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -16,6 +17,7 @@ from psycopg.types.json import Jsonb
 from app.config import get_settings
 from app.db import close_pool, connection, database_diagnostics, database_target, execute_schema
 from app.features import estimate_feature_build
+from app.exports import build_candidate_export_bundle, export_filename
 from app.jobs import create_job
 from app.preflight import database_sql_preflight, local_sql_preflight
 from app.models import (
@@ -24,7 +26,7 @@ from app.models import (
 )
 from app.utils import json_safe
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -398,6 +400,80 @@ def candidates(discovery_run_id: str | None = None, status_filter: str | None = 
             rows = cur.fetchall()
         conn.rollback()
     return json_safe(rows)
+
+
+@app.get("/api/candidates/export")
+def export_candidates(discovery_run_id: str | None = None, status_filter: str | None = None, _: str = Depends(require_auth)) -> Response:
+    clauses = ["TRUE"]
+    params: list[Any] = []
+    if discovery_run_id:
+        clauses.append("discovery_run_id=%s")
+        params.append(parse_uuid(discovery_run_id))
+    if status_filter:
+        clauses.append("workflow_status=%s")
+        params.append(status_filter)
+
+    with connection() as conn:
+        with conn.cursor() as cur:
+            candidate_query = f"SELECT * FROM ra_candidate_rules WHERE {' AND '.join(clauses)} ORDER BY rank_score DESC NULLS LAST,created_at DESC"
+            if params:
+                cur.execute(candidate_query, tuple(params))
+            else:
+                cur.execute(candidate_query)
+            candidate_rows = [dict(row) for row in cur.fetchall()]
+            if not candidate_rows:
+                conn.rollback()
+                raise HTTPException(404, "No candidates match the current filters")
+
+            run_ids = sorted({row["discovery_run_id"] for row in candidate_rows}, key=str)
+            feature_ids = sorted({row["feature_set_id"] for row in candidate_rows}, key=str)
+
+            cur.execute("SELECT * FROM ra_discovery_runs WHERE id=ANY(%s) ORDER BY created_at", (run_ids,))
+            discovery_rows = [dict(row) for row in cur.fetchall()]
+            cur.execute("SELECT * FROM ra_discovery_tasks WHERE discovery_run_id=ANY(%s) ORDER BY discovery_run_id,family,direction,holding_horizon_minutes", (run_ids,))
+            task_rows = [dict(row) for row in cur.fetchall()]
+            cur.execute("SELECT * FROM ra_feature_sets WHERE id=ANY(%s) ORDER BY created_at", (feature_ids,))
+            feature_rows = [dict(row) for row in cur.fetchall()]
+
+            universe_ids = sorted({row["universe_run_id"] for row in feature_rows}, key=str)
+            cur.execute("SELECT * FROM ra_universe_runs WHERE id=ANY(%s) ORDER BY created_at", (universe_ids,))
+            universe_rows = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT universe_run_id,symbol,exchange,asset_name,trading_days,average_bars_per_day,
+                       median_daily_dollar_volume,average_daily_dollar_volume,median_close,
+                       liquidity_tier,rank_by_liquidity
+                FROM ra_analysis_universe
+                WHERE universe_run_id=ANY(%s) AND included=true
+                ORDER BY universe_run_id,rank_by_liquidity NULLS LAST,symbol
+                """,
+                (universe_ids,),
+            )
+            universe_symbol_rows = [dict(row) for row in cur.fetchall()]
+        conn.rollback()
+
+    exported_at = datetime.now(UTC)
+    bundle = build_candidate_export_bundle(
+        candidates=candidate_rows,
+        discovery_runs=discovery_rows,
+        discovery_tasks=task_rows,
+        feature_sets=feature_rows,
+        universes=universe_rows,
+        universe_symbols=universe_symbol_rows,
+        filters={"discovery_run_id": discovery_run_id, "status_filter": status_filter},
+        app_version=VERSION,
+        exported_at=exported_at,
+    )
+    filename = export_filename(discovery_rows, exported_at)
+    return Response(
+        content=bundle,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.post("/api/candidates/{candidate_id}/actions/{action}")

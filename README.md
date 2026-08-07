@@ -1,8 +1,8 @@
-# Alpaca Pattern Discovery Workbench 2.0.1
+# Alpaca Pattern Discovery Workbench 2.1.0
 
 A button-driven companion to the **Alpaca Rapid Discovery Loader**. It connects to the same Supabase PostgreSQL database, reads the loader's `rd_` market-data tables, and writes only to its own `ra_` analysis tables.
 
-Version 2.0.1 is the startup-corrected release of the staged v2 discovery engine for production-sized one-minute datasets. The loader, universes, completed feature sets and `rd_` bars do not need to be rebuilt.
+Version 2.1.0 adds a self-contained Candidate Analysis Export to the staged v2 discovery engine. Completed discovery results, universes, feature sets and `rd_` bars do not need to be rebuilt.
 
 ## Why the discovery engine was rebuilt
 
@@ -96,6 +96,21 @@ Application and release-gate scans reject writes to `rd_` tables. The workbench 
 - Existing universe runs: preserved.
 - Existing completed feature sets: preserved; feature definition remains `1.1.0` because its calculation has not changed.
 - Existing 1.x discovery jobs: retryable. On first staged-v2 retry, only withdrawn discovery samples/tasks/candidates are reset; the selected feature set remains intact.
+
+
+## Candidate analysis export
+
+The **Candidates** tab includes **Download analysis export**. The button respects the currently selected discovery-run and workflow-status filters and downloads a ZIP containing:
+
+- `SUMMARY.md` — compact candidate overview and top-ranked results.
+- `candidates.csv` — flattened leaderboard including discovery, validation and sealed metrics plus frozen run thresholds.
+- `candidates.json` — complete machine-readable candidate records and conditions.
+- `discovery_runs.json` and `discovery_tasks.csv` — exact scan configuration and task coverage.
+- `feature_sets.json` — feature-set provenance and configuration.
+- `universes.json` and `universe_symbols.csv` — frozen universe definition and included-symbol liquidity metrics.
+- `ANALYSIS_PROMPT.txt` — a ready-made prompt for uploading the package into ChatGPT.
+
+The export is read-only and requires no schema migration or discovery rerun.
 
 ## Deployment
 

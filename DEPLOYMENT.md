@@ -1,3 +1,8 @@
+
+## 2.1.0 upgrade note
+
+This release adds the Candidate Analysis Export and requires no database migration. Deploy both services from the same commit for consistent version reporting; the export endpoint itself runs on the web service. Existing completed discovery runs and candidates are immediately exportable after deployment.
+
 # Deployment and upgrade guide — v2.0.1
 
 ## Before deployment
