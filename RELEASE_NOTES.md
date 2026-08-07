@@ -1,5 +1,18 @@
 # Release notes
 
+## 2.2.0 — Research Integrity + Discovery Coverage Pack 1
+
+- Preserves the six existing Discovery family definitions and completed historical candidates.
+- Adds versioned partial implementations for H01, H03, H04/H05, H06, H07 and H12 using features already present in the database.
+- Adds campaign name, hypothesis provenance and tested-variant and defined-grid accounting.
+- Applies multiple-testing adjustment against the exact number of observed statistical tests while separately retaining the full defined grid.
+- Adds p25/p75/p95/best-observation fields for new Discovery candidates.
+- Adds a button-driven Robustness Lab for existing and new candidates.
+- Adds date-clustered statistics, leave-one-date-out stability, cost/delay sensitivity, threshold neighbourhoods, price/liquidity breakdowns, holding-horizon MFE/MAE, missing-outcome rate, and detailed date/month/year/symbol results.
+- Adds compatible cross-feature-set historical holdouts and sealed replay, restricted to the same frozen universe, liquidity tiers and predictor/baseline definition.
+- Extends the Candidate analysis export with Robustness Lab summaries and detailed results.
+- Adds targeted schema migration `2.2.0`; no raw data or completed feature-set rebuild is required.
+
 ## 2.1.1 — Browser-native candidate export download
 
 - Replaces the asynchronous `fetch()` → `Blob` → synthetic anchor-click download with a normal browser GET form.

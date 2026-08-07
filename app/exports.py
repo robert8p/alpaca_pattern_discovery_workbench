@@ -19,14 +19,18 @@ CANDIDATE_COLUMNS = [
     "maximum_symbol_concentration_pct", "maximum_date_concentration_pct",
     "entry_sampling_mode", "entry_stride_minutes", "entry_anchor_minute",
     "rule_definition_version", "statistics_method", "engine_version",
+    "hypothesis_ids", "hypothesis_version", "variants_tested_campaign", "variants_defined_campaign",
+    "multiple_testing_method", "multiple_testing_adjusted_p", "discovery_status",
     "discovery_observations", "discovery_symbols", "discovery_dates",
     "discovery_gross_avg_pct", "discovery_net_avg_pct", "discovery_median_pct",
     "discovery_win_rate_pct", "discovery_t_stat", "discovery_profit_factor",
-    "discovery_p05_pct", "discovery_worst_pct", "discovery_max_symbol_share_pct",
+    "discovery_p05_pct", "discovery_p25_pct", "discovery_p75_pct", "discovery_p95_pct",
+    "discovery_worst_pct", "discovery_best_pct", "discovery_max_symbol_share_pct",
     "discovery_max_date_share_pct", "validation_observations", "validation_symbols",
     "validation_dates", "validation_gross_avg_pct", "validation_net_avg_pct",
     "validation_median_pct", "validation_win_rate_pct", "validation_t_stat",
-    "validation_profit_factor", "validation_p05_pct", "validation_worst_pct",
+    "validation_profit_factor", "validation_p05_pct", "validation_p25_pct", "validation_p75_pct",
+    "validation_p95_pct", "validation_worst_pct", "validation_best_pct",
     "validation_max_symbol_share_pct", "validation_max_date_share_pct",
     "sealed_start", "sealed_end", "sealed_observations", "sealed_net_avg_pct",
     "sealed_median_pct", "sealed_win_rate_pct", "sealed_t_stat",
@@ -90,11 +94,15 @@ def build_candidate_export_bundle(
     feature_sets: list[dict[str, Any]],
     universes: list[dict[str, Any]],
     universe_symbols: list[dict[str, Any]],
+    robustness_runs: list[dict[str, Any]] | None = None,
+    robustness_results: list[dict[str, Any]] | None = None,
     filters: dict[str, Any],
     app_version: str,
     exported_at: datetime | None = None,
 ) -> bytes:
     exported_at = exported_at or datetime.now(UTC)
+    robustness_runs = robustness_runs or []
+    robustness_results = robustness_results or []
 
     runs_by_id = {str(row["id"]): row for row in discovery_runs}
     features_by_id = {str(row["id"]): row for row in feature_sets}
@@ -141,7 +149,7 @@ def build_candidate_export_bundle(
         enriched_symbols.append(row)
 
     manifest = {
-        "export_format_version": "1.0",
+        "export_format_version": "1.1",
         "app_version": app_version,
         "exported_at": exported_at.isoformat(),
         "filters": json_safe(filters),
@@ -158,6 +166,8 @@ def build_candidate_export_bundle(
             "feature_sets.json": "Feature-set configuration and source coverage.",
             "universes.json": "Frozen universe configuration and tier counts.",
             "universe_symbols.csv": "Included symbols and liquidity/coverage metrics for the relevant universes.",
+            "robustness_runs.json": "Robustness Lab run summaries, holdout results and verdicts for exported candidates.",
+            "robustness_results.json": "Detailed robustness breakdowns by date, month, year, symbol, liquidity, price, costs, delays and threshold neighbourhood, including MFE/MAE and missing-outcome diagnostics.",
             "ANALYSIS_PROMPT.txt": "Suggested prompt to use when uploading this ZIP to ChatGPT.",
             "SUMMARY.md": "Compact human-readable overview of the exported candidate set.",
             "README.txt": "Description of the export and interpretation safeguards.",
@@ -220,6 +230,8 @@ Important interpretation rules
 5. Candidate ranking is a screening device, not proof of future profitability.
 6. universe_symbols.csv contains only symbols INCLUDED in the relevant frozen universe(s).
 7. Do not tune a rule using a sealed period after its result has been revealed.
+8. robustness_runs.json contains development robustness and compatible historical-holdout evidence where run.
+9. robustness_results.json contains the detailed per-date/per-month/per-year/per-symbol and sensitivity breakdowns behind those verdicts, including missing-outcome and MFE/MAE diagnostics.
 
 Recommended first file for human review: candidates.csv
 Recommended machine-complete file: candidates.json
@@ -231,10 +243,11 @@ Please:
 1. Rank the genuinely strongest candidates, prioritising validation persistence, net expected return, sample size, profit factor, t-statistic, tail behaviour and low symbol/date concentration rather than raw discovery rank alone.
 2. Identify likely overfit, regime-specific, illiquid or economically implausible candidates.
 3. Compare related candidates across families, directions and holding horizons to identify stable underlying relationships rather than isolated thresholds.
-4. Explain the most promising rules in plain English and the likely market mechanism behind each.
-5. Tell me which candidates are worth promoting to a sealed test and which should be rejected or held back.
-6. Propose the exact next data loads, robustness tests and threshold-neighbourhood tests needed before any live trading decision.
-7. Flag any important information missing from the export that would materially change your conclusions.
+4. Use Robustness Lab evidence where present: date-clustered statistics, leave-one-date-out results, MFE/MAE, missing-outcome rate, cost/delay sensitivity and threshold neighbourhoods.
+5. Explain the most promising rules in plain English and the likely market mechanism behind each.
+6. Tell me which candidates are worth promoting to a sealed test and which should be rejected or held back.
+7. Propose the exact next data loads, robustness tests and threshold-neighbourhood tests needed before any live trading decision.
+8. Flag any important information missing from the export that would materially change your conclusions.
 
 Do not assume that a high discovery score alone constitutes an edge.
 """
@@ -249,6 +262,8 @@ Do not assume that a high discovery score alone constitutes an edge.
         archive.writestr("feature_sets.json", _json_bytes(feature_sets))
         archive.writestr("universes.json", _json_bytes(universes))
         archive.writestr("universe_symbols.csv", _csv_bytes(enriched_symbols, UNIVERSE_SYMBOL_COLUMNS))
+        archive.writestr("robustness_runs.json", _json_bytes(robustness_runs))
+        archive.writestr("robustness_results.json", _json_bytes(robustness_results))
         archive.writestr("SUMMARY.md", summary.encode("utf-8"))
         archive.writestr("README.txt", readme.encode("utf-8"))
         archive.writestr("ANALYSIS_PROMPT.txt", prompt.encode("utf-8"))

@@ -1,149 +1,149 @@
+# Deployment and upgrade guide — v2.2.0
 
-## 2.1.1 upgrade note
+## Purpose of this upgrade
 
-Candidate export now uses the browser's native attachment download rather than an asynchronous Blob/synthetic-click sequence. No database migration, feature rebuild, or discovery rerun is required.
+2.2.0 adds the Research Integrity + Discovery Coverage Pack 1, Robustness Lab and compatible cross-feature-set holdouts. It does not require rebuilding the existing loader data, frozen universes, completed feature sets or completed historical candidates.
 
-This release adds the Candidate Analysis Export and requires no database migration. Deploy both services from the same commit for consistent version reporting; the export endpoint itself runs on the web service. Existing completed discovery runs and candidates are immediately exportable after deployment.
+## 1. Replace the repository
 
-# Deployment and upgrade guide — v2.0.1
+1. Extract `alpaca_pattern_discovery_workbench_v2.2.0.zip`.
+2. Replace the contents of the existing private Workbench GitHub repository.
+3. Include hidden files, especially `.github/workflows/ci.yml` and `.python-version`.
+4. Commit and push.
 
-## Before deployment
+## 2. Require the GitHub release gate
 
-1. Extract `alpaca_pattern_discovery_workbench_v2.0.1.zip` into the existing private GitHub repository.
-2. Preserve hidden files, especially `.github/workflows/ci.yml` and `.python-version`.
-3. Commit and push.
-4. Open **GitHub → Actions → release-gate**.
-5. Do not deploy until the workflow is green.
+Open **GitHub → Actions → release-gate** and wait for the pushed commit to complete successfully.
 
-The release gate starts PostgreSQL 16 and tests schema installation, universe generation, feature generation, SQL planning, staged discovery, candidate metadata and sealed evaluation.
+The CI workflow starts PostgreSQL 16 and exercises schema migration, universe creation, feature generation, generated-query planning, Discovery, Robustness Lab and sealed replay using the real Psycopg driver.
 
-## Render services
+Do not deploy the commit if this workflow is red.
 
-Deploy the same commit to both:
+## 3. Render environment
 
-```text
-alpaca-pattern-workbench-web
-alpaca-pattern-workbench-worker
-```
+Both services must continue to use the same writable Supabase Primary Session-pooler connection string on port 5432.
 
-Both must use the same writable Supabase Primary Session-pooler URL:
+Required shared settings include:
 
 ```text
-postgresql://postgres.PROJECT_REF:PASSWORD@...pooler.supabase.com:5432/postgres?sslmode=require
-```
-
-Do not use port 6543 or a read-replica endpoint.
-
-## Required environment variables
-
-### Both services
-
-```text
-DATABASE_URL=<same Primary Session-pooler URL>
-AUTO_MIGRATE=true
+DATABASE_URL=<same Primary Session-pooler URL used by the Workbench>
 PYTHON_VERSION=3.12.7
-DATABASE_STATEMENT_TIMEOUT_SECONDS=600
-DISCOVERY_STATEMENT_TIMEOUT_SECONDS=180
-DISCOVERY_WALL_TIMEOUT_SECONDS=210
-DISCOVERY_CANCEL_GRACE_SECONDS=15
-DISCOVERY_QUERY_RETRIES=3
-LOG_LEVEL=INFO
+AUTO_MIGRATE=true
 ```
 
-### Web service
+The web service also requires a strong `APP_PASSWORD`.
+
+Do not use a read replica or the transaction pooler on port 6543.
+
+## 4. Deploy both services
+
+Deploy the exact green GitHub commit to:
+
+- `alpaca-pattern-workbench-web`
+- `alpaca-pattern-workbench-worker`
+
+Confirm both report version `2.2.0`.
+
+## 5. Migration behaviour
+
+The first 2.2.0 startup obtains the existing PostgreSQL advisory migration lock and applies the targeted idempotent migration:
 
 ```text
-APP_USERNAME=admin
-APP_PASSWORD=<strong unique password>
+sql/migrations/2.2.0.sql
 ```
 
-### Worker service
+It adds only `ra_` research metadata/results and additional Discovery staging columns. It does not write to or alter `rd_bars`.
+
+Subsequent starts detect schema version 2.2.0 and skip unnecessary startup DDL.
+
+## 6. Post-deploy preflight
+
+Open **System → Run checks**.
+
+Require:
 
 ```text
-WORKER_POLL_SECONDS=3
-WORKER_STALE_SECONDS=300
-MAX_JOB_ATTEMPTS=3
-FEATURE_BATCH_WALL_TIMEOUT_SECONDS=660
-FEATURE_MIN_SYMBOL_BATCH_SIZE=1
-FEATURE_CANCEL_GRACE_SECONDS=15
-FEATURE_DB_CONFLICT_RETRIES=5
+SQL preflight: Passed
+Raw loader bars: Found
+Workbench schema: Ready
+Database: writable primary
 ```
 
-The updated `render.yaml` supplies all non-secret defaults.
+The local preflight validates all generated Discovery/validation/sealed query bindings plus a representative Robustness Lab query. The database preflight asks PostgreSQL to plan representative old and new family queries.
 
-## Migration
+## 7. Existing candidates
 
-On first 2.0.1 startup, one service obtains a PostgreSQL advisory lock and applies `sql/migrations/2.0.0.sql`. It creates only the new `ra_` discovery objects and metadata columns.
+Existing candidates from the staged v2 definition remain visible and are not rewritten.
 
-It does not modify:
+They can immediately use:
 
-- `rd_bars`
-- `rd_assets`
-- existing universe symbols
-- completed `ra_intraday_features`
+- **Run robustness lab**
+- Candidate analysis export
+- Compatible sealed replay when the target feature set and dates satisfy the safeguards
 
-After migration, later starts detect schema 2.0.0 and skip DDL.
+Do not rerun a completed historical Discovery job merely to obtain Robustness Lab results.
 
-## Deployment checks
+## 8. Recommended first Robustness Lab run
 
-After both services deploy:
+For each candidate you previously shortlisted:
 
-1. Confirm web and worker show version `2.0.1`.
-2. Open **System → Run checks**.
-3. Confirm:
-   - database port 5432
-   - `is_replica=false`
-   - transaction read-only values are `off`
-   - all v2 objects exist
-   - SQL preflight reports `ok=true`
-4. Confirm the worker heartbeat is current.
+1. Open **Candidates**.
+2. Click **Run robustness lab**.
+3. Use `Development-period robustness` first.
+4. Keep the source feature set selected.
+5. Leave dates blank to use the original Discovery + validation development period.
+6. Keep costs `20,25,30,40` bps.
+7. Keep delays `0,1,2,5` minutes.
+8. Keep threshold neighbourhood at `10%`.
+9. Queue the analysis.
 
-## Resuming the existing failed discovery job
+After it completes, the Candidate card displays the latest verdict. The detailed output is included in the Candidate export.
 
-Your completed June/July feature set remains valid.
+## 9. Historical holdout
 
-1. Open the failed **Initial interpretable rule scan**.
-2. Click **Retry**.
-3. Expect discovery progress to reset because the 1.x monolithic results are incompatible.
-4. Do not recreate the feature set.
+To test a rule on older untouched history:
 
-The v2 job will proceed through:
+1. Ensure the Loader contains the desired historical bars.
+2. Build a new feature set for those dates using the **same frozen universe and feature definition** as the original candidate (same liquidity tiers, predictor horizons and time-of-day baseline).
+3. Open the candidate → **Run robustness lab**.
+4. Select `Untouched historical holdout`.
+5. Select the new compatible feature set.
+6. Enter dates that do not overlap the original Discovery/validation development period, or leave them blank if the complete target feature set is entirely non-overlapping.
+
+The app rejects universe, feed, timeframe, adjustment, session and outcome-horizon incompatibilities.
+
+## 10. Forward sealed data
+
+When a newer feature set becomes available from the same frozen universe and feature definition:
+
+1. Click **Promote to sealed test**.
+2. Select that compatible feature set.
+3. Select dates beginning after the original development boundary.
+4. Queue once.
+
+The frozen rule conditions, holding horizon, sampling stride and anchor are replayed unchanged.
+
+## 11. New expanded Discovery campaign
+
+For new Discovery work, create a **new** Discovery job rather than editing an old completed experiment.
+
+Recommended initial settings:
 
 ```text
-sampling discovery/validation rows
-→ bounded partial scans
-→ merging partial statistics
-→ candidate completion
-```
-
-Progress now counts sample and scan chunks, so the denominator will be much larger than the old `48` task count. That is expected and is what makes recovery granular.
-
-## Recommended settings for the existing run
-
-An existing job retains its saved configuration. For new scans, use:
-
-```text
-Entry sampling: non-overlapping
-Scan date chunk: 3 days
+Campaign: Market-Edge US Equities Pack 1
+Families: all original families + H01/H03/H04-H07/H12 additions
+Entry sampling: Non-overlapping
+Date chunk: 3 days
 Symbol shards: 4
+Round-trip cost: 20 bps
 ```
 
-For an unusually constrained Supabase compute tier, start with 1 day and 8 shards. The engine will also split automatically after a timeout.
+The run records the full defined variant count and hypothesis IDs. New-family results are explicitly labelled partial where missing quote/sector/news/event data prevents full hypothesis coverage.
 
-## Troubleshooting
+## 12. Troubleshooting
 
-### A chunk times out
+If migration or SQL preflight fails, do not disable preflight. Capture the exact error and fix the cause before running Discovery.
 
-The parent chunk should become `split` and two smaller children should appear. Completed chunks remain intact. A one-day, one-bucket timeout is terminal and identifies a database-capacity or query-plan problem requiring inspection.
+If a staged Discovery chunk times out, the existing v2 engine automatically divides the affected date/symbol slice. Completed partials remain committed.
 
-### Deadlock, serialization or short lock timeout
-
-The chunk is returned to `pending` and retried with jittered backoff up to `DISCOVERY_QUERY_RETRIES` total attempts.
-
-### Pause remains requested
-
-Redeploy/restart the 2.0.1 worker. Startup recovery converts stale control states and returns active chunks to `pending`.
-
-### Preflight blocks a job
-
-Do not bypass it. Open **System**, inspect the exact missing object or PostgreSQL planning error, and confirm both services use the same 2.0.1 commit and database.
+If a Robustness Lab query is interrupted, retrying is safe; it is a derived analysis and never writes to `rd_` data.

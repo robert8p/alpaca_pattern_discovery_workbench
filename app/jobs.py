@@ -139,6 +139,8 @@ def recover_stale_jobs() -> int:
                         "UPDATE ra_sealed_chunks SET status='pending',error=COALESCE(error,'Recovered after paused worker restart') WHERE status='running' AND job_id=%s",
                         (row['id'],),
                     )
+                elif row['job_type'] == 'robustness_analysis':
+                    cur.execute("UPDATE ra_robustness_runs SET status='running' WHERE job_id=%s", (row['id'],))
 
             cur.execute(
                 """
@@ -173,6 +175,8 @@ def recover_stale_jobs() -> int:
                         """,
                         (row['id'],),
                     )
+                elif row['job_type'] == 'robustness_analysis':
+                    cur.execute("UPDATE ra_robustness_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (row['id'],))
                 elif row['job_type'] == 'discovery_scan':
                     cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (row['id'],))
                     cur.execute(

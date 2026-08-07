@@ -86,9 +86,10 @@ def test_complete_postgres_workflow():
     from app.config import get_settings
     from app.db import close_pool, execute_schema
     from app.discovery import RULE_DEFINITION_VERSION, run_discovery, run_sealed_evaluation
+    from app.robustness import run_robustness
     from app.features import build_feature_set
     from app.jobs import create_job
-    from app.models import DiscoveryConfig, FeatureBuildConfig, SealedEvaluationConfig, UniverseBuildConfig
+    from app.models import DiscoveryConfig, FeatureBuildConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig
     from app.preflight import database_sql_preflight
     from app.universe import build_universe
 
@@ -132,7 +133,7 @@ def test_complete_postgres_workflow():
 
     preflight = database_sql_preflight(force=True, exhaustive=True)
     assert preflight["ok"] is True
-    assert preflight["database_plans"] == 196
+    assert preflight["database_plans"] == 389
 
     discovery_config = DiscoveryConfig(
         name="Synthetic audited discovery",
@@ -143,6 +144,8 @@ def test_complete_postgres_workflow():
         families=[
             "time_of_day", "oversold_reversal", "momentum_continuation",
             "vwap_reversion", "gap_behavior", "volume_shock",
+            "dip_repair", "compression_expansion", "gap_state",
+            "activity_absorption", "price_efficiency", "new_high_liquidity_divergence",
         ], round_trip_cost_bps=0,
         minimum_observations=20, minimum_symbols=2, minimum_dates=5,
         maximum_symbol_concentration_pct=100,
@@ -175,6 +178,16 @@ def test_complete_postgres_workflow():
     assert candidate["rule_definition_version"] == RULE_DEFINITION_VERSION
     assert candidate["discovery_net_avg_pct"] > 0
 
+    robustness_config = RobustnessAnalysisConfig(
+        candidate_id=candidate["id"], mode="development",
+        start_date="2026-06-08", end_date="2026-06-30",
+        round_trip_costs_bps=[0,10,20,30], entry_delays_minutes=[0,1],
+    )
+    robustness_job = create_job("robustness_analysis", "Synthetic robustness", robustness_config.model_dump(mode="json"))
+    robustness_result = run_robustness(str(robustness_job["id"]), robustness_config)
+    assert robustness_result["summary"]["base"]["observations"] > 0
+    assert robustness_result["verdict"] in {"REJECT","WEAK","PROMISING"}
+
     sealed_config = SealedEvaluationConfig(
         candidate_id=candidate["id"],
         sealed_start="2026-07-01", sealed_end="2026-07-10",
@@ -183,4 +196,36 @@ def test_complete_postgres_workflow():
     sealed_result = run_sealed_evaluation(str(sealed_job["id"]), sealed_config)
     assert sealed_result["observations"] > 0
     assert sealed_result["net_avg_pct"] > 0
+    close_pool()
+
+
+def test_upgrade_from_v211_schema_to_v220():
+    """Exercise the real production upgrade path from the last shipped schema."""
+    import psycopg
+    from pathlib import Path
+    from app.config import get_settings
+    from app.db import close_pool, execute_schema, connection
+
+    os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+    get_settings.cache_clear()
+    close_pool()
+    url = os.environ["TEST_DATABASE_URL"]
+    legacy_schema = (Path(__file__).resolve().parent / "fixtures" / "schema_v2.1.1.sql").read_text(encoding="utf-8")
+    with psycopg.connect(url, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("CREATE SCHEMA public")
+            cur.execute(legacy_schema)
+    execute_schema()
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.2.0'")
+            assert cur.fetchone()["app_version"] == "2.2.0"
+            cur.execute("SELECT to_regclass('public.ra_robustness_runs') AS runs,to_regclass('public.ra_robustness_observations') AS observations,to_regclass('public.ra_robustness_results') AS results")
+            row=cur.fetchone()
+            assert row['runs'] and row['observations'] and row['results']
+            cur.execute("SELECT defined_variant_count,campaign_definition_version FROM ra_discovery_runs LIMIT 0")
+            cur.execute("SELECT variants_defined_campaign,multiple_testing_adjusted_p,sealed_feature_set_id FROM ra_candidate_rules LIMIT 0")
+            cur.execute("SELECT relative_trade_count_20bar,activity_impact_change_ratio,opening_range_position,touched_session_high FROM ra_discovery_samples LIMIT 0")
+        conn.rollback()
     close_pool()

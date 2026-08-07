@@ -3,7 +3,7 @@ from datetime import date
 import pytest
 
 from app.discovery import (
-    FAMILIES, GAP, PREV_DAY, RANGE_POS, RET5, RET30, RVOL, VWAP,
+    FAMILIES, GAP, PREV_DAY, RANGE_POS, RET5, RET30, RVOL, VWAP, RTCOUNT, RVOL_CHANGE, IMPACT_CHANGE,
     _condition_sql, _conditions, _partial_insert_query, _sample_insert_query,
     _sealed_partial_query,
 )
@@ -48,8 +48,8 @@ def test_condition_sql_preserves_boundaries():
 
 def test_local_preflight_is_exhaustive_and_stable():
     result = local_sql_preflight()
-    # 2 sample queries + 96 bounded partial scans + 96 sealed combinations + feature + universe.
-    assert result["checks"] == 196
+    # 2 sample queries + 192 bounded partial scans + 192 sealed combinations + feature + universe + robustness.
+    assert result["checks"] == 389
     assert result["ok"] is True
-    assert result["engine_version"] == "2.0.0"
+    assert result["engine_version"] == "2.2.0"
     assert len(result["definition_hash"]) == 64

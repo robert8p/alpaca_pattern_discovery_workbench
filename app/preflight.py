@@ -20,6 +20,7 @@ from app.discovery import (
 )
 from app.features import _feature_sql
 from app.models import FeatureBuildConfig, UniverseBuildConfig
+from app.robustness import _observation_query
 from app.sql_validation import validate_sql_bindings
 from app.universe import _universe_sql
 
@@ -66,8 +67,7 @@ def generated_queries() -> list[tuple[str, str, tuple[Any, ...]]]:
     queries: list[tuple[str, str, tuple[Any, ...]]] = []
     for stride in (1, 5):
         query = _sample_insert_query([5, 15, 30, 60], stride, 570)
-        params = (_NIL_UUID, "discovery", _NIL_UUID,
-                  _SAMPLE_DATE, _SAMPLE_DATE, _SAMPLE_DATE, _SAMPLE_DATE, 0, 256)
+        params = (_NIL_UUID, _SAMPLE_DATE, _SAMPLE_DATE, _SAMPLE_DATE, _SAMPLE_DATE, 0, 256, _NIL_UUID, "discovery")
         queries.append((f"sample:{stride}", query, params))
 
     for family, spec in FAMILIES.items():
@@ -83,14 +83,22 @@ def generated_queries() -> list[tuple[str, str, tuple[Any, ...]]]:
                     sealed_query, condition_params = _sealed_partial_query(
                         conditions, direction, horizon, stride, 570
                     )
-                    sealed_params = (0.2, _NIL_UUID, _SAMPLE_DATE, _SAMPLE_DATE,
-                                     _SAMPLE_DATE, _SAMPLE_DATE, 0, 256, *condition_params)
+                    sealed_params = (_NIL_UUID, _SAMPLE_DATE, _SAMPLE_DATE,
+                                     _SAMPLE_DATE, _SAMPLE_DATE, 0, 256, 0.2, *condition_params)
                     queries.append((f"sealed:{family}:{direction}:{horizon}:{stride}", sealed_query, sealed_params))
 
     feature_query, feature_params = _sample_feature_query()
     queries.append(("feature-build", feature_query, feature_params))
     universe_query, universe_params = _sample_universe_query()
     queries.append(("universe-build", universe_query, universe_params))
+    robustness_conditions = _sample_conditions("activity_absorption")
+    robustness_query, robustness_condition_params = _observation_query(
+        robustness_conditions, "long", 30, 30, 570, 0
+    )
+    queries.append((
+        "robustness:activity_absorption:long:30", robustness_query,
+        (_NIL_UUID, _SAMPLE_DATE, 0, 30, *robustness_condition_params),
+    ))
     return queries
 
 
@@ -132,11 +140,30 @@ def database_sql_preflight(*, force: bool = False, exhaustive: bool = False) -> 
                         to_regclass('public.ra_discovery_task_chunks') IS NOT NULL AS task_chunks_ok,
                         to_regclass('public.ra_discovery_partials') IS NOT NULL AS partials_ok,
                         to_regclass('public.ra_sealed_chunks') IS NOT NULL AS sealed_chunks_ok,
-                        EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_schema='public' AND table_name='ra_candidate_rules'
-                              AND column_name='statistics_method'
-                        ) AS v2_columns_ok
+                        to_regclass('public.ra_robustness_runs') IS NOT NULL AS robustness_runs_ok,
+                        to_regclass('public.ra_robustness_results') IS NOT NULL AS robustness_results_ok,
+                        (SELECT count(*) = 5 FROM information_schema.columns
+                         WHERE table_schema='public' AND table_name='ra_discovery_runs'
+                           AND column_name = ANY(ARRAY['campaign_name','hypothesis_ids','variant_count','defined_variant_count','campaign_definition_version']))
+                        AND (SELECT count(*) = 16 FROM information_schema.columns
+                         WHERE table_schema='public' AND table_name='ra_candidate_rules'
+                           AND column_name = ANY(ARRAY[
+                               'hypothesis_ids','hypothesis_version','variants_tested_campaign','variants_defined_campaign',
+                               'multiple_testing_method','multiple_testing_adjusted_p','discovery_p25_pct','discovery_p75_pct',
+                               'discovery_p95_pct','discovery_best_pct','validation_p25_pct','validation_p75_pct',
+                               'validation_p95_pct','validation_best_pct','discovery_status','sealed_feature_set_id'
+                           ]))
+                        AND (SELECT count(*) = 26 FROM information_schema.columns
+                         WHERE table_schema='public' AND table_name='ra_discovery_samples'
+                           AND column_name = ANY(ARRAY[
+                               'close','price_group','ret_1m_pct','ret_15m_pct','ret_60m_pct','ret_from_session_open_pct',
+                               'relative_trade_count_20bar','rolling_realised_volatility_30bar','rolling_range_30bar_pct',
+                               'same_minute_relative_volume','previous_day_range_pct','previous_day_realised_volatility',
+                               'activity_adjusted_return_5m','prior_activity_adjusted_return_5m','activity_impact_change_ratio',
+                               'prior_relative_volume_20bar','prior_relative_trade_count_20bar','relative_volume_change_ratio',
+                               'relative_trade_count_change_ratio','range_vs_previous_day_ratio','volatility_vs_previous_day_ratio',
+                               'opening_range_high','opening_range_low','opening_range_position','touched_session_high','touched_session_low'
+                           ])) AS coverage_pack_columns_ok
                     """
                 )
                 objects = dict(cur.fetchone())
@@ -148,6 +175,8 @@ def database_sql_preflight(*, force: bool = False, exhaustive: bool = False) -> 
                     next(item for item in checks if item[0] == "sample:5"),
                     next(item for item in checks if item[0] == "partial:oversold_reversal:long:30:30"),
                     next(item for item in checks if item[0] == "sealed:oversold_reversal:long:30:30"),
+                    next(item for item in checks if item[0] == "partial:activity_absorption:long:30:30"),
+                    next(item for item in checks if item[0] == "robustness:activity_absorption:long:30"),
                     next(item for item in checks if item[0] == "feature-build"),
                     next(item for item in checks if item[0] == "universe-build"),
                 ]

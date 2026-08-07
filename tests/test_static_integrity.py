@@ -56,3 +56,36 @@ def test_candidate_export_uses_browser_native_attachment_transport():
     assert 'id="candidate-export-btn" type="submit"' in html
     for forbidden in ("downloadCandidateExport", "URL.createObjectURL", "response.blob()"):
         assert forbidden not in javascript
+
+
+def test_feature_job_deletion_protects_robustness_and_sealed_provenance():
+    main=(ROOT / "app" / "main.py").read_text(encoding="utf-8")
+    assert "Cannot delete this feature set because robustness evidence depends on it" in main
+    assert "Cannot delete this feature set because sealed-test evidence depends on it" in main
+    assert "target_feature_set_id" in main and "source_feature_set_id" in main
+
+
+def test_coverage_pack_schema_tracks_actual_and_defined_variants():
+    schema=(ROOT / "sql" / "schema.sql").read_text(encoding="utf-8")
+    migration=(ROOT / "sql" / "migrations" / "2.2.0.sql").read_text(encoding="utf-8")
+    for token in ("variant_count", "defined_variant_count", "variants_tested_campaign", "variants_defined_campaign"):
+        assert token in schema
+        assert token in migration
+
+
+def test_candidate_feature_picker_filters_for_frozen_definition_compatibility():
+    javascript=(ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    for token in (
+        "compatibleFeatureSetsForCandidate", "universe_run_id!==source.universe_run_id",
+        "liquidity_tiers", "time_of_day_baseline_days", "predictor_horizons_minutes",
+        "outcome_horizons_minutes",
+    ):
+        assert token in javascript
+
+
+def test_discovery_coverage_surfaces_integrity_limitations():
+    main=(ROOT / "app" / "main.py").read_text(encoding="utf-8")
+    javascript=(ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    for token in ("historical_universe", "corporate_actions", "quotes", "market_sector"):
+        assert token in main
+    assert "Known integrity limitations" in javascript

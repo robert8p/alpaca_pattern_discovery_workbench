@@ -15,8 +15,8 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
-SCHEMA_VERSION = "2.0.0"
-APP_VERSION = "2.1.1"
+SCHEMA_VERSION = "2.2.0"
+APP_VERSION = "2.2.0"
 SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
@@ -173,7 +173,49 @@ def _schema_state(cur: Any) -> dict[str, bool]:
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='ra_candidate_rules'
                   AND column_name='statistics_method'
-            ) AS v2_candidate_columns_ok
+            ) AS v2_candidate_columns_ok,
+            (SELECT count(*) = 5 FROM information_schema.columns
+             WHERE table_schema='public' AND table_name='ra_discovery_runs'
+               AND column_name = ANY(ARRAY[
+                   'campaign_name','hypothesis_ids','variant_count','defined_variant_count','campaign_definition_version'
+               ]))
+            AND (SELECT count(*) = 18 FROM information_schema.columns
+             WHERE table_schema='public' AND table_name='ra_candidate_rules'
+               AND column_name = ANY(ARRAY[
+                   'hypothesis_ids','hypothesis_version','variants_tested_campaign','variants_defined_campaign',
+                   'multiple_testing_method','multiple_testing_adjusted_p','discovery_p25_pct','discovery_p75_pct',
+                   'discovery_p95_pct','discovery_best_pct','validation_p25_pct','validation_p75_pct',
+                   'validation_p95_pct','validation_best_pct','discovery_status','sealed_feature_set_id',
+                   'statistics_method','rule_definition_version'
+               ]))
+            AND (SELECT count(*) = 27 FROM information_schema.columns
+             WHERE table_schema='public' AND table_name='ra_discovery_samples'
+               AND column_name = ANY(ARRAY[
+                   'close','price_group','ret_1m_pct','ret_15m_pct','ret_60m_pct','ret_from_session_open_pct',
+                   'relative_trade_count_20bar','rolling_realised_volatility_30bar','rolling_range_30bar_pct',
+                   'same_minute_relative_volume','previous_day_range_pct','previous_day_realised_volatility',
+                   'activity_adjusted_return_5m','prior_activity_adjusted_return_5m','activity_impact_change_ratio',
+                   'prior_relative_volume_20bar','prior_relative_trade_count_20bar','relative_volume_change_ratio',
+                   'relative_trade_count_change_ratio','range_vs_previous_day_ratio','volatility_vs_previous_day_ratio',
+                   'opening_range_high','opening_range_low','opening_range_position','touched_session_high',
+                   'touched_session_low','fwd_return_60m_pct'
+               ]))
+            AND to_regclass('public.ra_robustness_runs') IS NOT NULL
+            AND to_regclass('public.ra_robustness_observations') IS NOT NULL
+            AND to_regclass('public.ra_robustness_results') IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='ra_discovery_partials' AND column_name='best_pct'
+            )
+            AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='ra_sealed_chunks' AND column_name='best_pct'
+            )
+            AND EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid='public.ra_jobs'::regclass AND conname='ra_jobs_job_type_check'
+                  AND pg_get_constraintdef(oid) LIKE '%%robustness_analysis%%'
+            ) AS coverage_pack_ok
         """
     )
     row = cur.fetchone()
@@ -216,6 +258,11 @@ def _apply_v200_discovery_migration(cur: Any) -> None:
     cur.execute(migration_path.read_text(encoding="utf-8"))
 
 
+def _apply_v220_coverage_migration(cur: Any) -> None:
+    migration_path = Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.2.0.sql"
+    cur.execute(migration_path.read_text(encoding="utf-8"))
+
+
 def execute_schema() -> None:
     schema_path = Path(__file__).resolve().parent.parent / "sql" / "schema.sql"
     try:
@@ -252,6 +299,7 @@ def execute_schema() -> None:
                     if (state.get("discovery_samples_ok") or state.get("sample_chunks_ok")) and not state.get("v2_sample_layout_ok"):
                         _drop_incompatible_v2_discovery_tables(cur)
                     _apply_v200_discovery_migration(cur)
+                    _apply_v220_coverage_migration(cur)
                 else:
                     cur.execute(schema_path.read_text(encoding="utf-8"))
 

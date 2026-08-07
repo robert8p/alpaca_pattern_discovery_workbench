@@ -103,10 +103,14 @@ class DiscoveryConfig(BaseModel):
     holding_horizons_minutes: list[Literal[5, 15, 30, 60]] = Field(default_factory=lambda: [30, 60])
     families: list[Literal[
         "time_of_day", "oversold_reversal", "momentum_continuation",
-        "vwap_reversion", "gap_behavior", "volume_shock"
+        "vwap_reversion", "gap_behavior", "volume_shock",
+        "dip_repair", "compression_expansion", "gap_state",
+        "activity_absorption", "price_efficiency", "new_high_liquidity_divergence"
     ]] = Field(default_factory=lambda: [
         "time_of_day", "oversold_reversal", "momentum_continuation",
-        "vwap_reversion", "gap_behavior", "volume_shock"
+        "vwap_reversion", "gap_behavior", "volume_shock",
+        "dip_repair", "compression_expansion", "gap_state",
+        "activity_absorption", "price_efficiency", "new_high_liquidity_divergence"
     ])
     round_trip_cost_bps: float = Field(default=20.0, ge=0, le=1000)
     minimum_observations: int = Field(default=250, ge=20, le=1_000_000)
@@ -118,6 +122,7 @@ class DiscoveryConfig(BaseModel):
     entry_sampling_mode: Literal["non_overlapping", "all_bars"] = "non_overlapping"
     date_chunk_days: int = Field(default=3, ge=1, le=14)
     symbol_shards: int = Field(default=4, ge=1, le=64)
+    campaign_name: str = Field(default="US-equity Discovery campaign", min_length=3, max_length=120)
 
     @model_validator(mode="after")
     def periods_are_valid(self):
@@ -139,6 +144,7 @@ class SealedEvaluationConfig(BaseModel):
     candidate_id: UUID
     sealed_start: date
     sealed_end: date
+    target_feature_set_id: UUID | None = None
 
     @model_validator(mode="after")
     def dates_are_valid(self):
@@ -147,8 +153,44 @@ class SealedEvaluationConfig(BaseModel):
         return self
 
 
+
+
+class RobustnessAnalysisConfig(BaseModel):
+    candidate_id: UUID
+    target_feature_set_id: UUID | None = None
+    mode: Literal["development", "historical_holdout"] = "development"
+    start_date: date | None = None
+    end_date: date | None = None
+    round_trip_costs_bps: list[float] = Field(default_factory=lambda: [20, 25, 30, 40])
+    entry_delays_minutes: list[int] = Field(default_factory=lambda: [0, 1, 2, 5])
+    neighbourhood_pct: float = Field(default=10.0, ge=1, le=50)
+
+    @field_validator("round_trip_costs_bps")
+    @classmethod
+    def valid_costs(cls, values: list[float]) -> list[float]:
+        cleaned = sorted(set(float(v) for v in values))
+        if not cleaned or any(v < 0 or v > 1000 for v in cleaned):
+            raise ValueError("Robustness costs must be between 0 and 1000 bps")
+        return cleaned
+
+    @field_validator("entry_delays_minutes")
+    @classmethod
+    def valid_delays(cls, values: list[int]) -> list[int]:
+        cleaned = sorted(set(int(v) for v in values))
+        if 0 not in cleaned or any(v < 0 or v > 30 for v in cleaned):
+            raise ValueError("Entry delays must include 0 and remain between 0 and 30 minutes")
+        return cleaned
+
+    @model_validator(mode="after")
+    def robustness_dates(self):
+        if (self.start_date is None) != (self.end_date is None):
+            raise ValueError("Provide both robustness dates or neither")
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            raise ValueError("Robustness end date must be on or after start date")
+        return self
+
 class JobCreateRequest(BaseModel):
-    job_type: Literal["quality_scan", "universe_build", "feature_build", "discovery_scan", "sealed_evaluation"]
+    job_type: Literal["quality_scan", "universe_build", "feature_build", "discovery_scan", "robustness_analysis", "sealed_evaluation"]
     config: dict
 
 

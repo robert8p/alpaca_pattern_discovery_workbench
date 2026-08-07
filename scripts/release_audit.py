@@ -22,9 +22,9 @@ from app.db import APP_VERSION, SCHEMA_VERSION
 from app.preflight import local_sql_preflight
 from app.sql_validation import SqlBindingError, inspect_psycopg_placeholders
 
-EXPECTED_APP_VERSION = "2.1.1"
-EXPECTED_DISCOVERY_VERSION = "2.0.0"
-EXPECTED_SCHEMA_VERSION = "2.0.0"
+EXPECTED_APP_VERSION = "2.2.0"
+EXPECTED_DISCOVERY_VERSION = "2.2.0"
+EXPECTED_SCHEMA_VERSION = "2.2.0"
 
 
 def audit_sql_literals() -> int:
@@ -127,7 +127,7 @@ def audit_versions() -> None:
         raise RuntimeError(f"Schema version mismatch: {SCHEMA_VERSION}")
     if APP_VERSION != EXPECTED_APP_VERSION:
         raise RuntimeError(f"DB migration app-version marker mismatch: {APP_VERSION}")
-    if RULE_DEFINITION_VERSION != "2026-08-staged-v2":
+    if RULE_DEFINITION_VERSION != "2026-08-coverage-pack1-v1":
         raise RuntimeError(f"Unexpected rule definition: {RULE_DEFINITION_VERSION}")
     if "histogram" not in STATISTICS_METHOD:
         raise RuntimeError("v2 statistics method must identify its mergeable histogram")
@@ -135,15 +135,27 @@ def audit_versions() -> None:
 
 def audit_schema() -> None:
     schema = (ROOT / "sql/schema.sql").read_text(encoding="utf-8")
-    migration = (ROOT / "sql/migrations/2.0.0.sql").read_text(encoding="utf-8")
-    required = (
+    migration_v2 = (ROOT / "sql/migrations/2.0.0.sql").read_text(encoding="utf-8")
+    migration_pack = (ROOT / "sql/migrations/2.2.0.sql").read_text(encoding="utf-8")
+    v2_required = (
         "ra_discovery_samples", "ra_discovery_sample_chunks", "ra_discovery_task_chunks",
         "ra_discovery_partials", "ra_sealed_chunks", "sample_stride_minutes",
         "fwd_return_60m_pct", "statistics_method", "engine_version",
     )
-    for token in required:
-        if token not in schema or token not in migration:
-            raise RuntimeError(f"Schema or migration is missing {token}")
+    for token in v2_required:
+        if token not in schema or token not in migration_v2:
+            raise RuntimeError(f"Base v2 schema or migration is missing {token}")
+    pack_required = (
+        "ra_robustness_runs", "ra_robustness_observations", "ra_robustness_results",
+        "campaign_name", "hypothesis_ids", "variant_count", "defined_variant_count",
+        "variants_tested_campaign", "variants_defined_campaign", "multiple_testing_adjusted_p",
+        "discovery_p25_pct", "validation_p95_pct", "sealed_feature_set_id",
+        "relative_trade_count_20bar", "activity_impact_change_ratio", "opening_range_position",
+        "touched_session_high", "best_pct",
+    )
+    for token in pack_required:
+        if token not in schema or token not in migration_pack:
+            raise RuntimeError(f"Coverage-pack schema or migration is missing {token}")
     if "CREATE TABLE IF NOT EXISTS rd_" in schema:
         raise RuntimeError("Schema creates raw rd_ tables")
 
@@ -155,6 +167,22 @@ def audit_blueprint() -> None:
     if blueprint.count("value: 3.12.7") != 2:
         raise RuntimeError("Both services must pin Python 3.12.7")
 
+
+
+def audit_research_integrity_ui() -> None:
+    html = (ROOT / "app/templates/index.html").read_text(encoding="utf-8")
+    javascript = (ROOT / "app/static/app.js").read_text(encoding="utf-8")
+    for token in (
+        'value="dip_repair"', 'value="compression_expansion"', 'value="gap_state"',
+        'value="activity_absorption"', 'value="price_efficiency"',
+        'value="new_high_liquidity_divergence"', 'id="robustness-dialog"',
+        'id="sealed-feature-set"', 'id="discovery-campaign"',
+    ):
+        if token not in html:
+            raise RuntimeError(f"Coverage-pack UI is missing {token}")
+    for token in ("openRobustness", "round_trip_costs_bps", "target_feature_set_id", "campaign_name"):
+        if token not in javascript:
+            raise RuntimeError(f"Coverage-pack browser flow is missing {token}")
 
 def audit_secrets() -> None:
     suspicious = re.compile(r"(?:eyJ[a-zA-Z0-9_-]{30,}|AKIA[0-9A-Z]{16}|postgresql://[^\s:]+:[^@\s]{12,}@)")
@@ -171,6 +199,7 @@ def main() -> None:
     audit_schema()
     audit_blueprint()
     audit_raw_write_policy()
+    audit_research_integrity_ui()
     audit_secrets()
     literal_queries = audit_sql_literals()
     static_bindings = audit_execute_parameter_counts()

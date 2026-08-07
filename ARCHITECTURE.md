@@ -1,105 +1,72 @@
-# Architecture — Pattern Discovery Workbench 2.0.0
+# Architecture — Pattern Discovery Workbench 2.2.0
 
-## System boundary
+## Design objective
 
-```text
-Rapid Discovery Loader              Pattern Discovery Workbench
-──────────────────────              ───────────────────────────
-rd_bars                 ──read──▶   quality / universe / features
-rd_assets               ──read──▶   staged discovery
-rd_jobs / rd_tasks      ──read──▶   sealed evaluation
-                                      │
-                                      ▼
-                                ra_* analysis tables
-```
+Consolidate US-equity Discovery in one Workbench while keeping raw collection, exploratory Discovery, robustness analysis and sealed evidence logically separate.
 
-The workbench does not write to loader-owned `rd_` tables.
+## Data ownership
 
-## Services
+### Loader-owned, read only
 
-### Web service
+- `rd_bars`
+- `rd_assets`
+- other `rd_` loader tables
 
-- FastAPI dashboard and API.
-- Validates typed job configurations.
-- Runs local and PostgreSQL planning preflight before accepting discovery or sealed jobs.
-- Queues jobs and exposes status, events, chunks, candidates and system health.
+Application code must never INSERT/UPDATE/DELETE/DDL these tables.
 
-### Worker
+### Workbench-owned
 
-- Claims one background job using `FOR UPDATE SKIP LOCKED`.
-- Executes quality, universe, feature, discovery or sealed workflows.
-- Maintains heartbeat and supports pause, resume, cancel and stale-worker recovery.
-- Uses the Supabase Primary Session pooler on port 5432.
+Core layers:
 
-## Discovery v2 persistence model
+- `ra_quality_reports`
+- `ra_universe_runs`
+- `ra_analysis_universe`
+- `ra_feature_sets`
+- `ra_intraday_features`
+- `ra_discovery_runs`
+- `ra_discovery_samples`
+- `ra_discovery_tasks` / chunks / partials
+- `ra_candidate_rules`
+- `ra_robustness_runs`
+- `ra_robustness_observations`
+- `ra_robustness_results`
+- `ra_sealed_chunks`
 
-### `ra_discovery_runs`
+## Discovery methodology
 
-One logical discovery run per job. Stores the immutable user configuration plus engine, rule-definition and statistics-method versions.
+The v2 engine materialises a narrow sampled dataset once per run. Rule-family scans are bounded by date and deterministic symbol bucket. Each chunk writes mergeable partial statistics rather than calculating whole-period percentiles in one query.
 
-### `ra_discovery_sample_chunks`
+2.2.0 leaves all legacy-family definitions unchanged and adds versioned market-data-only families for H01, H03, H04/H05, H06, H07 and H12.
 
-Resumable instructions for materialising narrow rows by:
+The run stores two distinct counts:
 
-- discovery/validation period
-- sample stride, chosen as the smallest requested horizon
-- date range
-- deterministic symbol-bucket range
+- `variant_count` / `candidates_tested`: grouped parameter combinations that actually occurred and were statistically examined.
+- `defined_variant_count`: the complete parameter grid defined before looking at results, including zero-observation combinations.
 
-### `ra_discovery_samples`
+Multiple-testing adjustment uses the exact number of statistical tests actually performed; the larger defined grid is retained as a conservative search-space audit.
 
-Narrow source table containing identifiers, predictors required by current families and all four supported forward-return columns on each sampled row. It is indexed by run, period, date and symbol bucket. Holding-period tasks select the relevant forward-return column and apply their own entry cadence.
+## Robustness Lab
 
-### `ra_discovery_tasks`
+Robustness is a separate background job. It replays the candidate's frozen signal conditions one trading date at a time and computes exact observation-level results in Python. This avoids the large whole-period grouped queries that previously caused production timeouts.
 
-One family × direction × holding-horizon combination.
+It supports development-period diagnostics and a non-overlapping historical holdout on another compatible feature set.
 
-### `ra_discovery_task_chunks`
+Compatibility requires the same frozen universe, timeframe, feed, adjustment, session, liquidity-tier selection, predictor horizons, time-of-day baseline definition and required outcome horizon. Operational chunk/batch sizes may differ.
 
-Resumable bounded scans for one task and one period. A timeout changes the parent to `split` and creates two smaller children.
+Robustness additionally reports exact holding-horizon MFE/MAE, missing-outcome rate, date/month/year breakdowns, clustered evidence, leave-one-date-out stability and sensitivity tests.
 
-### `ra_discovery_partials`
+Detailed outputs are stored separately from the candidate definition so Robustness Lab never mutates the candidate.
 
-One row per candidate group per completed task chunk. It contains mergeable sufficient statistics and exact symbol/date count maps.
+## Sealed evaluation
 
-### `ra_candidate_rules`
+Sealed evaluation remains explicit. A candidate's frozen conditions, direction, horizon, sampling stride and anchor are replayed without optimisation. A newer compatible feature set may be selected, but it must use the same frozen universe and the sealed dates must begin after the candidate's development boundary.
 
-Shortlisted results after all partials are merged. Each candidate freezes:
+## Versioning
 
-- exact conditions
-- direction and horizon
-- entry sampling mode, stride and anchor
-- rule-definition version
-- statistics method
-- discovery and validation metrics
+- Application version: `2.2.0`
+- Schema version: `2.2.0`
+- Discovery engine version: `2.2.0`
+- New rule-definition version: `2026-08-coverage-pack1-v1`
+- Legacy staged-v2 candidates remain readable by the audited Robustness/holdout replay paths.
 
-### `ra_sealed_chunks`
-
-Bounded partial evaluations of one promoted candidate over its untouched sealed period.
-
-## Failure and replay semantics
-
-- Before replaying a sample slice, rows for that exact run/period/date/bucket slice are deleted.
-- Before replaying a scan chunk, partials owned by that chunk are deleted.
-- Primary and unique keys prevent duplicate observations or partial groups.
-- Statement timeout: 180 seconds by default.
-- Independent wall-clock watchdog: 210 seconds.
-- Pause/cancel is checked every two seconds and cancels the active PostgreSQL backend.
-- Timeouts split by date first, then symbol bucket.
-- Deadlocks, serialization failures, lock timeouts and dropped pooled connections retry with jittered backoff.
-- Completed siblings remain committed.
-
-## Migration strategy
-
-Schema version `2.0.0` uses a targeted idempotent migration. Existing live analysis tables are not recreated and the full schema is not replayed when compatibility checks pass. A PostgreSQL advisory lock serialises startup migration.
-
-## Performance design
-
-The v2 engine deliberately avoids:
-
-- `percentile_cont` over the full discovery period
-- full-period `count(distinct ...)` for every candidate group
-- one monolithic family query
-- re-reading the wide feature table for every family
-
-The wide feature source is read only during sample materialisation and sealed evaluation. Family scans operate on bounded ranges of the narrow sample table.
+Migration is targeted and idempotent. A PostgreSQL advisory lock serialises startup migration between the web and worker services.

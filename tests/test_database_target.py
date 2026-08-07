@@ -25,5 +25,5 @@ def test_transaction_pooler_is_rejected(monkeypatch):
 
 
 def test_target_summary_never_contains_password(monkeypatch):
-    _set_url(monkeypatch, "postgresql://postgres.ref:super-secret@aws-0-eu-west-1.pooler.supabase.com:5432/postgres")
-    assert "super-secret" not in repr(database_target())
+    _set_url(monkeypatch, "postgresql://postgres.ref:pw@aws-0-eu-west-1.pooler.supabase.com:5432/postgres")
+    assert "pw" not in repr(database_target())

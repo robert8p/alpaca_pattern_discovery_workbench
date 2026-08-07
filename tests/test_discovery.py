@@ -5,7 +5,7 @@ from app.discovery import (
     FAMILIES, RANGE_POS, STATISTICS_METHOD, TIME, _bucket_ranges, _condition_sql,
     _date_chunks, _finalise_stats, _hist_quantile, _merge_partial_rows,
     _is_retryable_database_error, _partial_insert_query, _plain_rule,
-    _sample_insert_query, _sealed_partial_query,
+    _planned_variant_count, _sample_insert_query, _sealed_partial_query,
 )
 
 
@@ -138,3 +138,52 @@ def test_sample_schema_does_not_duplicate_predictors_per_horizon():
     assert "holding_horizon_minutes" not in sample_block
     for horizon in (5, 15, 30, 60):
         assert f"fwd_return_{horizon}m_pct" in sample_block
+
+
+def test_coverage_pack_families_are_versioned_and_mapped_to_hypotheses():
+    expected={
+        "dip_repair":{"H01"}, "compression_expansion":{"H03"}, "gap_state":{"H04","H05"},
+        "activity_absorption":{"H06"}, "price_efficiency":{"H07"},
+        "new_high_liquidity_divergence":{"H12"},
+    }
+    for family,hids in expected.items():
+        spec=FAMILIES[family]
+        assert set(spec["hypothesis_ids"]) == hids
+        assert spec["coverage"] == "PARTIAL"
+        assert spec["hypothesis_version"] != "legacy-v1"
+
+
+def test_sample_query_carries_unused_feature_inputs_into_discovery_layer():
+    q=_sample_insert_query([30],30,570)
+    for name in ("relative_trade_count_20bar","rolling_realised_volatility_30bar","opening_range_position","activity_impact_change_ratio","price_group"):
+        assert name in q
+
+
+def test_legacy_family_filters_are_not_redefined():
+    assert FAMILIES["oversold_reversal"]["filter"] == "ret_30m_pct<0 AND distance_from_cumulative_vwap_pct<0 AND relative_volume_20bar IS NOT NULL"
+    assert FAMILIES["gap_behavior"]["filter"] == "abs(gap_from_previous_regular_close_pct)>=1 AND previous_day_return_pct IS NOT NULL"
+
+
+def test_defined_variant_count_includes_full_parameter_grid():
+    from app.models import DiscoveryConfig
+    from uuid import uuid4
+    cfg=DiscoveryConfig.model_validate({
+        "feature_set_id": str(uuid4()), "discovery_start": "2026-07-01", "discovery_end": "2026-07-10",
+        "directions": ["long","short"], "holding_horizons_minutes": [15,30],
+        "families": ["time_of_day","activity_absorption"],
+    })
+    expected=0
+    for family in cfg.families:
+        per_family=1
+        for dimension in FAMILIES[family]["dimensions"]:
+            per_family *= len(dimension.labels)
+        expected += per_family * len(cfg.directions) * len(cfg.holding_horizons_minutes)
+    assert _planned_variant_count(cfg) == expected
+    assert expected > 0
+
+
+def test_candidate_write_tracks_actual_and_defined_variant_counts_separately():
+    source=Path("app/discovery.py").read_text(encoding="utf-8")
+    assert "variants_tested_campaign,variants_defined_campaign" in source
+    assert 'groups_tested,planned_variants,"bonferroni_normal_approx"' in source
+    assert "variant_count=%s,defined_variant_count=%s" in source

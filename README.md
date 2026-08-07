@@ -1,129 +1,140 @@
-# Alpaca Pattern Discovery Workbench 2.1.1
+# Alpaca Pattern Discovery Workbench 2.2.0
 
-A button-driven companion to the **Alpaca Rapid Discovery Loader**. It connects to the same Supabase PostgreSQL database, reads the loader's `rd_` market-data tables, and writes only to its own `ra_` analysis tables.
+A button-driven research companion to the Alpaca Rapid Discovery Loader. It reads the existing `rd_` market-data tables and writes only to versioned `ra_` research tables in the same Supabase database.
 
-Version 2.1.1 keeps the Candidate Analysis Export and changes its browser transport to a native attachment download for cross-browser reliability. Completed discovery results, universes, feature sets and `rd_` bars do not need to be rebuilt.
+## 2.2.0 — Research Integrity + Discovery Coverage Pack 1
 
-## Why the discovery engine was rebuilt
+This release expands the Workbench without changing completed historical experiment definitions.
 
-The withdrawn 1.x engine ran one large grouped PostgreSQL query for each rule family, direction and holding period. Exact percentiles, distinct counts, concentration calculations and multiple scans of the same feature rows could exceed the database statement timeout.
+### Existing families preserved
 
-The staged v2 engine removes that single-query failure point:
+The original six families remain unchanged:
+
+- `time_of_day`
+- `oversold_reversal`
+- `momentum_continuation`
+- `vwap_reversion`
+- `gap_behavior`
+- `volume_shock`
+
+### New versioned Discovery families
+
+The following use market-data features that were already present in completed feature sets:
+
+- `dip_repair` — H01 partial market-data implementation.
+- `compression_expansion` — H03 partial implementation.
+- `gap_state` — H04/H05 opening-gap acceptance/rejection states.
+- `activity_absorption` — H06 negative-space activity/price-response test.
+- `price_efficiency` — H07 activity-adjusted price-impact transition.
+- `new_high_liquidity_divergence` — H12 activity-confirmation proxy at session highs.
+
+These are explicitly labelled **partial** where quote, sector, market, news, halt or other enrichment is still absent. The application does not invent those missing data sources.
+
+## Research-integrity additions
+
+Every new Discovery run records:
+
+- Campaign name and campaign-definition version.
+- Hypothesis IDs and hypothesis versions.
+- Exact number of observed parameter variants actually tested.
+- Conservative size of the full defined parameter grid, including zero-observation combinations, stored separately.
+- Bonferroni-adjusted, two-sided normal-approximation significance for retained candidates.
+- Discovery status: `WEAK`, `PROMISING`, or `PROGRESS_TO_FORMAL_VALIDATION`.
+- Additional distribution outputs including p25, p75, p95 and best observation.
+
+Discovery, validation and sealed evidence remain logically separate. No sealed-period statistics are shown in Discovery.
+
+## Robustness Lab
+
+Every candidate—including candidates produced by the earlier staged-v2 rule definition—can be sent to **Run robustness lab**.
+
+The lab calculates:
+
+- Exact return distribution and win/profit-factor statistics.
+- Date-clustered t-statistic.
+- Leave-one-date-out minimum net expectancy.
+- Per-date, per-month and per-year performance.
+- Per-symbol performance and concentration.
+- Liquidity-tier and price-group breakdowns.
+- 20/25/30/40 bps cost sensitivity by default.
+- 0/1/2/5 minute entry-delay sensitivity by default.
+- Relaxed/exact/tightened threshold-neighbourhood performance.
+- Contribution of the best 1%, 5% and 10% of observations.
+- Explicit missing-outcome rate.
+- Holding-horizon MFE and MAE from completed post-entry bars.
+
+Verdicts are deliberately research-stage labels: `REJECT`, `WEAK`, `PROMISING`, or `HISTORICAL_HOLDOUT`.
+
+## Compatible holdouts
+
+Robustness and sealed evaluation can replay a frozen candidate on another completed feature set when all of these match:
+
+- Frozen analysis universe.
+- Timeframe.
+- Feed.
+- Adjustment.
+- Session.
+- Required outcome horizon.
+- Liquidity-tier selection.
+- Predictor horizons.
+- Time-of-day baseline definition.
+
+Historical holdout dates must not overlap the original Discovery/validation development period. Sealed evaluation must begin after the development boundary. The candidate conditions and entry-sampling method are never re-optimised during replay.
+
+## Known integrity limitations
+
+The Workbench explicitly reports limitations it cannot yet solve from the current market-data layer:
+
+- Historical universe membership does not yet reconstruct point-in-time active/delisted membership.
+- Raw prices avoid back-adjustment leakage, but explicit point-in-time corporate-action exclusion events are not yet available.
+- Quote spread/depth is absent.
+- Market/sector-relative states require benchmark and point-in-time sector enrichment.
+
+These remain visible limitations rather than being approximated from unsuitable fields.
+
+## Candidate export
+
+**Candidates → Download analysis export** creates a ZIP containing the candidate leaderboard, frozen conditions, run configuration, feature/universe provenance, Robustness Lab summaries and detailed robustness breakdowns suitable for uploading back to ChatGPT.
+
+## Architecture
 
 ```text
-Completed feature set
+Rapid Discovery Loader
         │
         ▼
-Narrow sampled rows, built once per period at the minimum required cadence
+     rd_bars  (read only)
         │
-        ▼
-Bounded date × symbol-bucket scan chunks
-        │
-        ▼
-Persistent mergeable partial statistics
-        │
-        ▼
-Python merge and shortlist
-        │
-        ▼
-Separate staged sealed evaluation
+        ├───────────────┐
+        ▼               │
+ra_intraday_features    │
+        │               │
+        ▼               │
+ra_discovery_samples    │
+        │               │
+        ▼               │
+bounded partial scans   │
+        │               │
+        ▼               │
+ra_candidate_rules      │
+        ├── Robustness Lab / historical holdout
+        └── explicit sealed evaluation
 ```
 
-A completed chunk is never recomputed unless its exact slice is deliberately reset. Timeouts split the failing chunk into smaller date or deterministic symbol-bucket ranges, down to one date and one of 1,024 virtual buckets.
-
-## Main workflows
-
-1. **Data quality** — verify coverage, completeness and OHLC integrity.
-2. **Research universe** — freeze a liquidity-ranked symbol set.
-3. **Feature engineering** — build reusable leakage-aware intraday predictors and future outcome labels.
-4. **Staged discovery** — materialise narrow samples, scan interpretable rule families in bounded chunks and merge sufficient statistics.
-5. **Candidate workflow** — inspect, shortlist, reject or restore rules.
-6. **Sealed evaluation** — calculate an untouched result only after explicit promotion.
-
-## Discovery v2 details
-
-### Sample materialisation
-
-For discovery and validation separately, the engine copies only the columns required by the rule families into `ra_discovery_samples`. It stores all requested forward-return columns on the same row and samples once at the smallest required cadence. Each holding-period task then applies its own cadence. This avoids duplicating the predictors four times when 5-, 15-, 30- and 60-minute outcomes are selected.
-
-Non-overlapping mode evaluates entries at the holding-period cadence:
-
-| Holding period | Entry cadence |
-|---|---|
-| 5 minutes | every 5 minutes |
-| 15 minutes | every 15 minutes |
-| 30 minutes | every 30 minutes |
-| 60 minutes | every 60 minutes |
-
-`all_bars` remains available, but it deliberately permits overlapping outcomes and is slower.
-
-### Partial scans
-
-Every family × direction × horizon × period is split by:
-
-- Configurable calendar-day chunks, default 3 days.
-- Configurable initial symbol shards, default 4.
-- Automatic binary splitting after a timeout.
-
-Each chunk stores mergeable statistics rather than complete trade rows:
-
-- observation count
-- gross and net sum
-- net sum of squares
-- wins
-- positive and negative return sums
-- exact worst result
-- 0.1-percentage-point histogram
-- exact symbol counts
-- exact date counts
-
-This supports mean, approximate median, approximate fifth percentile, t-statistic, profit factor and exact concentration metrics without a whole-period percentile sort.
-
-### Statistical limitations
-
-- Histogram median and fifth percentile are approximate to 0.1 percentage point; extreme tails are clipped at ±20% for quantiles. Exact worst return is stored separately.
-- Event-level t-statistics do not correct for cross-symbol market correlation.
-- Candidate metrics are not a portfolio-capital simulation.
-- Survivorship, spread, short availability and multiple-testing risks still require deeper validation.
-
-## Raw-data protection
-
-Application and release-gate scans reject writes to `rd_` tables. The workbench writes to `ra_` only. Stronger database-level enforcement can be added by using a dedicated PostgreSQL role with read-only access to `rd_` and write access to `ra_`.
-
-## Existing data compatibility
-
-- Existing `rd_bars`: preserved.
-- Existing universe runs: preserved.
-- Existing completed feature sets: preserved; feature definition remains `1.1.0` because its calculation has not changed.
-- Existing 1.x discovery jobs: retryable. On first staged-v2 retry, only withdrawn discovery samples/tasks/candidates are reset; the selected feature set remains intact.
-
-
-## Candidate analysis export
-
-The **Candidates** tab includes **Download analysis export**. The button respects the currently selected discovery-run and workflow-status filters and downloads a ZIP containing:
-
-- `SUMMARY.md` — compact candidate overview and top-ranked results.
-- `candidates.csv` — flattened leaderboard including discovery, validation and sealed metrics plus frozen run thresholds.
-- `candidates.json` — complete machine-readable candidate records and conditions.
-- `discovery_runs.json` and `discovery_tasks.csv` — exact scan configuration and task coverage.
-- `feature_sets.json` — feature-set provenance and configuration.
-- `universes.json` and `universe_symbols.csv` — frozen universe definition and included-symbol liquidity metrics.
-- `ANALYSIS_PROMPT.txt` — a ready-made prompt for uploading the package into ChatGPT.
-
-The export is read-only and requires no schema migration or discovery rerun.
+The staged Discovery engine remains timeout-resistant: samples and family scans are chunked by date and deterministic symbol bucket, with committed partials surviving pause/retry/redeployment.
 
 ## Deployment
 
-Read [`DEPLOYMENT.md`](DEPLOYMENT.md). Do not deploy a commit until its GitHub `release-gate` Action is green.
+See `DEPLOYMENT.md`. Existing `rd_` bars, feature rows, universes and completed candidate results are preserved. The first 2.2.0 startup applies the targeted idempotent migration `sql/migrations/2.2.0.sql`.
 
-## Local commands
+## Release validation
+
+Run locally:
 
 ```bash
-python -m pip install -r requirements-dev.txt
-pytest -q
 python -m compileall -q app scripts tests
 node --check app/static/app.js
+pytest -q
 python scripts/release_audit.py
 ```
 
-A real PostgreSQL 16 integration test is included and runs in GitHub Actions. It is skipped locally unless `RUN_POSTGRES_INTEGRATION=1` and `TEST_DATABASE_URL` are supplied.
+The repository also includes `.github/workflows/ci.yml`, which provisions PostgreSQL 16 and runs the real Psycopg end-to-end workflow. Do not deploy a commit whose `release-gate` workflow is red.

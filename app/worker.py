@@ -8,17 +8,18 @@ from typing import Any
 from app.config import get_settings
 from app.db import close_pool, connection, execute_schema
 from app.discovery import run_discovery, run_sealed_evaluation
+from app.robustness import run_robustness
 from app.features import build_feature_set
 from app.jobs import (
     JobInterrupted, claim_next_job, fail_job, finish_job, interrupt_job,
     make_worker_id, recover_stale_jobs, worker_heartbeat,
 )
-from app.models import DiscoveryConfig, FeatureBuildConfig, QualityScanConfig, SealedEvaluationConfig, UniverseBuildConfig
+from app.models import DiscoveryConfig, FeatureBuildConfig, QualityScanConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig
 from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
@@ -42,6 +43,9 @@ def _mark_related(job: dict[str, Any], status: str) -> None:
                         """,
                         (job["id"],),
                     )
+            elif job["job_type"] == "robustness_analysis":
+                if status in {"cancelled", "failed"}:
+                    cur.execute("UPDATE ra_robustness_runs SET status=%s,completed_at=CASE WHEN %s='cancelled' THEN now() ELSE completed_at END WHERE job_id=%s", (status, status, job["id"]))
             elif job["job_type"] == "discovery_scan":
                 if status == "cancelled":
                     cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (job["id"],))
@@ -65,6 +69,8 @@ def _dispatch(job: dict[str, Any]) -> dict[str, Any]:
         return build_feature_set(job_id, FeatureBuildConfig.model_validate(config))
     if job["job_type"] == "discovery_scan":
         return run_discovery(job_id, DiscoveryConfig.model_validate(config))
+    if job["job_type"] == "robustness_analysis":
+        return run_robustness(job_id, RobustnessAnalysisConfig.model_validate(config))
     if job["job_type"] == "sealed_evaluation":
         return run_sealed_evaluation(job_id, SealedEvaluationConfig.model_validate(config))
     raise ValueError(f"Unsupported job type: {job['job_type']}")

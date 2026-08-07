@@ -22,11 +22,11 @@ from app.jobs import create_job
 from app.preflight import database_sql_preflight, local_sql_preflight
 from app.models import (
     DiscoveryConfig, FeatureBuildConfig, FeatureEstimateRequest, JobCreateRequest,
-    QualityScanConfig, SealedEvaluationConfig, UniverseBuildConfig,
+    QualityScanConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
 )
 from app.utils import json_safe
 
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -154,10 +154,11 @@ def queue_job(payload: JobCreateRequest, _: str = Depends(require_auth)) -> dict
         "universe_build": UniverseBuildConfig,
         "feature_build": FeatureBuildConfig,
         "discovery_scan": DiscoveryConfig,
+        "robustness_analysis": RobustnessAnalysisConfig,
         "sealed_evaluation": SealedEvaluationConfig,
     }
     model = validators[payload.job_type].model_validate(payload.config)
-    if payload.job_type in {"discovery_scan", "sealed_evaluation"}:
+    if payload.job_type in {"discovery_scan", "robustness_analysis", "sealed_evaluation"}:
         try:
             database_sql_preflight()
         except Exception as exc:
@@ -276,6 +277,21 @@ def job_action(job_id: str, action: str, _: str = Depends(require_auth)) -> dict
                     )
                     if int(cur.fetchone()["n"]):
                         raise HTTPException(409, "Cannot delete this feature set because discovery runs depend on it")
+                    cur.execute(
+                        "SELECT count(*) AS n FROM ra_robustness_runs WHERE target_feature_set_id IN "
+                        "(SELECT id FROM ra_feature_sets WHERE job_id=%s) OR source_feature_set_id IN "
+                        "(SELECT id FROM ra_feature_sets WHERE job_id=%s)",
+                        (jid, jid),
+                    )
+                    if int(cur.fetchone()["n"]):
+                        raise HTTPException(409, "Cannot delete this feature set because robustness evidence depends on it")
+                    cur.execute(
+                        "SELECT count(*) AS n FROM ra_candidate_rules WHERE sealed_feature_set_id IN "
+                        "(SELECT id FROM ra_feature_sets WHERE job_id=%s)",
+                        (jid,),
+                    )
+                    if int(cur.fetchone()["n"]):
+                        raise HTTPException(409, "Cannot delete this feature set because sealed-test evidence depends on it")
                 elif row["job_type"] == "discovery_scan":
                     cur.execute(
                         "SELECT count(*) AS n FROM ra_candidate_rules WHERE discovery_run_id IN "
@@ -396,7 +412,20 @@ def candidates(discovery_run_id: str | None = None, status_filter: str | None = 
     params.append(min(limit, 1000))
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT * FROM ra_candidate_rules WHERE {' AND '.join(clauses)} ORDER BY rank_score DESC NULLS LAST,created_at DESC LIMIT %s", tuple(params))
+            where_sql = ' AND '.join('c.' + clause if clause != 'TRUE' else clause for clause in clauses)
+            cur.execute(f"""
+                SELECT c.*,rr.id AS robustness_run_id,rr.verdict AS robustness_verdict,rr.summary AS robustness_summary,
+                       rr.mode AS robustness_mode,rr.target_feature_set_id AS robustness_target_feature_set_id,
+                       rr.completed_at AS robustness_completed_at
+                FROM ra_candidate_rules c
+                LEFT JOIN LATERAL (
+                    SELECT * FROM ra_robustness_runs r
+                    WHERE r.candidate_id=c.id AND r.status='completed'
+                    ORDER BY r.completed_at DESC NULLS LAST,r.created_at DESC LIMIT 1
+                ) rr ON TRUE
+                WHERE {where_sql}
+                ORDER BY c.rank_score DESC NULLS LAST,c.created_at DESC LIMIT %s
+            """, tuple(params))
             rows = cur.fetchall()
         conn.rollback()
     return json_safe(rows)
@@ -450,6 +479,15 @@ def export_candidates(discovery_run_id: str | None = None, status_filter: str | 
                 (universe_ids,),
             )
             universe_symbol_rows = [dict(row) for row in cur.fetchall()]
+            candidate_ids = [row["id"] for row in candidate_rows]
+            cur.execute("SELECT * FROM ra_robustness_runs WHERE candidate_id=ANY(%s) ORDER BY candidate_id,created_at", (candidate_ids,))
+            robustness_rows = [dict(row) for row in cur.fetchall()]
+            robustness_ids = [row["id"] for row in robustness_rows]
+            if robustness_ids:
+                cur.execute("SELECT * FROM ra_robustness_results WHERE robustness_run_id=ANY(%s) ORDER BY robustness_run_id,result_type,result_key", (robustness_ids,))
+                robustness_result_rows = [dict(row) for row in cur.fetchall()]
+            else:
+                robustness_result_rows = []
         conn.rollback()
 
     exported_at = datetime.now(UTC)
@@ -460,6 +498,8 @@ def export_candidates(discovery_run_id: str | None = None, status_filter: str | 
         feature_sets=feature_rows,
         universes=universe_rows,
         universe_symbols=universe_symbol_rows,
+        robustness_runs=robustness_rows,
+        robustness_results=robustness_result_rows,
         filters={"discovery_run_id": discovery_run_id, "status_filter": status_filter},
         app_version=VERSION,
         exported_at=exported_at,
@@ -489,6 +529,62 @@ def candidate_action(candidate_id: str, action: str, _: str = Depends(require_au
     if not row:
         raise HTTPException(404, "Candidate not found")
     return {"ok": True, "status": statuses[action]}
+
+
+@app.post("/api/candidates/{candidate_id}/robustness", status_code=201)
+def queue_robustness(candidate_id: str, payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
+    config = RobustnessAnalysisConfig.model_validate({"candidate_id": parse_uuid(candidate_id), **payload})
+    try:
+        database_sql_preflight()
+    except Exception as exc:
+        raise HTTPException(503, f"Analysis SQL preflight failed: {exc}") from exc
+    return json_safe(create_job("robustness_analysis", f"Robustness · {str(config.candidate_id)[:8]}", config.model_dump(mode="json")))
+
+
+@app.get("/api/candidates/{candidate_id}/robustness")
+def candidate_robustness(candidate_id: str, _: str = Depends(require_auth)) -> list[dict[str, Any]]:
+    cid = parse_uuid(candidate_id)
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ra_robustness_runs WHERE candidate_id=%s ORDER BY created_at DESC", (cid,))
+            rows = cur.fetchall()
+        conn.rollback()
+    return json_safe(rows)
+
+
+@app.get("/api/discovery-coverage")
+def discovery_coverage(_: str = Depends(require_auth)) -> dict[str, Any]:
+    from app.discovery import FAMILIES
+    covered = []
+    for family, spec in FAMILIES.items():
+        covered.append({
+            "family": family, "hypothesis_ids": spec.get("hypothesis_ids", []),
+            "hypothesis_version": spec.get("hypothesis_version"), "coverage": spec.get("coverage", "UNKNOWN"),
+        })
+    next_data_ready = [
+        {"hypothesis_id": "H02", "scope": "market-only", "missing": "SPY-aligned benchmark state must be added to the feature layer"},
+        {"hypothesis_id": "H08", "scope": "market-only", "missing": "market-relative residual features must be added to the feature layer"},
+    ]
+    integrity_limitations = [
+        {"area": "historical_universe", "limitation": "Current frozen universes do not yet reconstruct point-in-time active/delisted membership for earlier dates."},
+        {"area": "corporate_actions", "limitation": "Raw intraday prices avoid back-adjustment leakage but explicit point-in-time split/dividend event exclusions are not yet available."},
+        {"area": "quotes", "limitation": "Bid-ask spread, depth and quote-size liquidity confirmation are not present in the current feature layer."},
+        {"area": "market_sector", "limitation": "Market/sector-relative states require benchmark and point-in-time sector enrichment."},
+    ]
+    blocked = [
+        {"hypothesis_id": "H09-H11", "missing": "frozen 14:00/17:00 activation and trigger history from the 13.8 Research Lab"},
+        {"hypothesis_id": "H13-H14", "missing": "point-in-time halt/resumption events"},
+        {"hypothesis_id": "H25-H27", "missing": "point-in-time sector/ETF membership, weights and market-cap enrichment"},
+        {"hypothesis_id": "H28", "missing": "point-in-time customer/supplier relationships and exposure"},
+        {"hypothesis_id": "H29", "missing": "home-market listings and FX data"},
+        {"hypothesis_id": "H30-H34", "missing": "timestamped news/earnings/attention event data"},
+        {"hypothesis_id": "H35", "missing": "secondary-offering event and pricing data"},
+        {"hypothesis_id": "H36", "missing": "index/rebalance event and closing-auction flow data"},
+    ]
+    return {
+        "implemented_families": covered, "next_data_ready": next_data_ready,
+        "blocked_or_enrichment_dependent": blocked, "integrity_limitations": integrity_limitations,
+    }
 
 
 @app.post("/api/candidates/{candidate_id}/sealed", status_code=201)
