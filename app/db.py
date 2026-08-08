@@ -219,7 +219,7 @@ def _schema_state(cur: Any) -> dict[str, bool]:
             )
             AND EXISTS (
                 SELECT 1 FROM pg_constraint
-                WHERE conrelid='public.ra_jobs'::regclass AND conname='ra_jobs_job_type_check'
+                WHERE conrelid=to_regclass('public.ra_jobs') AND conname='ra_jobs_job_type_check'
                   AND pg_get_constraintdef(oid) LIKE '%%robustness_analysis%%'
             ) AS coverage_pack_ok,
             to_regclass('public.ra_full_history_backfills') IS NOT NULL
@@ -230,7 +230,7 @@ def _schema_state(cur: Any) -> dict[str, bool]:
             AND to_regprocedure('public.ra_ensure_market_state_partitions(date,date)') IS NOT NULL
             AND to_regprocedure('public.ra_ensure_candidate_wave_partitions(date,date)') IS NOT NULL
             AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='ra_jobs_research_period_guard' AND NOT tgisinternal)
-            AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.ra_jobs'::regclass AND conname='ra_jobs_job_type_check' AND pg_get_constraintdef(oid) LIKE '%%historical_feature_backfill%%')
+            AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('public.ra_jobs') AND conname='ra_jobs_job_type_check' AND pg_get_constraintdef(oid) LIKE '%%historical_feature_backfill%%')
             AS phase1_full_history_ok
         """
     )
