@@ -218,7 +218,7 @@ def test_complete_postgres_workflow():
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id,entry_stride_minutes,entry_anchor_minute,rule_definition_version,
+                SELECT id,holding_horizon_minutes,entry_stride_minutes,entry_anchor_minute,rule_definition_version,
                        discovery_net_avg_pct,validation_net_avg_pct
                 FROM ra_candidate_rules
                 WHERE discovery_run_id=%s
@@ -228,7 +228,7 @@ def test_complete_postgres_workflow():
             )
             candidate = cur.fetchone()
         conn.rollback()
-    assert candidate["entry_stride_minutes"] == 5
+    assert candidate["entry_stride_minutes"] == candidate["holding_horizon_minutes"]
     assert candidate["entry_anchor_minute"] == 570
     assert candidate["rule_definition_version"] == RULE_DEFINITION_VERSION
     assert candidate["discovery_net_avg_pct"] > 0
