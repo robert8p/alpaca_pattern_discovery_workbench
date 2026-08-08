@@ -1,0 +1,7 @@
+encoded_chars= 40432
+gzip_bytes= 30324 gzip_sha256= 5d9e8329f83c7626788961b1ac8d0644563454ec4f40120ae9f1b6e72369f591
+patch_bytes= 142824 patch_sha256= 096202801c868bd639ee19ead350894b76e70f3f52f266978955ce4f4455574c
+patch_head= b'diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\nindex d4c3f95..4cf8f39 100644\n--- a'
+python_status=0
+error: .github/workflows/ci.yml: No such file or directory
+git_apply_check_status=1
