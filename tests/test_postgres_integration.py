@@ -88,7 +88,7 @@ def _reset_and_seed() -> None:
 
 def test_complete_postgres_workflow():
     from app.config import get_settings
-    from app.db import close_pool, execute_schema
+    from app.db import close_pool, connection, execute_schema
     from app.discovery import RULE_DEFINITION_VERSION, run_discovery, run_sealed_evaluation
     from app.full_history import (
         freeze_candidate, run_historical_feature_backfill, run_market_state_build, run_candidate_wave_build
@@ -214,7 +214,6 @@ def test_complete_postgres_workflow():
     assert discovery_result["candidates_tested"] > 0
     assert discovery_result["candidates_retained"] > 0
 
-    from app.db import connection
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
