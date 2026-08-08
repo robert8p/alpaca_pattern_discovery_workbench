@@ -22,9 +22,9 @@ from app.db import APP_VERSION, SCHEMA_VERSION
 from app.preflight import local_sql_preflight
 from app.sql_validation import SqlBindingError, inspect_psycopg_placeholders
 
-EXPECTED_APP_VERSION = "2.3.0"
+EXPECTED_APP_VERSION = "2.5.0"
 EXPECTED_DISCOVERY_VERSION = "2.2.0"
-EXPECTED_SCHEMA_VERSION = "2.3.0"
+EXPECTED_SCHEMA_VERSION = "2.5.0"
 
 
 def audit_sql_literals() -> int:
@@ -138,6 +138,7 @@ def audit_schema() -> None:
     migration_v2 = (ROOT / "sql/migrations/2.0.0.sql").read_text(encoding="utf-8")
     migration_pack = (ROOT / "sql/migrations/2.2.0.sql").read_text(encoding="utf-8")
     migration_robustness = (ROOT / "sql/migrations/2.3.0.sql").read_text(encoding="utf-8")
+    migration_phase1 = (ROOT / "sql/migrations/2.5.0.sql").read_text(encoding="utf-8")
     v2_required = (
         "ra_discovery_samples", "ra_discovery_sample_chunks", "ra_discovery_task_chunks",
         "ra_discovery_partials", "ra_sealed_chunks", "sample_stride_minutes",
@@ -164,6 +165,20 @@ def audit_schema() -> None:
     for token in robustness_required:
         if token not in schema or token not in migration_robustness:
             raise RuntimeError(f"Robustness-v2 schema or migration is missing {token}")
+    phase1_required = (
+        "ra_full_history_backfills", "ra_full_history_backfill_partitions",
+        "ra_market_state_features", "ra_candidate_wave_stats",
+        "ra_research_campaigns", "ra_research_ledger", "ra_research_periods",
+        "ra_research_controls", "ra_jobs_research_period_guard",
+        "ra_candidate_rules_frozen_guard", "ra_research_ledger_sealed_guard",
+        "ra_ensure_market_state_partitions", "ra_ensure_candidate_wave_partitions",
+    )
+    for token in phase1_required:
+        if token not in migration_phase1:
+            raise RuntimeError(f"Phase-1 full-history migration is missing {token}")
+    db_source = (ROOT / "app/db.py").read_text(encoding="utf-8")
+    if "_apply_v250_full_history_migration(cur)" not in db_source:
+        raise RuntimeError("Fresh/live schema paths do not apply the Phase-1 migration")
     if "CREATE TABLE IF NOT EXISTS rd_" in schema:
         raise RuntimeError("Schema creates raw rd_ tables")
 
@@ -180,6 +195,7 @@ def audit_blueprint() -> None:
 def audit_research_integrity_ui() -> None:
     html = (ROOT / "app/templates/index.html").read_text(encoding="utf-8")
     javascript = (ROOT / "app/static/app.js").read_text(encoding="utf-8")
+    phase1_javascript = (ROOT / "app/static/phase1.js").read_text(encoding="utf-8")
     for token in (
         'value="dip_repair"', 'value="compression_expansion"', 'value="gap_state"',
         'value="activity_absorption"', 'value="price_efficiency"',
@@ -191,6 +207,14 @@ def audit_research_integrity_ui() -> None:
     for token in ("openRobustness", "round_trip_costs_bps", "target_feature_set_id", "campaign_name"):
         if token not in javascript:
             raise RuntimeError(f"Coverage-pack browser flow is missing {token}")
+    if '/static/phase1.js' not in html:
+        raise RuntimeError("Phase-1 browser extension is not loaded by index.html")
+    for token in ('data-view="full-history"', 'id="view-full-history"', 'id="fh-backfill-status"', 'id="fh-infrastructure-status"'):
+        if token not in phase1_javascript:
+            raise RuntimeError(f"Phase-1 Full-History UI is missing {token}")
+    for token in ("refreshFullHistory", "/api/full-history/status", "candidate-freeze", "Freeze in Research Ledger", "openFullHistoryView"):
+        if token not in phase1_javascript:
+            raise RuntimeError(f"Phase-1 browser flow is missing {token}")
 
 def audit_secrets() -> None:
     suspicious = re.compile(r"(?:eyJ[a-zA-Z0-9_-]{30,}|AKIA[0-9A-Z]{16}|postgresql://[^\s:]+:[^@\s]{12,}@)")

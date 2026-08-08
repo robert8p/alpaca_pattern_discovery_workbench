@@ -7,19 +7,26 @@ from typing import Any
 
 from app.config import get_settings
 from app.db import close_pool, connection, execute_schema
-from app.discovery import run_discovery, run_sealed_evaluation
+from app.discovery import _ensure_discovery_run, run_discovery, run_sealed_evaluation
 from app.robustness import run_robustness
 from app.features import build_feature_set
+from app.full_history import (
+    assert_candidate_frozen, record_sealed_result, register_research_campaign, run_candidate_wave_build,
+    run_historical_feature_backfill, run_market_state_build, sync_candidate_ledger,
+)
 from app.jobs import (
     JobInterrupted, claim_next_job, fail_job, finish_job, interrupt_job,
     make_worker_id, recover_stale_jobs, worker_heartbeat,
 )
-from app.models import DiscoveryConfig, FeatureBuildConfig, QualityScanConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig
+from app.models import (
+    CandidateWaveBuildConfig, DiscoveryConfig, FeatureBuildConfig, HistoricalFeatureBackfillConfig,
+    MarketStateBuildConfig, QualityScanConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
+)
 from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "2.3.0"
+VERSION = "2.5.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
@@ -50,6 +57,21 @@ def _mark_related(job: dict[str, Any], status: str) -> None:
                     cur.execute("UPDATE ra_robustness_runs SET status=%s,completed_at=CASE WHEN %s='cancelled' THEN now() ELSE completed_at END WHERE job_id=%s", (status, status, job["id"]))
                 if status == "cancelled":
                     cur.execute("UPDATE ra_robustness_chunks SET status='cancelled' WHERE robustness_run_id IN (SELECT id FROM ra_robustness_runs WHERE job_id=%s) AND status IN ('pending','running','failed')", (job["id"],))
+            elif job["job_type"] == "historical_feature_backfill":
+                cur.execute("UPDATE ra_full_history_backfills SET status=%s,latest_error=CASE WHEN %s='failed' THEN latest_error ELSE NULL END WHERE job_id=%s", (status, status, job["id"]))
+                if status == "paused":
+                    cur.execute("UPDATE ra_feature_chunks SET status='pending' WHERE feature_set_id IN (SELECT id FROM ra_feature_sets WHERE job_id=%s) AND status='running'", (job["id"],))
+                    cur.execute("UPDATE ra_feature_batches SET status='pending' WHERE feature_chunk_id IN (SELECT c.id FROM ra_feature_chunks c JOIN ra_feature_sets f ON f.id=c.feature_set_id WHERE f.job_id=%s) AND status='running'", (job["id"],))
+            elif job["job_type"] == "market_state_build":
+                if status == "paused":
+                    cur.execute("UPDATE ra_market_state_chunks SET status='pending' WHERE market_state_run_id IN (SELECT id FROM ra_market_state_runs WHERE job_id=%s) AND status='running'", (job["id"],))
+                if status in {"cancelled", "failed"}:
+                    cur.execute("UPDATE ra_market_state_runs SET status=%s WHERE job_id=%s", (status, job["id"]))
+            elif job["job_type"] == "candidate_wave_build":
+                if status == "paused":
+                    cur.execute("UPDATE ra_candidate_wave_chunks SET status='pending' WHERE candidate_wave_run_id IN (SELECT id FROM ra_candidate_wave_runs WHERE job_id=%s) AND status='running'", (job["id"],))
+                if status in {"cancelled", "failed"}:
+                    cur.execute("UPDATE ra_candidate_wave_runs SET status=%s WHERE job_id=%s", (status, job["id"]))
             elif job["job_type"] == "discovery_scan":
                 if status == "cancelled":
                     cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (job["id"],))
@@ -72,11 +94,26 @@ def _dispatch(job: dict[str, Any]) -> dict[str, Any]:
     if job["job_type"] == "feature_build":
         return build_feature_set(job_id, FeatureBuildConfig.model_validate(config))
     if job["job_type"] == "discovery_scan":
-        return run_discovery(job_id, DiscoveryConfig.model_validate(config))
+        model = DiscoveryConfig.model_validate(config)
+        run_id, _ = _ensure_discovery_run(job_id, model)
+        register_research_campaign(run_id)
+        result = run_discovery(job_id, model)
+        sync_candidate_ledger(run_id)
+        return result
     if job["job_type"] == "robustness_analysis":
         return run_robustness(job_id, RobustnessAnalysisConfig.model_validate(config))
     if job["job_type"] == "sealed_evaluation":
-        return run_sealed_evaluation(job_id, SealedEvaluationConfig.model_validate(config))
+        model = SealedEvaluationConfig.model_validate(config)
+        assert_candidate_frozen(model.candidate_id)
+        result = run_sealed_evaluation(job_id, model)
+        record_sealed_result(model.candidate_id, model.sealed_start, model.sealed_end, result)
+        return result
+    if job["job_type"] == "historical_feature_backfill":
+        return run_historical_feature_backfill(job_id, HistoricalFeatureBackfillConfig.model_validate(config))
+    if job["job_type"] == "market_state_build":
+        return run_market_state_build(job_id, MarketStateBuildConfig.model_validate(config))
+    if job["job_type"] == "candidate_wave_build":
+        return run_candidate_wave_build(job_id, CandidateWaveBuildConfig.model_validate(config))
     raise ValueError(f"Unsupported job type: {job['job_type']}")
 
 

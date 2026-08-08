@@ -24,7 +24,9 @@ def _reset_and_seed() -> None:
                 CREATE TABLE rd_assets (
                     symbol text PRIMARY KEY,
                     exchange text,
-                    name text
+                    name text,
+                    attributes jsonb,
+                    raw jsonb
                 );
                 CREATE TABLE rd_bars (
                     symbol text NOT NULL,
@@ -56,12 +58,14 @@ def _reset_and_seed() -> None:
                 WITH trading_days AS (
                     SELECT d::date AS trade_date,
                            dense_rank() OVER (ORDER BY d)::integer AS day_number
-                    FROM generate_series('2026-06-01'::date,'2026-07-10'::date,interval '1 day') d
+                    FROM generate_series('2026-06-01'::date,'2026-08-14'::date,interval '1 day') d
                     WHERE extract(isodow FROM d) BETWEEN 1 AND 5
                 ), symbols(symbol,base_price) AS (
                     VALUES ('AAA'::text,100.0::double precision),
                            ('BBB'::text,60.0::double precision),
-                           ('CCC'::text,30.0::double precision)
+                           ('CCC'::text,30.0::double precision),
+                           ('SPY'::text,500.0::double precision),
+                           ('QQQ'::text,450.0::double precision)
                 ), bars AS (
                     SELECT s.symbol,t.trade_date,t.day_number,g.minute_number,
                         ((t.trade_date + time '09:30' + g.minute_number*interval '1 minute')
@@ -86,10 +90,16 @@ def test_complete_postgres_workflow():
     from app.config import get_settings
     from app.db import close_pool, execute_schema
     from app.discovery import RULE_DEFINITION_VERSION, run_discovery, run_sealed_evaluation
+    from app.full_history import (
+        freeze_candidate, run_historical_feature_backfill, run_market_state_build, run_candidate_wave_build
+    )
     from app.robustness import run_robustness
     from app.features import build_feature_set
     from app.jobs import create_job
-    from app.models import DiscoveryConfig, FeatureBuildConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig
+    from app.models import (
+        CandidateWaveBuildConfig, DiscoveryConfig, FeatureBuildConfig, HistoricalFeatureBackfillConfig,
+        MarketStateBuildConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
+    )
     from app.preflight import database_sql_preflight
     from app.universe import build_universe
 
@@ -101,7 +111,7 @@ def test_complete_postgres_workflow():
 
     universe_config = UniverseBuildConfig(
         name="Synthetic liquid universe",
-        start_date="2026-06-01", end_date="2026-07-10",
+        start_date="2026-06-01", end_date="2026-08-14",
         timeframe="1Min", feed="sip", adjustment="raw", session="regular",
         minimum_trading_days=10,
         minimum_average_bars_per_day=300,
@@ -117,7 +127,7 @@ def test_complete_postgres_workflow():
     feature_config = FeatureBuildConfig(
         name="Synthetic features",
         universe_run_id=universe_result["universe_run_id"],
-        start_date="2026-06-01", end_date="2026-07-10",
+        start_date="2026-06-01", end_date="2026-08-14",
         timeframe="1Min", feed="sip", adjustment="raw", session="regular",
         liquidity_tiers=["A", "B", "C", "D"],
         date_chunk_days=10,
@@ -130,6 +140,52 @@ def test_complete_postgres_workflow():
     feature_result = build_feature_set(str(feature_job["id"]), feature_config)
     assert feature_result["rows"] > 30_000
     assert feature_result["symbols"] == 3
+
+    # Phase 1 one-day backfill plumbing uses the unchanged feature pipeline and is idempotent.
+    one_day_cfg = HistoricalFeatureBackfillConfig(
+        name="Synthetic one-day historical feature backfill",
+        reference_feature_set_id=feature_result["feature_set_id"],
+        start_date="2026-06-02", end_date="2026-06-02", scope="one_day_test",
+    )
+    one_day_job = create_job("historical_feature_backfill", one_day_cfg.name, one_day_cfg.model_dump(mode="json"))
+    one_day_first = run_historical_feature_backfill(str(one_day_job["id"]), one_day_cfg)
+    one_day_second = run_historical_feature_backfill(str(one_day_job["id"]), one_day_cfg)
+    assert one_day_first["rows"] == one_day_second["rows"] > 0
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*) rows, count(DISTINCT (symbol,bar_ts)) distinct_rows
+                FROM ra_intraday_features WHERE feature_set_id=%s
+                """,
+                (one_day_first["feature_set_id"],),
+            )
+            dedupe = cur.fetchone()
+            assert dedupe["rows"] == dedupe["distinct_rows"]
+        conn.rollback()
+
+    market_cfg = MarketStateBuildConfig(
+        name="Synthetic market state", feature_set_id=feature_result["feature_set_id"],
+        start_date="2026-06-08", end_date="2026-06-08", sample_stride_minutes=5,
+    )
+    market_job = create_job("market_state_build", market_cfg.name, market_cfg.model_dump(mode="json"))
+    market_result = run_market_state_build(str(market_job["id"]), market_cfg)
+    assert market_result["rows"] > 0
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*) rows,count(DISTINCT bar_ts) unique_ts,
+                       count(*) FILTER (WHERE spy_return_5m_pct IS NOT NULL) spy_ready,
+                       count(*) FILTER (WHERE qqq_return_5m_pct IS NOT NULL) qqq_ready
+                FROM ra_market_state_features WHERE market_state_run_id=%s
+                """,
+                (market_result["market_state_run_id"],),
+            )
+            ms = cur.fetchone()
+            assert ms["rows"] == ms["unique_ts"]
+            assert ms["spy_ready"] > 0 and ms["qqq_ready"] > 0
+        conn.rollback()
 
     preflight = database_sql_preflight(force=True, exhaustive=True)
     assert preflight["ok"] is True
@@ -178,6 +234,46 @@ def test_complete_postgres_workflow():
     assert candidate["rule_definition_version"] == RULE_DEFINITION_VERSION
     assert candidate["discovery_net_avg_pct"] > 0
 
+    wave_cfg = CandidateWaveBuildConfig(
+        name="Synthetic generic candidate wave", candidate_id=candidate["id"],
+        start_date="2026-06-08", end_date="2026-06-08",
+        signal_strength_field="ret_5m_pct", elevated_wave_threshold_pct=1.0,
+    )
+    wave_job = create_job("candidate_wave_build", wave_cfg.name, wave_cfg.model_dump(mode="json"))
+    wave_result = run_candidate_wave_build(str(wave_job["id"]), wave_cfg)
+    assert wave_result["rows"] > 0
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) rows,count(DISTINCT bar_ts) unique_ts FROM ra_candidate_wave_stats WHERE candidate_wave_run_id=%s",
+                (wave_result["candidate_wave_run_id"],),
+            )
+            wave = cur.fetchone()
+            assert wave["rows"] == wave["unique_ts"]
+        conn.rollback()
+
+    # Database-level guards remain effective even when application validation is bypassed.
+    import psycopg
+    from psycopg.types.json import Jsonb
+    with connection() as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(psycopg.Error, match="sealed holdout"):
+                cur.execute(
+                    "INSERT INTO ra_jobs(job_type,name,config) VALUES ('discovery_scan','illegal sealed discovery',%s)",
+                    (Jsonb({"discovery_end":"2026-08-03","validation_end":"2026-08-04"}),),
+                )
+        conn.rollback()
+    with pytest.raises(Exception, match="locked in Phase 1"):
+        create_job(
+            "historical_feature_backfill", "illegal full history",
+            {**one_day_cfg.model_dump(mode="json"), "scope":"full_history"},
+        )
+    with pytest.raises(Exception, match="frozen"):
+        create_job(
+            "sealed_evaluation", "illegal unfrozen sealed",
+            {"candidate_id":str(candidate["id"]),"sealed_start":"2026-08-04","sealed_end":"2026-08-05"},
+        )
+
     robustness_config = RobustnessAnalysisConfig(
         candidate_id=candidate["id"], mode="development",
         start_date="2026-06-08", end_date="2026-06-30",
@@ -188,9 +284,10 @@ def test_complete_postgres_workflow():
     assert robustness_result["summary"]["base"]["observations"] > 0
     assert robustness_result["verdict"] in {"REJECT","WEAK","PROMISING"}
 
+    freeze_candidate(candidate["id"], "Synthetic integration freeze")
     sealed_config = SealedEvaluationConfig(
         candidate_id=candidate["id"],
-        sealed_start="2026-07-01", sealed_end="2026-07-10",
+        sealed_start="2026-08-04", sealed_end="2026-08-14",
     )
     sealed_job = create_job("sealed_evaluation", "Synthetic sealed", sealed_config.model_dump(mode="json"))
     sealed_result = run_sealed_evaluation(str(sealed_job["id"]), sealed_config)
@@ -199,7 +296,7 @@ def test_complete_postgres_workflow():
     close_pool()
 
 
-def test_upgrade_from_v211_schema_to_v230():
+def test_upgrade_from_v211_schema_to_v250():
     """Exercise the real production upgrade path from the last shipped schema."""
     import psycopg
     from pathlib import Path
@@ -219,8 +316,8 @@ def test_upgrade_from_v211_schema_to_v230():
     execute_schema()
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.3.0'")
-            assert cur.fetchone()["app_version"] == "2.3.0"
+            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.5.0'")
+            assert cur.fetchone()["app_version"] == "2.5.0"
             cur.execute("SELECT to_regclass('public.ra_robustness_runs') AS runs,to_regclass('public.ra_robustness_observations') AS observations,to_regclass('public.ra_robustness_results') AS results")
             row=cur.fetchone()
             assert row['runs'] and row['observations'] and row['results']
@@ -231,7 +328,7 @@ def test_upgrade_from_v211_schema_to_v230():
     close_pool()
 
 
-def test_upgrade_from_v220_schema_to_v230():
+def test_upgrade_from_v220_schema_to_v250():
     import psycopg
     from pathlib import Path
     from app.config import get_settings
@@ -250,8 +347,8 @@ def test_upgrade_from_v220_schema_to_v230():
     execute_schema()
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.3.0'")
-            assert cur.fetchone()["app_version"] == "2.3.0"
+            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.5.0'")
+            assert cur.fetchone()["app_version"] == "2.5.0"
             cur.execute("SELECT to_regclass('public.ra_robustness_chunks') AS chunks,to_regclass('public.ra_robustness_samples') AS samples")
             row=cur.fetchone()
             assert row["chunks"] and row["samples"]

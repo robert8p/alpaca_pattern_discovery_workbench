@@ -12,6 +12,10 @@ Feed = Literal["sip", "iex", "boats", "otc"]
 Adjustment = Literal["raw", "split", "dividend", "all"]
 Session = Literal["regular", "premarket", "postmarket", "overnight", "all"]
 
+SEALED_START_DATE = date(2026, 8, 4)
+HISTORY_START_DATE = date(2025, 5, 4)
+PRESEALED_END_DATE = date(2026, 8, 3)
+
 
 class SourceSelection(BaseModel):
     start_date: date
@@ -137,6 +141,9 @@ class DiscoveryConfig(BaseModel):
                 raise ValueError("Validation must begin after the discovery period")
         if not self.directions or not self.holding_horizons_minutes or not self.families:
             raise ValueError("Select at least one direction, holding horizon and discovery family")
+        latest = self.validation_end or self.discovery_end
+        if latest >= SEALED_START_DATE:
+            raise ValueError(f"Discovery and validation must end before the true sealed holdout begins on {SEALED_START_DATE}")
         return self
 
 
@@ -150,6 +157,8 @@ class SealedEvaluationConfig(BaseModel):
     def dates_are_valid(self):
         if self.sealed_end < self.sealed_start:
             raise ValueError("Sealed end must be on or after sealed start")
+        if self.sealed_start < SEALED_START_DATE:
+            raise ValueError(f"True sealed evaluation may not begin before {SEALED_START_DATE}")
         return self
 
 
@@ -187,10 +196,77 @@ class RobustnessAnalysisConfig(BaseModel):
             raise ValueError("Provide both robustness dates or neither")
         if self.start_date and self.end_date and self.end_date < self.start_date:
             raise ValueError("Robustness end date must be on or after start date")
+        if self.end_date and self.end_date >= SEALED_START_DATE:
+            raise ValueError(f"Robustness/research confirmation may not include the sealed holdout beginning {SEALED_START_DATE}")
         return self
 
+
+class HistoricalFeatureBackfillConfig(BaseModel):
+    name: str = Field(default="Full-history engineered features", min_length=3, max_length=120)
+    reference_feature_set_id: UUID
+    start_date: date = HISTORY_START_DATE
+    end_date: date = PRESEALED_END_DATE
+    scope: Literal["one_day_test", "full_history"] = "one_day_test"
+
+    @model_validator(mode="after")
+    def fixed_phase1_scope(self):
+        if self.start_date < HISTORY_START_DATE:
+            raise ValueError(f"Historical backfill may not begin before {HISTORY_START_DATE}")
+        if self.end_date < self.start_date:
+            raise ValueError("Historical backfill end must be on or after start")
+        if self.end_date >= SEALED_START_DATE:
+            raise ValueError(f"Phase 1 historical backfill may not include the sealed holdout beginning {SEALED_START_DATE}")
+        if self.scope == "one_day_test" and self.start_date != self.end_date:
+            raise ValueError("A one-day backfill test must use the same start and end date")
+        return self
+
+
+class MarketStateBuildConfig(BaseModel):
+    name: str = Field(default="Point-in-time market state", min_length=3, max_length=120)
+    feature_set_id: UUID
+    start_date: date
+    end_date: date
+    sample_stride_minutes: int = Field(default=1, ge=1, le=60)
+
+    @model_validator(mode="after")
+    def presealed_only(self):
+        if self.end_date < self.start_date:
+            raise ValueError("Market-state end must be on or after start")
+        if self.end_date >= SEALED_START_DATE:
+            raise ValueError(f"Phase 1 market-state research may not include the sealed holdout beginning {SEALED_START_DATE}")
+        return self
+
+
+class CandidateWaveBuildConfig(BaseModel):
+    name: str = Field(default="Candidate wave statistics", min_length=3, max_length=120)
+    candidate_id: UUID
+    start_date: date
+    end_date: date
+    elevated_wave_threshold_pct: float = Field(default=1.0, ge=0.01, le=100.0)
+    signal_strength_field: Literal[
+        "ret_1m_pct", "ret_5m_pct", "ret_15m_pct", "ret_30m_pct", "ret_60m_pct",
+        "relative_volume_20bar", "relative_trade_count_20bar", "activity_impact_change_ratio",
+        "distance_from_cumulative_vwap_pct", "cumulative_range_position"
+    ] | None = None
+
+    @model_validator(mode="after")
+    def presealed_only(self):
+        if self.end_date < self.start_date:
+            raise ValueError("Candidate-wave end must be on or after start")
+        if self.end_date >= SEALED_START_DATE:
+            raise ValueError(f"Candidate-wave research may not include the sealed holdout beginning {SEALED_START_DATE}")
+        return self
+
+
+class CandidateFreezeRequest(BaseModel):
+    notes: str | None = Field(default=None, max_length=4000)
+
+
 class JobCreateRequest(BaseModel):
-    job_type: Literal["quality_scan", "universe_build", "feature_build", "discovery_scan", "robustness_analysis", "sealed_evaluation"]
+    job_type: Literal[
+        "quality_scan", "universe_build", "feature_build", "discovery_scan", "robustness_analysis", "sealed_evaluation",
+        "historical_feature_backfill", "market_state_build", "candidate_wave_build"
+    ]
     config: dict
 
 
