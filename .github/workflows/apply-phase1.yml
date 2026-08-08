@@ -22,16 +22,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat \
-            .phase1/patch-00.b64 \
-            .phase1/patch-01.b64 \
-            .phase1/patch-02.b64 \
-            .phase1/patch-03a.b64 \
-            .phase1/patch-03b.b64 \
-            .phase1/patch-03c.b64 \
-            .phase1/patch-04a.b64 \
-            .phase1/patch-05b.b64 \
-            | base64 --decode | gzip -dc > /tmp/phase1.patch
+          python - <<'PY'
+          import base64, gzip
+          from pathlib import Path
+          names = [
+              'patch-00.b64','patch-01.b64','patch-02.b64','patch-03a.b64',
+              'patch-03b.b64','patch-03c.b64','patch-04a.b64','patch-05b.b64'
+          ]
+          encoded = ''.join((Path('.phase1') / name).read_text() for name in names)
+          print('encoded_chars=', len(encoded))
+          raw = base64.b64decode(encoded, validate=True)
+          print('gzip_bytes=', len(raw))
+          patch = gzip.decompress(raw)
+          print('patch_bytes=', len(patch))
+          Path('/tmp/phase1.patch').write_bytes(patch)
+          PY
           git apply --check /tmp/phase1.patch
           git apply /tmp/phase1.patch
           rm -rf .phase1
