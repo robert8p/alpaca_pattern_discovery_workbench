@@ -1,0 +1,39 @@
+name: fix-phase1-stride-test
+on:
+  push:
+    branches: [phase1-full-history-v2.5.0]
+    paths: ['.github/workflows/fix-phase1-stride-test.yml']
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase1-full-history-v2.5.0
+      - name: Fix non-overlapping stride invariant assertion
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('tests/test_postgres_integration.py')
+          s=p.read_text()
+          old='SELECT id,entry_stride_minutes,entry_anchor_minute,rule_definition_version,\n                       discovery_net_avg_pct,validation_net_avg_pct'
+          new='SELECT id,holding_horizon_minutes,entry_stride_minutes,entry_anchor_minute,rule_definition_version,\n                       discovery_net_avg_pct,validation_net_avg_pct'
+          if old not in s:
+              raise SystemExit('expected candidate SELECT not found')
+          s=s.replace(old,new,1)
+          old_assert='assert candidate["entry_stride_minutes"] == 5'
+          new_assert='assert candidate["entry_stride_minutes"] == candidate["holding_horizon_minutes"]'
+          if old_assert not in s:
+              raise SystemExit('expected stride assertion not found')
+          s=s.replace(old_assert,new_assert,1)
+          p.write_text(s)
+          PY
+          git config user.name 'Phase 1 Research Builder'
+          git config user.email 'phase1-research-builder@users.noreply.github.com'
+          git add tests/test_postgres_integration.py
+          git commit -m 'Test actual non-overlapping stride invariant'
+          git push origin HEAD:phase1-full-history-v2.5.0
