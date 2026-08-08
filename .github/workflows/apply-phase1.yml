@@ -18,26 +18,22 @@ jobs:
         with:
           ref: phase1-full-history-v2.5.0
           fetch-depth: 0
-      - name: Apply audited Phase 1 source patch
+      - name: Apply fresh-schema compatibility fix
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import base64, gzip, hashlib
           from pathlib import Path
-          names = [
-              'patch-00.b64','patch-01.b64','patch-02.b64','patch-03a.b64',
-              'patch-03b.b64','patch-03c.b64','patch-04a.b64','patch-05b.b64'
-          ]
-          encoded = ''.join((Path('.phase1') / name).read_text() for name in names)
-          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '096202801c868bd639ee19ead350894b76e70f3f52f266978955ce4f4455574c'
-          Path('/tmp/phase1.patch').write_bytes(patch)
+          p = Path('app/db.py')
+          s = p.read_text()
+          old = "conrelid='public.ra_jobs'::regclass"
+          new = "conrelid=to_regclass('public.ra_jobs')"
+          if old not in s:
+              raise SystemExit('expected fresh-schema probe pattern not found')
+          p.write_text(s.replace(old, new))
           PY
-          git apply --check --exclude=.github/workflows/ci.yml /tmp/phase1.patch
-          git apply --exclude=.github/workflows/ci.yml /tmp/phase1.patch
           git config user.name 'Phase 1 Research Builder'
           git config user.email 'phase1-research-builder@users.noreply.github.com'
-          git add app scripts sql tests
-          git commit -m 'Implement Phase 1 full-history clustered discovery infrastructure'
+          git add app/db.py
+          git commit -m 'Harden fresh-schema compatibility probe'
           git push origin HEAD:phase1-full-history-v2.5.0
