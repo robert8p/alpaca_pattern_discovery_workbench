@@ -19,14 +19,16 @@ from app.db import close_pool, connection, database_diagnostics, database_target
 from app.features import estimate_feature_build
 from app.exports import build_candidate_export_bundle, export_filename
 from app.jobs import create_job
+from app.full_history import assert_candidate_frozen, freeze_candidate, full_history_status
 from app.preflight import database_sql_preflight, local_sql_preflight
 from app.models import (
-    DiscoveryConfig, FeatureBuildConfig, FeatureEstimateRequest, JobCreateRequest,
-    QualityScanConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
+    CandidateFreezeRequest, CandidateWaveBuildConfig, DiscoveryConfig, FeatureBuildConfig, FeatureEstimateRequest,
+    HistoricalFeatureBackfillConfig, JobCreateRequest, MarketStateBuildConfig, QualityScanConfig,
+    RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
 )
 from app.utils import json_safe
 
-VERSION = "2.3.0"
+VERSION = "2.5.0"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -156,9 +158,12 @@ def queue_job(payload: JobCreateRequest, _: str = Depends(require_auth)) -> dict
         "discovery_scan": DiscoveryConfig,
         "robustness_analysis": RobustnessAnalysisConfig,
         "sealed_evaluation": SealedEvaluationConfig,
+        "historical_feature_backfill": HistoricalFeatureBackfillConfig,
+        "market_state_build": MarketStateBuildConfig,
+        "candidate_wave_build": CandidateWaveBuildConfig,
     }
     model = validators[payload.job_type].model_validate(payload.config)
-    if payload.job_type in {"discovery_scan", "robustness_analysis", "sealed_evaluation"}:
+    if payload.job_type in {"discovery_scan", "robustness_analysis", "sealed_evaluation", "market_state_build", "candidate_wave_build"}:
         try:
             database_sql_preflight()
         except Exception as exc:
@@ -440,13 +445,19 @@ def candidates(discovery_run_id: str | None = None, status_filter: str | None = 
             cur.execute(f"""
                 SELECT c.*,rr.id AS robustness_run_id,rr.verdict AS robustness_verdict,rr.summary AS robustness_summary,
                        rr.mode AS robustness_mode,rr.target_feature_set_id AS robustness_target_feature_set_id,
-                       rr.completed_at AS robustness_completed_at
+                       rr.completed_at AS robustness_completed_at,
+                       rl.candidate_freeze_timestamp AS research_freeze_timestamp,rl.frozen_candidate_hash AS research_frozen_hash
                 FROM ra_candidate_rules c
                 LEFT JOIN LATERAL (
                     SELECT * FROM ra_robustness_runs r
                     WHERE r.candidate_id=c.id AND r.status='completed'
                     ORDER BY r.completed_at DESC NULLS LAST,r.created_at DESC LIMIT 1
                 ) rr ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT candidate_freeze_timestamp,frozen_candidate_hash FROM ra_research_ledger l
+                    WHERE l.candidate_id=c.id AND l.candidate_freeze_timestamp IS NOT NULL
+                    ORDER BY l.candidate_freeze_timestamp DESC LIMIT 1
+                ) rl ON TRUE
                 WHERE {where_sql}
                 ORDER BY c.rank_score DESC NULLS LAST,c.created_at DESC LIMIT %s
             """, tuple(params))
@@ -611,9 +622,47 @@ def discovery_coverage(_: str = Depends(require_auth)) -> dict[str, Any]:
     }
 
 
+@app.get("/api/full-history/status")
+def get_full_history_status(_: str = Depends(require_auth)) -> dict[str, Any]:
+    return full_history_status()
+
+
+@app.get("/api/research-ledger")
+def get_research_ledger(limit: int = 200, _: str = Depends(require_auth)) -> list[dict[str, Any]]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id,campaign_id,campaign_name,discovery_run_id,feature_set_id,universe_id,engine_version,code_rule_version,
+                    candidate_family,candidate_id,discovery_start,discovery_end,validation_start,validation_end,
+                    research_confirmation_start,research_confirmation_end,sealed_test_start,sealed_test_end,
+                    number_candidates_tested,candidate_retention_status,candidate_freeze_timestamp,frozen_candidate_hash,
+                    classification,notes,failure_reason,created_at,updated_at,
+                    CASE WHEN sealed_test_result IS NULL THEN false ELSE true END AS sealed_result_recorded
+                FROM ra_research_ledger ORDER BY created_at DESC LIMIT %s
+                """,
+                (min(max(limit,1),1000),),
+            )
+            rows = cur.fetchall()
+        conn.rollback()
+    return json_safe(rows)
+
+
+@app.post("/api/research-ledger/candidates/{candidate_id}/freeze")
+def freeze_research_candidate(candidate_id: str, payload: CandidateFreezeRequest, _: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        return freeze_candidate(parse_uuid(candidate_id), payload.notes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/candidates/{candidate_id}/sealed", status_code=201)
 def queue_sealed(candidate_id: str, payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
     config = SealedEvaluationConfig.model_validate({"candidate_id": parse_uuid(candidate_id), **payload})
+    try:
+        assert_candidate_frozen(config.candidate_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return json_safe(create_job("sealed_evaluation", f"Sealed evaluation · {str(config.candidate_id)[:8]}", config.model_dump(mode="json")))
 
 
