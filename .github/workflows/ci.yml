@@ -47,6 +47,21 @@ jobs:
       - name: JavaScript syntax
         run: node --check app/static/app.js && node --check app/static/phase1.js
       - name: Unit and PostgreSQL integration tests
-        run: pytest -q
+        id: pytest
+        shell: bash
+        run: |
+          set +e
+          pytest -q 2>&1 | tee pytest.log
+          status=${PIPESTATUS[0]}
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+      - name: Upload pytest diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-diagnostics
+          path: pytest.log
+          if-no-files-found: error
       - name: Release audit
+        if: steps.pytest.outcome == 'success'
         run: python scripts/release_audit.py
