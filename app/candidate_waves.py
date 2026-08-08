@@ -141,8 +141,8 @@ def run_candidate_wave_build(job_id: str, config: CandidateWaveBuildConfig) -> d
                                 run_id, config.candidate_id, candidate["feature_set_id"], r["bar_ts"], r["trade_date"], r["eligible_universe_count"],
                                 r["qualifying_stock_count"], r["qualifying_stock_pct"], r["tier_a_count"], r["tier_b_count"], r["tier_c_count"],
                                 r.get("average_signal_strength"), r.get("median_signal_strength"), r.get("maximum_signal_strength"), r.get("signal_strength_dispersion"),
-                                config.signal_strength_field or "not_defined", r.get("exchange_concentration"), r.get("largest_exchange_share_pct"),
-                                r.get("sector_concentration"), r.get("largest_sector_share_pct"), prev, change, pct_change,
+                                config.signal_strength_field or "not_defined", Jsonb(r["exchange_concentration"]) if r.get("exchange_concentration") is not None else None, r.get("largest_exchange_share_pct"),
+                                Jsonb(r["sector_concentration"]) if r.get("sector_concentration") is not None else None, r.get("largest_sector_share_pct"), prev, change, pct_change,
                                 r.get("consecutive_elevated") or 0, config.elevated_wave_threshold_pct,
                             ),
                         )
