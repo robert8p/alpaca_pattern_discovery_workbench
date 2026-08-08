@@ -21,57 +21,81 @@ jobs:
       - name: Reassemble and apply audited Phase 1 patch
         shell: bash
         run: |
-          set +e
-          mkdir -p .phase1
-          : > .phase1/diagnostic.txt
-          python - <<'PY' >> .phase1/diagnostic.txt 2>&1
-          import base64, gzip, hashlib, traceback
+          set -euo pipefail
+          python - <<'PY'
+          import base64, gzip, hashlib
           from pathlib import Path
           names = [
               'patch-00.b64','patch-01.b64','patch-02.b64','patch-03a.b64',
               'patch-03b.b64','patch-03c.b64','patch-04a.b64','patch-05b.b64'
           ]
-          try:
-              encoded = ''.join((Path('.phase1') / name).read_text() for name in names)
-              print('encoded_chars=', len(encoded))
-              raw = base64.b64decode(encoded, validate=True)
-              print('gzip_bytes=', len(raw), 'gzip_sha256=', hashlib.sha256(raw).hexdigest())
-              patch = gzip.decompress(raw)
-              print('patch_bytes=', len(patch), 'patch_sha256=', hashlib.sha256(patch).hexdigest())
-              print('patch_head=', repr(patch[:100]))
-              Path('/tmp/phase1.patch').write_bytes(patch)
-          except Exception:
-              traceback.print_exc()
-              raise
+          encoded = ''.join((Path('.phase1') / name).read_text() for name in names)
+          raw = base64.b64decode(encoded, validate=True)
+          patch = gzip.decompress(raw)
+          assert hashlib.sha256(patch).hexdigest() == '096202801c868bd639ee19ead350894b76e70f3f52f266978955ce4f4455574c'
+          Path('/tmp/phase1.patch').write_bytes(patch)
           PY
-          py_status=$?
-          echo "python_status=$py_status" >> .phase1/diagnostic.txt
-          if [ "$py_status" -eq 0 ]; then
-            git apply --check /tmp/phase1.patch >> .phase1/diagnostic.txt 2>&1
-            check_status=$?
-          else
-            check_status=99
-          fi
-          echo "git_apply_check_status=$check_status" >> .phase1/diagnostic.txt
-          git config user.name 'Phase 1 Research Builder'
-          git config user.email 'phase1-research-builder@users.noreply.github.com'
-          if [ "$check_status" -ne 0 ]; then
-            git add .phase1/diagnostic.txt
-            git commit -m 'Record Phase 1 patch diagnostic'
-            git push origin HEAD:phase1-full-history-v2.5.0
-            exit 1
-          fi
-          git apply /tmp/phase1.patch
-          apply_status=$?
-          echo "git_apply_status=$apply_status" >> .phase1/diagnostic.txt
-          if [ "$apply_status" -ne 0 ]; then
-            git add .phase1/diagnostic.txt
-            git commit -m 'Record Phase 1 patch diagnostic'
-            git push origin HEAD:phase1-full-history-v2.5.0
-            exit 1
-          fi
+          git apply --check --exclude=.github/workflows/ci.yml /tmp/phase1.patch
+          git apply --exclude=.github/workflows/ci.yml /tmp/phase1.patch
+          mkdir -p .github/workflows
+          cat > .github/workflows/ci.yml <<'YAML'
+          name: release-gate
+
+          on:
+            push:
+            pull_request:
+            workflow_dispatch:
+
+          jobs:
+            test:
+              runs-on: ubuntu-latest
+              services:
+                postgres:
+                  image: postgres:16
+                  env:
+                    POSTGRES_USER: postgres
+                    POSTGRES_PASSWORD: postgres
+                    POSTGRES_DB: pdw_test
+                  ports:
+                    - 5432:5432
+                  options: >-
+                    --health-cmd "pg_isready -U postgres -d pdw_test"
+                    --health-interval 5s
+                    --health-timeout 5s
+                    --health-retries 20
+              env:
+                DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pdw_test
+                TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/pdw_test
+                RUN_POSTGRES_INTEGRATION: "1"
+                APP_PASSWORD: ci-password
+                AUTO_MIGRATE: "true"
+                DATABASE_STATEMENT_TIMEOUT_SECONDS: "120"
+                FEATURE_BATCH_WALL_TIMEOUT_SECONDS: "150"
+                DISCOVERY_STATEMENT_TIMEOUT_SECONDS: "60"
+                DISCOVERY_WALL_TIMEOUT_SECONDS: "75"
+                ROBUSTNESS_INITIAL_SYMBOL_SHARDS: "1"
+                ROBUSTNESS_QUERY_RETRIES: "2"
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: "3.12.7"
+                    cache: pip
+                - name: Install dependencies
+                  run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+                - name: Python compile
+                  run: python -m compileall -q app scripts tests
+                - name: JavaScript syntax
+                  run: node --check app/static/app.js && node --check app/static/phase1.js
+                - name: Unit and PostgreSQL integration tests
+                  run: pytest -q
+                - name: Release audit
+                  run: python scripts/release_audit.py
+          YAML
           rm -rf .phase1
           rm -f .github/workflows/apply-phase1.yml
+          git config user.name 'Phase 1 Research Builder'
+          git config user.email 'phase1-research-builder@users.noreply.github.com'
           git add -A
           git commit -m 'Implement Phase 1 full-history clustered discovery infrastructure'
           git push origin HEAD:phase1-full-history-v2.5.0
