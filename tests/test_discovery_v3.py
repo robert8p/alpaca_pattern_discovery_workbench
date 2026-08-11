@@ -73,12 +73,21 @@ def test_blank_canvas_families_are_appended_without_directional_hypotheses():
         discovery_start=date(2026, 6, 1),
         discovery_end=date(2026, 6, 30),
     )
-    _configure()
-    augmented = _augment_config(config)
-    for family_name in BLANK_CANVAS_FAMILIES:
-        assert family_name in augmented.families
-        spec = base_discovery.FAMILIES[family_name]
-        assert spec["filter"] == "TRUE"
-        assert spec["constraints"] == []
-        assert spec["hypothesis_ids"] == []
-        assert spec["coverage"] == "HYPOTHESIS_FREE_GRID"
+    original_families = dict(base_discovery.FAMILIES)
+    original_discovery_version = base_discovery.DISCOVERY_VERSION
+    original_campaign_version = base_discovery.CAMPAIGN_DEFINITION_VERSION
+    try:
+        _configure()
+        augmented = _augment_config(config)
+        for family_name in BLANK_CANVAS_FAMILIES:
+            assert family_name in augmented.families
+            spec = base_discovery.FAMILIES[family_name]
+            assert spec["filter"] == "TRUE"
+            assert spec["constraints"] == []
+            assert spec["hypothesis_ids"] == []
+            assert spec["coverage"] == "HYPOTHESIS_FREE_GRID"
+    finally:
+        base_discovery.FAMILIES.clear()
+        base_discovery.FAMILIES.update(original_families)
+        base_discovery.DISCOVERY_VERSION = original_discovery_version
+        base_discovery.CAMPAIGN_DEFINITION_VERSION = original_campaign_version
