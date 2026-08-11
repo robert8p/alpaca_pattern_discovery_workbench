@@ -9,6 +9,20 @@ from app.utils import finite_or_none
 
 DISCOVERY_VERSION = "2.3.0-whole-economics-screen"
 CAMPAIGN_DEFINITION_VERSION = "2026-08-research-integrity-pack2-whole-economics"
+BLANK_CANVAS_VERSION = "blank-canvas-state-lattice-v1"
+
+# These families do not encode a predicted direction or a named trading thesis.
+# They systematically cross observable point-in-time state dimensions and allow
+# the engine to evaluate both long/short and every configured horizon. The grid
+# is intentionally finite so multiple-testing burden remains measurable.
+BLANK_CANVAS_FAMILIES: dict[str, list[Any]] = {
+    "blank_canvas_price_activity": [base.RET5, base.RET30, base.RVOL],
+    "blank_canvas_location_liquidity": [base.VWAP_SIDE, base.RANGE_POS, base.RVOL],
+    "blank_canvas_state_change": [base.RVOL_CHANGE, base.RTCOUNT_CHANGE, base.IMPACT_CHANGE],
+    "blank_canvas_range_volatility": [base.RANGE_RATIO, base.VOL_RATIO, base.RVOL],
+    "blank_canvas_temporal_state": [base.TIME, base.WEEKDAY, base.RET5],
+    "blank_canvas_gap_prior_state": [base.GAP, base.PREV_DAY, base.RVOL],
+}
 
 
 def economic_rank_score(discovery: dict[str, Any], validation: dict[str, Any] | None) -> float:
@@ -34,7 +48,7 @@ def economic_rank_score(discovery: dict[str, Any], validation: dict[str, Any] | 
     concentration = max(0.05, 1.0 - float(discovery.get("max_symbol_share_pct") or 100.0) / 100.0)
     concentration *= max(0.05, 1.0 - float(discovery.get("max_date_share_pct") or 100.0) / 100.0)
 
-    # No component uses win_rate_pct. A 40% winner-rate strategy with strong
+    # No component uses win_rate_pct. A lower-hit-rate strategy with strong
     # expectancy/payoff can outrank a higher-hit-rate but fragile strategy.
     payoff_factor = math.sqrt(min(4.0, max(0.25, profit_factor)))
     median_factor = 1.0 + 0.20 * math.tanh(median / max(abs(d_net), 0.10))
@@ -74,10 +88,37 @@ def economic_rank_score(discovery: dict[str, Any], validation: dict[str, Any] | 
     return finite_or_none(score) or 0.0
 
 
+def _install_blank_canvas_families() -> None:
+    for family_name, dimensions in BLANK_CANVAS_FAMILIES.items():
+        base.FAMILIES[family_name] = {
+            "hypothesis_ids": [],
+            "hypothesis_version": BLANK_CANVAS_VERSION,
+            "coverage": "HYPOTHESIS_FREE_GRID",
+            "dimensions": dimensions,
+            "filter": "TRUE",
+            "constraints": [],
+            "constraint_descriptions": [],
+        }
+
+
+def _augment_config(config: DiscoveryConfig) -> DiscoveryConfig:
+    augmented = config.model_copy(deep=True)
+    requested = list(augmented.families)
+    for family_name in BLANK_CANVAS_FAMILIES:
+        if family_name not in requested:
+            requested.append(family_name)
+    # DiscoveryConfig uses a closed Literal list at the API boundary to preserve
+    # backwards compatibility. Internally, these versioned engine-owned family
+    # names are appended after successful validation and persisted in the run.
+    augmented.families = requested  # type: ignore[assignment]
+    return augmented
+
+
 def _configure() -> None:
     # The base discovery module owns the mature chunking/query engine. Override
-    # only its ranking objective/version so the operationally hardened engine is
-    # retained while candidate ordering follows whole-strategy economics.
+    # only its ranking objective/version and add engine-owned hypothesis-free
+    # grids, preserving the hardened chunking, retry and multiple-testing logic.
+    _install_blank_canvas_families()
     base._rank_score = economic_rank_score
     base.DISCOVERY_VERSION = DISCOVERY_VERSION
     base.CAMPAIGN_DEFINITION_VERSION = CAMPAIGN_DEFINITION_VERSION
@@ -85,12 +126,12 @@ def _configure() -> None:
 
 def _ensure_discovery_run(job_id: str, config: DiscoveryConfig):
     _configure()
-    return base._ensure_discovery_run(job_id, config)
+    return base._ensure_discovery_run(job_id, _augment_config(config))
 
 
 def run_discovery(job_id: str, config: DiscoveryConfig):
     _configure()
-    return base.run_discovery(job_id, config)
+    return base.run_discovery(job_id, _augment_config(config))
 
 
 def run_sealed_evaluation(job_id: str, config: SealedEvaluationConfig):
