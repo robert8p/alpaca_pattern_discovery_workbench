@@ -1,0 +1,21 @@
+name: patch-pti262
+on:
+  push:
+    branches: [executable-strategy-v27b]
+    paths: ['.github/workflows/patch-pti262.yml']
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: executable-strategy-v27b
+      - run: |
+          python scripts/patch_pti262_tmp.py
+          git config user.name 'Executable Strategy Research Builder'
+          git config user.email 'executable-strategy@users.noreply.github.com'
+          git add app/db.py scripts/release_audit.py tests/test_schema_startup.py
+          git diff --cached --quiet || git commit -m 'Use actual PTI availability migration in v2.7 startup'
+          git push origin HEAD:executable-strategy-v27b
