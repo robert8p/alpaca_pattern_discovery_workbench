@@ -94,11 +94,12 @@ def test_complete_postgres_workflow():
         freeze_candidate, run_historical_feature_backfill, run_market_state_build, run_candidate_wave_build
     )
     from app.robustness import run_robustness
+    from app.strategy_economics import run_strategy_economics
     from app.features import build_feature_set
     from app.jobs import create_job
     from app.models import (
         CandidateWaveBuildConfig, DiscoveryConfig, FeatureBuildConfig, HistoricalFeatureBackfillConfig,
-        MarketStateBuildConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
+        MarketStateBuildConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, StrategyEconomicsConfig, UniverseBuildConfig,
     )
     from app.preflight import database_sql_preflight
     from app.universe import build_universe
@@ -262,7 +263,7 @@ def test_complete_postgres_workflow():
                     (Jsonb({"discovery_end":"2026-08-03","validation_end":"2026-08-04"}),),
                 )
         conn.rollback()
-    with pytest.raises(Exception, match="locked in Phase 1"):
+    with pytest.raises(Exception, match="locked"):
         create_job(
             "historical_feature_backfill", "illegal full history",
             {**one_day_cfg.model_dump(mode="json"), "scope":"full_history"},
@@ -283,19 +284,40 @@ def test_complete_postgres_workflow():
     assert robustness_result["summary"]["base"]["observations"] > 0
     assert robustness_result["verdict"] in {"REJECT","WEAK","PROMISING"}
 
+    strategy_cfg = StrategyEconomicsConfig(
+        name="Synthetic whole-strategy economics", candidate_id=candidate["id"],
+        target_feature_set_id=feature_result["feature_set_id"], mode="research", research_stage="custom_presealed",
+        start_date="2026-06-08", end_date="2026-06-30", capital_levels=[10000],
+        base_entry_delay_minutes=0, entry_delays_minutes=[0,1,2,5],
+        base_round_trip_cost_bps=20, round_trip_costs_bps=[20,25,30,40],
+        position_size_pct_of_capital=5, max_positions=20, max_gross_exposure_pct=100,
+        max_net_exposure_pct=100, max_symbol_exposure_pct=10, max_bar_participation_pct=5,
+        max_daily_participation_pct=1,
+    )
+    strategy_job=create_job("strategy_economics_analysis", strategy_cfg.name, strategy_cfg.model_dump(mode="json"))
+    strategy_result=run_strategy_economics(str(strategy_job["id"]), strategy_cfg)
+    assert strategy_result["primary_metrics"]["trades"] > 0
+    assert strategy_result["primary_metrics"]["market_days"] > 0
+    assert strategy_result["primary_metrics"]["maximum_drawdown_pct"] is not None
+    assert len(strategy_result["stress_results"]) == 16
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) n FROM ra_strategy_metric_sets WHERE strategy_run_id=%s",(strategy_result["strategy_run_id"],))
+            assert cur.fetchone()["n"] == 1
+            cur.execute("SELECT count(*) n,count(DISTINCT (capital_level,signal_ts,symbol)) d FROM ra_strategy_trades WHERE strategy_run_id=%s",(strategy_result["strategy_run_id"],))
+            row=cur.fetchone(); assert row["n"] == row["d"]
+        conn.rollback()
+
     freeze_candidate(candidate["id"], "Synthetic integration freeze")
     sealed_config = SealedEvaluationConfig(
-        candidate_id=candidate["id"],
-        sealed_start="2026-08-04", sealed_end="2026-08-14",
+        candidate_id=candidate["id"], sealed_start="2026-08-04", sealed_end="2026-08-14",
     )
-    sealed_job = create_job("sealed_evaluation", "Synthetic sealed", sealed_config.model_dump(mode="json"))
-    sealed_result = run_sealed_evaluation(str(sealed_job["id"]), sealed_config)
-    assert sealed_result["observations"] > 0
-    assert sealed_result["net_avg_pct"] > 0
+    with pytest.raises(Exception, match="strategy|executable|frozen"):
+        create_job("sealed_evaluation", "Synthetic sealed must remain blocked", sealed_config.model_dump(mode="json"))
     close_pool()
 
 
-def test_upgrade_from_v211_schema_to_v250():
+def test_upgrade_from_v211_schema_to_v270():
     """Exercise the real production upgrade path from the last shipped schema."""
     import psycopg
     from pathlib import Path
@@ -315,8 +337,8 @@ def test_upgrade_from_v211_schema_to_v250():
     execute_schema()
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.5.0'")
-            assert cur.fetchone()["app_version"] == "2.5.0"
+            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.7.0'")
+            assert cur.fetchone()["app_version"] == "2.7.0"
             cur.execute("SELECT to_regclass('public.ra_robustness_runs') AS runs,to_regclass('public.ra_robustness_observations') AS observations,to_regclass('public.ra_robustness_results') AS results")
             row=cur.fetchone()
             assert row['runs'] and row['observations'] and row['results']
@@ -327,7 +349,7 @@ def test_upgrade_from_v211_schema_to_v250():
     close_pool()
 
 
-def test_upgrade_from_v220_schema_to_v250():
+def test_upgrade_from_v220_schema_to_v270():
     import psycopg
     from pathlib import Path
     from app.config import get_settings
@@ -346,8 +368,8 @@ def test_upgrade_from_v220_schema_to_v250():
     execute_schema()
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.5.0'")
-            assert cur.fetchone()["app_version"] == "2.5.0"
+            cur.execute("SELECT app_version FROM ra_schema_versions WHERE version='2.7.0'")
+            assert cur.fetchone()["app_version"] == "2.7.0"
             cur.execute("SELECT to_regclass('public.ra_robustness_chunks') AS chunks,to_regclass('public.ra_robustness_samples') AS samples")
             row=cur.fetchone()
             assert row["chunks"] and row["samples"]
