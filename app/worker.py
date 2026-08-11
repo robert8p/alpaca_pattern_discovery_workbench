@@ -8,7 +8,7 @@ from typing import Any
 from app.config import get_settings
 from app.db import close_pool, connection, execute_schema
 from app.discovery import _ensure_discovery_run, run_discovery, run_sealed_evaluation
-from app.robustness import run_robustness
+from app.robustness_v3 import run_robustness
 from app.features import build_feature_set
 from app.full_history import (
     assert_candidate_frozen, record_sealed_result, register_research_campaign, run_candidate_wave_build,
