@@ -10,8 +10,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = Field(alias="DATABASE_URL")
-    database_pool_min_size: int = Field(default=1, ge=0, le=4, alias="DATABASE_POOL_MIN_SIZE")
-    database_pool_max_size: int = Field(default=4, ge=2, le=12, alias="DATABASE_POOL_MAX_SIZE")
     app_username: str = Field(default="admin", alias="APP_USERNAME")
     app_password: str = Field(default="change-me", alias="APP_PASSWORD")
     auto_migrate: bool = Field(default=True, alias="AUTO_MIGRATE")
