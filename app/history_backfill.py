@@ -109,6 +109,7 @@ def _ensure_backfill_record(
         "session": "regular",
         "universe_membership": "point_in_time_monthly" if point_in_time_universe_run_id else "legacy_static",
     }
+    months = _month_partitions(config.start_date, config.end_date)
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM ra_full_history_backfills WHERE job_id=%s", (job_id,))
@@ -118,9 +119,19 @@ def _ensure_backfill_record(
                 cur.execute(
                     """
                     UPDATE ra_full_history_backfills SET status='running',latest_error=NULL,
-                        point_in_time_universe_run_id=%s,started_at=COALESCE(started_at,now()) WHERE id=%s
+                        point_in_time_universe_run_id=%s,requested_start=%s,requested_end=%s,
+                        months_available=%s,source_config=%s,feature_config=%s,completed_at=NULL,
+                        started_at=COALESCE(started_at,now()) WHERE id=%s
                     """,
-                    (point_in_time_universe_run_id, backfill_id),
+                    (
+                        point_in_time_universe_run_id,
+                        config.start_date,
+                        config.end_date,
+                        len(months),
+                        Jsonb(source),
+                        Jsonb(feature_config.model_dump(mode="json")),
+                        backfill_id,
+                    ),
                 )
             else:
                 cur.execute(
@@ -142,16 +153,40 @@ def _ensure_backfill_record(
                         feature_definition_hash(),
                         config.start_date,
                         config.end_date,
-                        len(_month_partitions(config.start_date, config.end_date)),
+                        len(months),
                         point_in_time_universe_run_id,
                     ),
                 )
                 backfill_id = cur.fetchone()["id"]
-                for pstart, pend in _month_partitions(config.start_date, config.end_date):
+
+            for pstart, pend in months:
+                cur.execute(
+                    """
+                    SELECT id,partition_start,partition_end,status
+                    FROM ra_full_history_backfill_partitions
+                    WHERE backfill_id=%s
+                      AND date_trunc('month',partition_start)=date_trunc('month',%s::date)
+                    ORDER BY partition_start LIMIT 1
+                    """,
+                    (backfill_id, pstart),
+                )
+                existing_partition = cur.fetchone()
+                if existing_partition:
+                    if pend > existing_partition["partition_end"] or pstart < existing_partition["partition_start"]:
+                        cur.execute(
+                            """
+                            UPDATE ra_full_history_backfill_partitions SET
+                                partition_start=LEAST(partition_start,%s),partition_end=GREATEST(partition_end,%s),
+                                research_stage=%s,status='pending',completed_at=NULL,error=NULL
+                            WHERE id=%s
+                            """,
+                            (pstart, pend, _stage_for_period(pstart, pend), existing_partition["id"]),
+                        )
+                else:
                     cur.execute(
                         """
                         INSERT INTO ra_full_history_backfill_partitions(backfill_id,partition_start,partition_end,research_stage)
-                        VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING
+                        VALUES (%s,%s,%s,%s)
                         """,
                         (backfill_id, pstart, pend, _stage_for_period(pstart, pend)),
                     )
@@ -197,6 +232,29 @@ def _sync_backfill_status(backfill_id: str, job_id: str, error: str | None = Non
         conn.commit()
 
 
+def _uncovered_date_ranges(
+    seg_start: date,
+    seg_end: date,
+    covered_chunks: list[tuple[date, date]],
+) -> list[tuple[date, date]]:
+    """Return only dates not already planned by an existing feature chunk."""
+    uncovered = [(seg_start, seg_end)]
+    for covered_start, covered_end in sorted(covered_chunks):
+        remaining: list[tuple[date, date]] = []
+        for start, end in uncovered:
+            if covered_end < start or covered_start > end:
+                remaining.append((start, end))
+                continue
+            if start < covered_start:
+                remaining.append((start, covered_start - timedelta(days=1)))
+            if covered_end < end:
+                remaining.append((covered_end + timedelta(days=1), end))
+        uncovered = remaining
+        if not uncovered:
+            break
+    return uncovered
+
+
 def _ensure_master_feature_set(
     job_id: str,
     config: HistoricalFeatureBackfillConfig,
@@ -240,6 +298,12 @@ def _ensure_master_feature_set(
                 feature_set_id = cur.fetchone()["id"]
 
             cur.execute(
+                "SELECT chunk_start,chunk_end FROM ra_feature_chunks WHERE feature_set_id=%s ORDER BY chunk_start",
+                (feature_set_id,),
+            )
+            covered_chunks = [(row["chunk_start"], row["chunk_end"]) for row in cur.fetchall()]
+
+            cur.execute(
                 """
                 SELECT * FROM ra_point_in_time_universe_snapshots
                 WHERE point_in_time_universe_run_id=%s AND status='completed'
@@ -252,29 +316,36 @@ def _ensure_master_feature_set(
             for snapshot in snapshots:
                 seg_start = max(config.start_date, snapshot["effective_start"])
                 seg_end = min(config.end_date, snapshot["effective_end"])
-                for chunk_start, chunk_end in date_chunks(seg_start, seg_end, base_config.date_chunk_days):
-                    cur.execute(
-                        """
-                        INSERT INTO ra_feature_chunks(feature_set_id,chunk_start,chunk_end)
-                        VALUES (%s,%s,%s) ON CONFLICT DO NOTHING
-                        """,
-                        (feature_set_id, chunk_start, chunk_end),
-                    )
-                    cur.execute(
-                        "SELECT id FROM ra_feature_chunks WHERE feature_set_id=%s AND chunk_start=%s AND chunk_end=%s",
-                        (feature_set_id, chunk_start, chunk_end),
-                    )
-                    chunk_id = cur.fetchone()["id"]
-                    if snapshot.get("snapshot_universe_run_id"):
+                for uncovered_start, uncovered_end in _uncovered_date_ranges(seg_start, seg_end, covered_chunks):
+                    for chunk_start, chunk_end in date_chunks(uncovered_start, uncovered_end, base_config.date_chunk_days):
                         cur.execute(
                             """
-                            INSERT INTO ra_feature_chunk_universes(feature_chunk_id,point_in_time_snapshot_id,universe_run_id)
-                            VALUES (%s,%s,%s) ON CONFLICT (feature_chunk_id) DO UPDATE SET
-                                point_in_time_snapshot_id=excluded.point_in_time_snapshot_id,
-                                universe_run_id=excluded.universe_run_id
+                            INSERT INTO ra_feature_chunks(feature_set_id,chunk_start,chunk_end)
+                            VALUES (%s,%s,%s) ON CONFLICT DO NOTHING
+                            RETURNING id
                             """,
-                            (chunk_id, snapshot["id"], snapshot["snapshot_universe_run_id"]),
+                            (feature_set_id, chunk_start, chunk_end),
                         )
+                        inserted = cur.fetchone()
+                        if inserted:
+                            chunk_id = inserted["id"]
+                            covered_chunks.append((chunk_start, chunk_end))
+                        else:
+                            cur.execute(
+                                "SELECT id FROM ra_feature_chunks WHERE feature_set_id=%s AND chunk_start=%s AND chunk_end=%s",
+                                (feature_set_id, chunk_start, chunk_end),
+                            )
+                            chunk_id = cur.fetchone()["id"]
+                        if snapshot.get("snapshot_universe_run_id"):
+                            cur.execute(
+                                """
+                                INSERT INTO ra_feature_chunk_universes(feature_chunk_id,point_in_time_snapshot_id,universe_run_id)
+                                VALUES (%s,%s,%s) ON CONFLICT (feature_chunk_id) DO UPDATE SET
+                                    point_in_time_snapshot_id=excluded.point_in_time_snapshot_id,
+                                    universe_run_id=excluded.universe_run_id
+                                """,
+                                (chunk_id, snapshot["id"], snapshot["snapshot_universe_run_id"]),
+                            )
             cur.execute("SELECT * FROM ra_feature_chunks WHERE feature_set_id=%s ORDER BY chunk_start", (feature_set_id,))
             chunks = [dict(row) for row in cur.fetchall()]
         conn.commit()
@@ -358,6 +429,7 @@ def _run_point_in_time_feature_set(
                     (chunk["id"],),
                 )
             conn.commit()
+
         try:
             while True:
                 batches = _chunk_batches(chunk["id"])
