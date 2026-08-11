@@ -1,0 +1,22 @@
+name: patch-strategy-direction
+on:
+  push:
+    branches: [whole-strategy-economics-v1]
+    paths: ['.github/workflows/patch-direction.yml']
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: whole-strategy-economics-v1
+      - name: Patch direction accounting
+        run: |
+          python scripts/patch_strategy_direction_tmp.py
+          git config user.name 'Whole Strategy Research Builder'
+          git config user.email 'whole-strategy-research@users.noreply.github.com'
+          git add app/strategy_economics.py tests/test_strategy_economics.py
+          git diff --cached --quiet || git commit -m 'Carry direction through overlapping strategy positions'
+          git push origin HEAD:whole-strategy-economics-v1
