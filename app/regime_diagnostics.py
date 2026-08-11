@@ -5,7 +5,7 @@ import statistics
 from collections import defaultdict
 from typing import Any, Callable
 
-REGIME_DIAGNOSTICS_VERSION = "1.0.0"
+REGIME_DIAGNOSTICS_VERSION = "1.1.0"
 
 
 def _finite(value: Any) -> float | None:
@@ -83,48 +83,33 @@ def _group(
             buckets[label] = ([], [])
         buckets[label][0].append(row)
         buckets[label][1].append(value)
-    return {label: _summary(group_rows, group_returns) for label, (group_rows, group_returns) in sorted(buckets.items())}
-
-
-def _unique_market_states(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_ts: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if row.get("market_state_run_id") is None:
-            continue
-        by_ts.setdefault(str(row.get("bar_ts")), row)
-    return list(by_ts.values())
-
-
-def _thresholds(states: list[dict[str, Any]]) -> dict[str, Any]:
-    mapping = {
-        "dispersion_30m_pct": "dispersion_30m_pct",
-        "pct_abnormal_volatility": "pct_abnormal_volatility",
-        "median_relative_volume": "median_relative_volume",
+    return {
+        label: _summary(group_rows, group_returns)
+        for label, (group_rows, group_returns) in sorted(buckets.items())
     }
-    result: dict[str, Any] = {}
-    for name, field in mapping.items():
-        values = [_finite(row.get(field)) for row in states]
-        clean = [x for x in values if x is not None]
-        result[name] = {
-            "p25": _quantile(clean, 0.25),
-            "p75": _quantile(clean, 0.75),
-            "observations": len(clean),
-        }
-    return result
 
 
-def regime_diagnostics(rows: list[dict[str, Any]], *, cost_bps: float) -> dict[str, Any]:
-    usable = [row for row in rows if row.get("gross_return_pct") is not None]
-    states = _unique_market_states(usable)
-    if not states:
+def regime_diagnostics(
+    rows: list[dict[str, Any]],
+    *,
+    cost_bps: float,
+    calibration_thresholds: dict[str, Any] | None,
+    calibration_market_state_timestamps: int = 0,
+    market_state_run_id: str | None = None,
+) -> dict[str, Any]:
+    usable = [
+        row for row in rows
+        if row.get("gross_return_pct") is not None and row.get("market_state_run_id") is not None
+    ]
+    if not usable or not calibration_thresholds or not market_state_run_id:
         return {
             "version": REGIME_DIAGNOSTICS_VERSION,
             "available": False,
-            "reason": "No completed point-in-time market-state run was available for the target feature set.",
+            "reason": "No completed full-timeline point-in-time market-state calibration was available for the target feature set.",
             "sealed_data_accessed": False,
         }
 
-    thresholds = _thresholds(states)
+    thresholds = calibration_thresholds
     cost_pct = float(cost_bps) / 100.0
     returns = [float(row["gross_return_pct"]) - cost_pct for row in usable]
 
@@ -168,6 +153,8 @@ def regime_diagnostics(rows: list[dict[str, Any]], *, cost_bps: float) -> dict[s
             p75 = _finite((thresholds.get(threshold_key) or {}).get("p75"))
             if value is None or p25 is None or p75 is None:
                 return None
+            if p25 == p75:
+                return normal
             if value <= p25:
                 return low
             if value >= p75:
@@ -191,10 +178,19 @@ def regime_diagnostics(rows: list[dict[str, Any]], *, cost_bps: float) -> dict[s
         "market_direction": direction,
         "broad_market_breadth": breadth,
         "session": session,
-        "volatility_level": quantile_label("pct_abnormal_volatility", "pct_abnormal_volatility", "low_volatility", "normal_volatility", "high_volatility"),
+        "volatility_level": quantile_label(
+            "pct_abnormal_volatility", "pct_abnormal_volatility",
+            "low_volatility", "normal_volatility", "high_volatility",
+        ),
         "volatility_change": volatility_change,
-        "cross_sectional_dispersion": quantile_label("dispersion_30m_pct", "dispersion_30m_pct", "low_dispersion", "normal_dispersion", "high_dispersion"),
-        "market_liquidity_activity": quantile_label("median_relative_volume", "median_relative_volume", "low_liquidity_activity", "normal_liquidity_activity", "high_liquidity_activity"),
+        "cross_sectional_dispersion": quantile_label(
+            "dispersion_30m_pct", "dispersion_30m_pct",
+            "low_dispersion", "normal_dispersion", "high_dispersion",
+        ),
+        "market_liquidity_activity": quantile_label(
+            "median_relative_volume", "median_relative_volume",
+            "low_liquidity_activity", "normal_liquidity_activity", "high_liquidity_activity",
+        ),
     }
 
     grouped = {name: _group(usable, returns, labeler) for name, labeler in dimensions.items()}
@@ -219,11 +215,14 @@ def regime_diagnostics(rows: list[dict[str, Any]], *, cost_bps: float) -> dict[s
         "version": REGIME_DIAGNOSTICS_VERSION,
         "available": True,
         "sealed_data_accessed": False,
-        "market_state_timestamps": len(states),
+        "market_state_run_id": market_state_run_id,
+        "signal_rows_with_market_state": len(usable),
+        "calibration_market_state_timestamps": int(calibration_market_state_timestamps),
         "threshold_methodology": {
+            "calibration_population": "All timestamps in the latest completed pre-sealed point-in-time market-state run for the target feature set; thresholds are not calibrated from signal timestamps.",
             "direction": "SPY 30-minute return > +0.25% rising, < -0.25% falling, otherwise sideways.",
             "breadth": ">=60% positive over 30m = broad strength; <=40% = broad weakness; otherwise mixed.",
-            "volatility_dispersion_liquidity": "Pre-sealed point-in-time market-state 25th/75th percentiles define low/high; middle 50% is normal. The percentile method is fixed before sealed holdout access.",
+            "volatility_dispersion_liquidity": "Full pre-sealed market-state 25th/75th percentiles define low/high; middle 50% is normal. The percentile method is fixed before sealed holdout access.",
             "volatility_change": "Change in abnormal-volatility share versus 5 minutes earlier: >=+5 percentage points expansion, <=-5 contraction, otherwise stable.",
             "session": "09:30-10:30 ET opening; 10:30-15:00 ET midday; 15:00-16:00 ET closing.",
         },
