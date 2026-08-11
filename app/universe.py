@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.db import connection
 from app.jobs import add_event, set_progress
 from app.models import UniverseBuildConfig
+from app.pti_availability import apply_point_in_time_availability_filter
 from app.sql_validation import validate_sql_bindings
 from app.utils import json_safe, market_date_bounds
 
@@ -141,6 +142,15 @@ def build_universe(job_id: str, config: UniverseBuildConfig) -> dict[str, Any]:
             rows = cur.rowcount or 0
         conn.commit()
 
+    availability = apply_point_in_time_availability_filter(job_id, str(run_id), config)
+    if availability:
+        add_event(
+            job_id,
+            "point_in_time_availability_applied",
+            f"PTI availability used {availability['reference_trade_date']}; removed {availability['removed_symbols']} unavailable symbols and refilled {availability['refilled_symbols']} slots.",
+            details=availability,
+        )
+
     set_progress(job_id, "summarising universe", 3, 4)
     with connection() as conn:
         with conn.cursor() as cur:
@@ -170,6 +180,8 @@ def build_universe(job_id: str, config: UniverseBuildConfig) -> dict[str, Any]:
             )
         conn.commit()
     result = {"universe_run_id": run_id, "rows_assessed": rows, **dict(summary)}
+    if availability:
+        result["point_in_time_availability"] = availability
     add_event(job_id, "universe_created", f"Universe built with {summary['included_symbols']:,} included symbols.", details=result)
     set_progress(job_id, "complete", 4, 4, result=result)
     return json_safe(result)
