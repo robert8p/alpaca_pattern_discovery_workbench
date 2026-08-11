@@ -358,6 +358,7 @@ def _simulate(signals: list[dict[str, Any]], candidate: dict[str, Any], config: 
         entry_ts = signal.get("entry_ts")
         exit_ts = signal.get("exit_ts")
         row = dict(signal)
+        row["direction"] = candidate["direction"]
         row.update({"accepted": False, "rejection_reason": None, "metadata_temporal_status": signal.get("liquidity_metadata_temporal_status") or "entry_bar_only_no_point_in_time_daily_capacity"})
         if entry_ts is None or row.get("entry_price") is None:
             row["rejection_reason"] = "unavailable_entry_fill"
