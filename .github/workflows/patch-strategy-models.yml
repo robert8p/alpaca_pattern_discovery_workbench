@@ -1,4 +1,4 @@
-name: patch-strategy-ui
+name: patch-strategy-ui-safe
 on:
   push:
     branches: [whole-strategy-economics-v1]
@@ -17,6 +17,6 @@ jobs:
           python scripts/patch_strategy_ui_tmp.py
           git config user.name 'Whole Strategy Research Builder'
           git config user.email 'whole-strategy-research@users.noreply.github.com'
-          git add app/templates/index.html .github/workflows/ci.yml scripts/release_audit.py
+          git add app/templates/index.html scripts/release_audit.py
           git diff --cached --quiet || git commit -m 'Add whole-strategy economics UI and release checks'
           git push origin HEAD:whole-strategy-economics-v1
