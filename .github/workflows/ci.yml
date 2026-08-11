@@ -45,7 +45,7 @@ jobs:
       - name: Python compile
         run: python -m compileall -q app scripts tests
       - name: JavaScript syntax
-        run: node --check app/static/app.js && node --check app/static/phase1.js
+        run: node --check app/static/app.js && node --check app/static/phase1.js && node --check app/static/strategy.js
       - name: Unit and PostgreSQL integration tests
         id: pytest
         shell: bash
