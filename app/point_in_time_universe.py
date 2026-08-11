@@ -13,7 +13,7 @@ from app.models import HistoricalFeatureBackfillConfig, UniverseBuildConfig
 from app.universe import build_universe
 from app.utils import json_safe
 
-PTI_UNIVERSE_VERSION = "1.0.0"
+PTI_UNIVERSE_VERSION = "1.0.1"
 PTI_LOOKBACK_CALENDAR_DAYS = 61
 PTI_SCHEMA_LOCK = "alpaca_pattern_discovery_pti_universe_schema"
 
@@ -112,21 +112,22 @@ def _snapshot_dates(config: HistoricalFeatureBackfillConfig, reference_universe_
         return [config.start_date]
     ref = _reference_universe(reference_universe_run_id)
     source = dict(ref.get("source_config") or {})
+    selection = dict(ref.get("selection_config") or {})
+    minimum_trading_days = int(selection.get("minimum_trading_days") or 15)
     with connection() as conn:
         with conn.cursor() as cur:
+            # Use SPY only as a trading-calendar proxy. Eligibility still comes
+            # from each stock's own bars inside build_universe(). Crucially, we
+            # count warm-up dates only from the requested broad-history start,
+            # not SPY's older standalone history.
             cur.execute(
                 """
-                WITH trading_dates AS (
-                    SELECT DISTINCT (b.bar_ts AT TIME ZONE 'America/New_York')::date AS trade_date
-                    FROM rd_bars b
-                    WHERE b.timeframe=%s AND b.feed=%s AND b.adjustment=%s
-                      AND b.session_label='regular'
-                      AND (b.bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
-                )
-                SELECT min(trade_date) AS snapshot_date
-                FROM trading_dates
-                GROUP BY date_trunc('month',trade_date)
-                ORDER BY snapshot_date
+                SELECT DISTINCT (b.bar_ts AT TIME ZONE 'America/New_York')::date AS trade_date
+                FROM rd_bars b
+                WHERE b.symbol='SPY' AND b.timeframe=%s AND b.feed=%s AND b.adjustment=%s
+                  AND b.session_label='regular'
+                  AND (b.bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                ORDER BY trade_date
                 """,
                 (
                     source.get("timeframe", "1Min"),
@@ -136,9 +137,35 @@ def _snapshot_dates(config: HistoricalFeatureBackfillConfig, reference_universe_
                     config.end_date,
                 ),
             )
-            rows = cur.fetchall()
+            trading_dates = [row["trade_date"] for row in cur.fetchall()]
         conn.rollback()
-    return [row["snapshot_date"] for row in rows]
+    if not trading_dates:
+        return []
+
+    eligible_dates: list[date] = []
+    for candidate in trading_dates:
+        prior_count = sum(
+            1
+            for prior in trading_dates
+            if candidate - timedelta(days=PTI_LOOKBACK_CALENDAR_DAYS) <= prior < candidate
+        )
+        if prior_count >= minimum_trading_days:
+            eligible_dates.append(candidate)
+    if not eligible_dates:
+        return []
+
+    # The first eligible date is an explicit bootstrap snapshot so late-May
+    # history is not silently discarded just because the monthly snapshot at
+    # the start of May lacked the required 15 prior trading days. Thereafter we
+    # use the first eligible trading date of each month.
+    snapshots = [eligible_dates[0]]
+    seen_months = {(eligible_dates[0].year, eligible_dates[0].month)}
+    for d in eligible_dates[1:]:
+        key = (d.year, d.month)
+        if key not in seen_months:
+            snapshots.append(d)
+            seen_months.add(key)
+    return snapshots
 
 
 def _plan_snapshots(run_id: str, config: HistoricalFeatureBackfillConfig, reference_universe_run_id: UUID | str) -> None:
@@ -271,8 +298,8 @@ def ensure_point_in_time_universes(
     """Create immutable-as-of monthly universe snapshots before feature work.
 
     Each snapshot invokes the exact existing UniverseBuildConfig methodology but
-    sets its source window to end on T-1. Monthly membership is conservative:
-    information that appears during a month cannot enter until the next snapshot.
+    sets its source window to end on T-1. The first snapshot is the earliest date
+    with the required historical liquidity warm-up; monthly snapshots follow.
     """
     run_id = _ensure_pti_run(job_id, config, reference_universe_run_id)
     _plan_snapshots(run_id, config, reference_universe_run_id)
