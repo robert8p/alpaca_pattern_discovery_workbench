@@ -13,7 +13,7 @@ from app.models import HistoricalFeatureBackfillConfig, UniverseBuildConfig
 from app.universe import build_universe
 from app.utils import json_safe
 
-PTI_UNIVERSE_VERSION = "1.0.1"
+PTI_UNIVERSE_VERSION = "1.0.2"
 PTI_LOOKBACK_CALENDAR_DAYS = 61
 PTI_SCHEMA_LOCK = "alpaca_pattern_discovery_pti_universe_schema"
 
@@ -78,8 +78,12 @@ def _ensure_pti_run(job_id: str, config: HistoricalFeatureBackfillConfig, refere
             if existing:
                 run_id = existing["id"]
                 cur.execute(
-                    "UPDATE ra_point_in_time_universe_runs SET status='running',latest_error=NULL,started_at=COALESCE(started_at,now()) WHERE id=%s",
-                    (run_id,),
+                    """
+                    UPDATE ra_point_in_time_universe_runs SET status='running',latest_error=NULL,
+                        requested_start=%s,requested_end=%s,methodology_version=%s,completed_at=NULL,
+                        started_at=COALESCE(started_at,now()) WHERE id=%s
+                    """,
+                    (config.start_date, config.end_date, PTI_UNIVERSE_VERSION, run_id),
                 )
             else:
                 cur.execute(
@@ -181,7 +185,11 @@ def _plan_snapshots(run_id: str, config: HistoricalFeatureBackfillConfig, refere
                     INSERT INTO ra_point_in_time_universe_snapshots(
                         point_in_time_universe_run_id,snapshot_date,effective_start,effective_end,lookback_start,lookback_end
                     ) VALUES (%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (point_in_time_universe_run_id,snapshot_date) DO NOTHING
+                    ON CONFLICT (point_in_time_universe_run_id,snapshot_date) DO UPDATE SET
+                        effective_start=excluded.effective_start,
+                        effective_end=excluded.effective_end,
+                        lookback_start=excluded.lookback_start,
+                        lookback_end=excluded.lookback_end
                     """,
                     (
                         run_id,
@@ -300,6 +308,9 @@ def ensure_point_in_time_universes(
     Each snapshot invokes the exact existing UniverseBuildConfig methodology but
     sets its source window to end on T-1. The first snapshot is the earliest date
     with the required historical liquidity warm-up; monthly snapshots follow.
+    Existing snapshots can safely extend their effective end date when a completed
+    historical job is grown to a later month; the frozen membership itself is never
+    recomputed unless that snapshot failed.
     """
     run_id = _ensure_pti_run(job_id, config, reference_universe_run_id)
     _plan_snapshots(run_id, config, reference_universe_run_id)
