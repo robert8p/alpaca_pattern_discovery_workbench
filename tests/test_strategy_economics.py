@@ -123,6 +123,9 @@ def test_h07_style_conditions_are_reconstructed_from_target_feature_set():
     assert "p.bar_ts=f.bar_ts-interval '5 minutes'" in lower
     assert "lead(" not in lower
     assert "ra_intraday_features en" in lower and "ra_intraday_features ex" in lower
+    assert "rd_daily_features" not in lower
+    assert "ra_feature_chunk_universes" in lower
+    assert "pts.lookback_end < s.trade_date" in lower
     assert len(params) > 8
 
 

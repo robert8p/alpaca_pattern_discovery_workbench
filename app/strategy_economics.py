@@ -286,7 +286,8 @@ def _signal_query(candidate: dict[str, Any], config: StrategyEconomicsConfig, de
                ex.bar_ts AS exit_ts,ex.close AS exit_price,
                a.exchange,COALESCE(a.attributes->>'sector',a.raw->>'sector') AS sector,
                CASE WHEN a.raw ? 'shortable' THEN NULLIF(a.raw->>'shortable','')::boolean END AS current_reference_shortable,
-               (d.volume*COALESCE(d.vwap,d.close))::double precision AS daily_dollar_volume,
+               CASE WHEN pts.status='completed' AND pts.lookback_end < s.trade_date THEN au.median_daily_dollar_volume END::double precision AS daily_dollar_volume,
+               CASE WHEN pts.status='completed' AND pts.lookback_end < s.trade_date THEN 'point_in_time_universe_t_minus_1' ELSE 'entry_bar_only_no_point_in_time_daily_capacity' END AS liquidity_metadata_temporal_status,
                {path_cols}
         FROM signal s
         LEFT JOIN ra_intraday_features en
@@ -296,9 +297,13 @@ def _signal_query(candidate: dict[str, Any], config: StrategyEconomicsConfig, de
           ON ex.feature_set_id=s.feature_set_id AND ex.symbol=s.symbol
          AND ex.bar_ts=en.bar_ts+(%s*interval '1 minute') AND ex.trade_date=s.trade_date
         LEFT JOIN rd_assets a ON a.symbol=s.symbol
-        LEFT JOIN rd_daily_features d
-          ON d.symbol=s.symbol AND d.trade_date=s.trade_date AND d.timeframe='1Min'
-         AND d.feed='sip' AND d.adjustment='raw' AND d.session_label='regular'
+        LEFT JOIN ra_feature_chunks fc
+          ON fc.feature_set_id=s.feature_set_id AND s.trade_date BETWEEN fc.chunk_start AND fc.chunk_end
+        LEFT JOIN ra_feature_chunk_universes fcu ON fcu.feature_chunk_id=fc.id
+        LEFT JOIN ra_point_in_time_universe_snapshots pts
+          ON pts.id=fcu.point_in_time_snapshot_id AND s.trade_date BETWEEN pts.effective_start AND pts.effective_end
+        LEFT JOIN ra_analysis_universe au
+          ON au.universe_run_id=fcu.universe_run_id AND au.symbol=s.symbol AND au.included
         {path_join}
         ORDER BY s.bar_ts,s.symbol
     """
@@ -342,8 +347,6 @@ def _simulate(signals: list[dict[str, Any]], candidate: dict[str, Any], config: 
     open_positions: list[dict[str, Any]] = []
     accepted: list[dict[str, Any]] = []
     direction_sign = 1 if candidate["direction"] == "long" else -1
-    metadata_status = "current_reference_structural_metadata"
-
     def priority(row: dict[str, Any]) -> tuple[Any, ...]:
         if config.signal_priority == "signal_strength_desc":
             return (row["signal_ts"], -(abs(float(row.get("signal_strength") or 0))), -(float(row.get("daily_dollar_volume") or 0)), row["symbol"])
@@ -355,7 +358,7 @@ def _simulate(signals: list[dict[str, Any]], candidate: dict[str, Any], config: 
         entry_ts = signal.get("entry_ts")
         exit_ts = signal.get("exit_ts")
         row = dict(signal)
-        row.update({"accepted": False, "rejection_reason": None, "metadata_temporal_status": metadata_status})
+        row.update({"accepted": False, "rejection_reason": None, "metadata_temporal_status": signal.get("liquidity_metadata_temporal_status") or "entry_bar_only_no_point_in_time_daily_capacity"})
         if entry_ts is None or row.get("entry_price") is None:
             row["rejection_reason"] = "unavailable_entry_fill"
             accepted.append(row)
@@ -1016,6 +1019,7 @@ def run_strategy_economics(job_id: str, config: StrategyEconomicsConfig) -> dict
         "execution_limitations":{
             "historical_short_availability":"Point-in-time borrow/short-availability history is not present; current asset metadata is diagnostic only.",
             "historical_bid_ask":"Minute SIP bars do not contain quote-level spread/depth; configured spread/slippage/impact assumptions are explicit proxies.",
+            "capacity_information_timing":"Entry-bar dollar volume is observable at entry. Daily-capacity limits use only point-in-time universe median daily dollar volume whose lookback ended before the trade date; when unavailable the engine falls back to entry-bar capacity only and does not use same-day future volume.",
             "sector_metadata":"Sector labels are used only for diagnostics unless point-in-time sector metadata is supplied; no retroactive sector filter is applied.",
             "stop_execution":"No stop is introduced unless it is part of the frozen strategy methodology.",
         },
