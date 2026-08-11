@@ -70,7 +70,7 @@ def snapshot_universe_config(reference_universe_run_id: UUID | str, snapshot_dat
 def _ensure_pti_run(job_id: str, config: HistoricalFeatureBackfillConfig, reference_universe_run_id: UUID | str) -> str:
     ensure_point_in_time_schema()
     ref = _reference_universe(reference_universe_run_id)
-    cadence = "single_date" if config.scope == "one_day_test" else "monthly_with_bootstrap"
+    cadence = "single_date" if config.scope == "one_day_test" else "monthly"
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM ra_point_in_time_universe_runs WHERE parent_job_id=%s", (job_id,))
