@@ -1,4 +1,14 @@
-from app.discovery_v3 import economic_rank_score
+from datetime import date
+from uuid import uuid4
+
+from app import discovery as base_discovery
+from app.discovery_v3 import (
+    BLANK_CANVAS_FAMILIES,
+    _augment_config,
+    _configure,
+    economic_rank_score,
+)
+from app.models import DiscoveryConfig
 
 
 def _stats(**overrides):
@@ -55,3 +65,20 @@ def test_tail_risk_reduces_score_without_becoming_a_hard_hit_rate_gate():
     controlled = economic_rank_score(_stats(p05_pct=-0.8, worst_pct=-3.0), None)
     heavy_tail = economic_rank_score(_stats(p05_pct=-4.0, worst_pct=-15.0), None)
     assert controlled > heavy_tail
+
+
+def test_blank_canvas_families_are_appended_without_directional_hypotheses():
+    config = DiscoveryConfig(
+        feature_set_id=uuid4(),
+        discovery_start=date(2026, 6, 1),
+        discovery_end=date(2026, 6, 30),
+    )
+    _configure()
+    augmented = _augment_config(config)
+    for family_name in BLANK_CANVAS_FAMILIES:
+        assert family_name in augmented.families
+        spec = base_discovery.FAMILIES[family_name]
+        assert spec["filter"] == "TRUE"
+        assert spec["constraints"] == []
+        assert spec["hypothesis_ids"] == []
+        assert spec["coverage"] == "HYPOTHESIS_FREE_GRID"
