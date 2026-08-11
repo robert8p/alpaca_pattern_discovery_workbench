@@ -16,6 +16,7 @@
         <div class="metric-grid">
           <article class="metric"><span>Historical source</span><strong id="fh-source-range">—</strong><small>Alpaca SIP · 1Min · raw</small></article>
           <article class="metric"><span>PTI source gate</span><strong id="fh-pti-ready">—</strong><small>61-day warm-up + inactive survivorship supplement</small></article>
+          <article class="metric"><span>Months available</span><strong id="fh-months-available">—</strong><small>4 May 2025 through pre-sealed history</small></article>
           <article class="metric"><span>Months completed</span><strong id="fh-months-completed">—</strong><small>Historical engineered-feature backfill</small></article>
           <article class="metric"><span>Rows processed</span><strong id="fh-rows-processed">—</strong><small>Idempotent feature rows</small></article>
         </div>
@@ -39,7 +40,7 @@
     const inv=d.historical_source_coverage||{}, b=d.backfill||{}, j=d.resume_retry_state||{}, cp=d.current_processing_partition||{}, pti=d.point_in_time_source_readiness||{};
     $q('#fh-source-range').textContent=inv.min_bar_ts?`${day(inv.min_bar_ts)} → ${day(inv.max_bar_ts)}`:'Not available';
     $q('#fh-pti-ready').textContent=pti.ready?'READY':'BLOCKED';
-    $q('#fh-months-completed').textContent=n(d.months_completed); $q('#fh-rows-processed').textContent=n(d.rows_processed);
+    $q('#fh-months-available').textContent=n(d.months_available); $q('#fh-months-completed').textContent=n(d.months_completed); $q('#fh-rows-processed').textContent=n(d.rows_processed);
     const blockers=(pti.blockers||[]).map(x=>esc(x)).join(' · ')||'None';
     const ptiWindow=pti.required_warmup_start?`${day(pti.required_warmup_start)} → ${day(pti.required_warmup_end)}`:'—';
     $q('#fh-backfill-status').innerHTML=`<div class="health-line"><strong>Point-in-time source gate</strong><span>${pti.ready?'READY':'BLOCKED'} · warm-up ${ptiWindow}</span></div><div class="health-line"><strong>Source blockers</strong><span>${blockers}</span></div><div class="health-line"><strong>Active-history coverage</strong><span>${pti.active_history_ready?'Ready':'Pending'}</span></div><div class="health-line"><strong>All-known 61-day warm-up</strong><span>${pti.all_known_warmup_ready?'Ready':'Pending'}</span></div><div class="health-line"><strong>Inactive survivorship supplement</strong><span>${pti.inactive_survivorship_ready?'Ready':'Pending'}</span></div><div class="health-line"><strong>Feature-backfill readiness</strong><span>${esc(b.status||'Architecture ready · no full run launched')}</span></div><div class="health-line"><strong>Feature definition</strong><span>v${esc(d.feature_engine_version||'—')} · ${esc(String(d.feature_definition_hash||'').slice(0,16))}</span></div><div class="health-line"><strong>Current partition</strong><span>${cp.chunk_start?`${day(cp.chunk_start)} → ${day(cp.chunk_end)} · ${esc(cp.status)}`:'None'}</span></div><div class="health-line"><strong>Resume / retry</strong><span>${j.status?`${esc(j.status)} · ${esc(j.phase||'—')} · ${n(j.progress_current)}/${n(j.progress_total)} · attempts ${n(j.attempts)}`:'No active historical feature job'}</span></div><div class="health-line"><strong>Latest error</strong><span>${esc(d.latest_error||'None')}</span></div>`;
