@@ -19,16 +19,17 @@ from app.db import close_pool, connection, database_diagnostics, database_target
 from app.features import estimate_feature_build
 from app.exports import build_candidate_export_bundle, export_filename
 from app.jobs import create_job
+from app.executable_strategy import assert_strategy_frozen, freeze_strategy
 from app.full_history import assert_candidate_frozen, freeze_candidate, full_history_status
 from app.preflight import database_sql_preflight, local_sql_preflight
 from app.models import (
     CandidateFreezeRequest, CandidateWaveBuildConfig, DiscoveryConfig, FeatureBuildConfig, FeatureEstimateRequest,
     HistoricalFeatureBackfillConfig, JobCreateRequest, MarketStateBuildConfig, QualityScanConfig,
-    RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
+    RobustnessAnalysisConfig, SealedEvaluationConfig, StrategyEconomicsConfig, UniverseBuildConfig,
 )
 from app.utils import json_safe
 
-VERSION = "2.5.0"
+VERSION = "2.7.0"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -161,6 +162,7 @@ def queue_job(payload: JobCreateRequest, _: str = Depends(require_auth)) -> dict
         "historical_feature_backfill": HistoricalFeatureBackfillConfig,
         "market_state_build": MarketStateBuildConfig,
         "candidate_wave_build": CandidateWaveBuildConfig,
+        "strategy_economics_analysis": StrategyEconomicsConfig,
     }
     model = validators[payload.job_type].model_validate(payload.config)
     if payload.job_type in {"discovery_scan", "robustness_analysis", "sealed_evaluation", "market_state_build", "candidate_wave_build"}:
@@ -587,6 +589,31 @@ def candidate_robustness(candidate_id: str, _: str = Depends(require_auth)) -> l
     return json_safe(rows)
 
 
+@app.post("/api/candidates/{candidate_id}/strategy-economics", status_code=201)
+def queue_executable_strategy(candidate_id: str, payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
+    config=StrategyEconomicsConfig.model_validate({"candidate_id":parse_uuid(candidate_id),**payload})
+    if config.mode=="sealed":
+        try: assert_strategy_frozen(config.candidate_id,config.strategy_config_hash)
+        except ValueError as exc: raise HTTPException(409,str(exc)) from exc
+    return json_safe(create_job("strategy_economics_analysis",f"Executable strategy · {str(config.candidate_id)[:8]} · {config.research_stage}",config.model_dump(mode="json")))
+
+
+@app.get("/api/candidates/{candidate_id}/strategy-economics")
+def executable_strategy_runs(candidate_id: str, _: str = Depends(require_auth)) -> list[dict[str,Any]]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ra_strategy_economics_runs WHERE candidate_id=%s ORDER BY created_at DESC",(parse_uuid(candidate_id),))
+            rows=cur.fetchall()
+        conn.rollback()
+    return json_safe(rows)
+
+
+@app.post("/api/research-ledger/candidates/{candidate_id}/freeze-strategy/{strategy_run_id}")
+def freeze_executable_strategy(candidate_id: str,strategy_run_id: str,payload: CandidateFreezeRequest,_: str=Depends(require_auth)) -> dict[str,Any]:
+    try: return freeze_strategy(parse_uuid(candidate_id),parse_uuid(strategy_run_id),payload.notes)
+    except ValueError as exc: raise HTTPException(400,str(exc)) from exc
+
+
 @app.get("/api/discovery-coverage")
 def discovery_coverage(_: str = Depends(require_auth)) -> dict[str, Any]:
     from app.discovery import FAMILIES
@@ -661,6 +688,7 @@ def queue_sealed(candidate_id: str, payload: dict[str, Any], _: str = Depends(re
     config = SealedEvaluationConfig.model_validate({"candidate_id": parse_uuid(candidate_id), **payload})
     try:
         assert_candidate_frozen(config.candidate_id)
+        assert_strategy_frozen(config.candidate_id)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return json_safe(create_job("sealed_evaluation", f"Sealed evaluation · {str(config.candidate_id)[:8]}", config.model_dump(mode="json")))

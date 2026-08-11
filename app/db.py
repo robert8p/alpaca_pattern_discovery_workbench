@@ -15,8 +15,8 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 _pool: ConnectionPool | None = None
-SCHEMA_VERSION = "2.5.0"
-APP_VERSION = "2.5.0"
+SCHEMA_VERSION = "2.7.0"
+APP_VERSION = "2.7.0"
 SCHEMA_MIGRATION_LOCK = "alpaca_pattern_discovery_schema_migration"
 
 
@@ -231,7 +231,13 @@ def _schema_state(cur: Any) -> dict[str, bool]:
             AND to_regprocedure('public.ra_ensure_candidate_wave_partitions(date,date)') IS NOT NULL
             AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='ra_jobs_research_period_guard' AND NOT tgisinternal)
             AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('public.ra_jobs') AND conname='ra_jobs_job_type_check' AND pg_get_constraintdef(oid) LIKE '%%historical_feature_backfill%%')
-            AS phase1_full_history_ok
+            AS phase1_full_history_ok,
+            to_regclass('public.ra_point_in_time_universe_runs') IS NOT NULL AND to_regclass('public.ra_feature_chunk_universes') IS NOT NULL AS point_in_time_universe_ok,
+            to_regclass('public.ra_strategy_economics_runs') IS NOT NULL AND to_regclass('public.ra_strategy_trades') IS NOT NULL
+            AND to_regclass('public.ra_strategy_equity_points') IS NOT NULL AND to_regclass('public.ra_strategy_metric_sets') IS NOT NULL
+            AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='ra_research_ledger_strategy_guard' AND NOT tgisinternal)
+            AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('public.ra_jobs') AND conname='ra_jobs_job_type_check' AND pg_get_constraintdef(oid) LIKE '%%strategy_economics_analysis%%')
+            AS executable_strategy_ok
         """
     )
     row = cur.fetchone()
@@ -289,6 +295,18 @@ def _apply_v250_full_history_migration(cur: Any) -> None:
     cur.execute(migration_path.read_text(encoding="utf-8"))
 
 
+def _apply_v260_point_in_time_migration(cur: Any) -> None:
+    cur.execute((Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.6.0.sql").read_text(encoding="utf-8"))
+
+
+def _apply_v262_point_in_time_availability_migration(cur: Any) -> None:
+    cur.execute((Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.6.2.sql").read_text(encoding="utf-8"))
+
+
+def _apply_v270_executable_strategy_migration(cur: Any) -> None:
+    cur.execute((Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.7.0.sql").read_text(encoding="utf-8"))
+
+
 def execute_schema() -> None:
     schema_path = Path(__file__).resolve().parent.parent / "sql" / "schema.sql"
     try:
@@ -328,15 +346,21 @@ def execute_schema() -> None:
                     _apply_v220_coverage_migration(cur)
                     _apply_v230_robustness_migration(cur)
                     _apply_v250_full_history_migration(cur)
+                    _apply_v260_point_in_time_migration(cur)
+                    _apply_v262_point_in_time_availability_migration(cur)
+                    _apply_v270_executable_strategy_migration(cur)
                 else:
                     # Fresh install: load the stable v2.3 baseline, then apply the
                     # additive Phase-1 migration. This keeps schema.sql unchanged
                     # and makes the v2.5 upgrade path identical on fresh/live DBs.
                     cur.execute(schema_path.read_text(encoding="utf-8"))
                     _apply_v250_full_history_migration(cur)
+                    _apply_v260_point_in_time_migration(cur)
+                    _apply_v262_point_in_time_availability_migration(cur)
+                    _apply_v270_executable_strategy_migration(cur)
 
                 if not _schema_is_compatible(cur):
-                    raise RuntimeError("Schema migration completed but Phase 1 compatibility checks still failed")
+                    raise RuntimeError("Schema migration completed but v2.7 compatibility checks still failed")
                 cur.execute(
                     "INSERT INTO ra_schema_versions(version,app_version) VALUES (%s,%s) ON CONFLICT (version) DO UPDATE SET app_version=excluded.app_version,applied_at=now()",
                     (SCHEMA_VERSION, APP_VERSION),

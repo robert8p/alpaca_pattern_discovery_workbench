@@ -19,7 +19,7 @@ from app.research_ledger import freeze_candidate, sync_candidate_ledger
 from app.research_policy import SEALED_START_DATE
 from app.utils import finite_or_none, json_safe
 
-STRATEGY_ECONOMICS_VERSION = "executable-portfolio-v1"
+STRATEGY_ECONOMICS_VERSION = "executable-portfolio-v1.1-complete-freeze"
 _SAFE_STRENGTH_FIELDS = {
     "ret_1m_pct", "ret_5m_pct", "ret_15m_pct", "ret_30m_pct", "ret_60m_pct",
     "relative_volume_20bar", "relative_trade_count_20bar", "activity_impact_change_ratio",
@@ -1038,37 +1038,103 @@ def run_strategy_economics(job_id: str, config: StrategyEconomicsConfig) -> dict
     return json_safe(summary)
 
 
+
+def _deployment_methodology(candidate: dict[str,Any], config: StrategyEconomicsConfig, strategy_hash: str, strategy_run_id: str) -> dict[str,Any]:
+    short = str(candidate.get("direction")) == "short"
+    return {
+        "decision_information_policy": "Completed SIP 1-minute bar and predictor fields observable no later than signal timestamp T; no future predictor fields.",
+        "entry_execution": {"delay_minutes": config.base_entry_delay_minutes, "price_proxy": "completed entry-minute close", "partial_fills": config.allow_partial_fills, "minimum_fill_fraction": config.min_fill_fraction},
+        "exit_execution": {"method": "fixed_horizon", "holding_minutes": int(candidate["holding_horizon_minutes"]), "price_proxy": "completed exit-minute close"},
+        "base_round_trip_cost_bps": config.base_round_trip_cost_bps,
+        "spread_assumption": {"bps": config.spread_bps, "included_in_base_cost": True, "quote_history_available": False},
+        "slippage_assumption": {"bps": config.slippage_bps, "included_in_base_cost": True},
+        "capital_allocation_method": "fixed_fraction_with_deterministic_priority_and_exposure_caps",
+        "position_sizing": {"method": config.position_sizing_method, "pct_total_capital": config.position_size_pct_of_capital, "capital_levels_tested": config.capital_levels},
+        "simultaneous_signal_handling": {"priority": config.signal_priority, "max_positions": config.max_positions, "one_position_per_symbol": config.one_position_per_symbol},
+        "maximum_gross_exposure": {"pct_total_capital": config.max_gross_exposure_pct},
+        "maximum_net_exposure": {"pct_total_capital": config.max_net_exposure_pct},
+        "symbol_limit": {"pct_total_capital": config.max_symbol_exposure_pct},
+        "sector_limit": {"enabled": False, "reason": "Point-in-time sector metadata is not yet available; no retrospective sector filter is permitted."},
+        "daily_loss_rule": {"enabled": False, "reason": "No daily-loss optimization is introduced in this frozen methodology."},
+        "conflict_handling": {"same_symbol": "reject_new_signal_when_existing_position_open" if config.one_position_per_symbol else "allow", "cross_strategy": "not_applicable_single_strategy"},
+        "unused_capital_policy": "remain_in_cash",
+        "rebalance_methodology": "no_intratrade_rebalance; capital changes only through deterministic entries/exits",
+        "liquidity_participation_limit": {"max_entry_bar_pct": config.max_bar_participation_pct, "max_point_in_time_median_daily_pct": config.max_daily_participation_pct, "future_same_day_volume_used": False},
+        "borrow_policy": {"short_strategy": short, "historical_point_in_time_borrow_available": False, "rule": "SHORT DEPLOYMENT BLOCKED UNTIL POINT-IN-TIME BORROW/SHORTABILITY IS AVAILABLE" if short else "not_applicable_long_strategy"},
+        "funding_policy": {"bps": config.funding_bps, "included_in_base_cost": True},
+        "stop_policy": {"enabled": False, "reason": "No stop added unless independently discovered and frozen before holdout."},
+        "strategy_config_hash": strategy_hash,
+        "strategy_economics_run_id": strategy_run_id,
+        "engine_version": STRATEGY_ECONOMICS_VERSION,
+    }
+
+
+def _authorize_complete_strategy_freeze(candidate: dict[str,Any], run: dict[str,Any], config: StrategyEconomicsConfig) -> dict[str,Any]:
+    score=dict(run.get("scorecard") or {})
+    if run.get("research_stage") != "research_confirmation" or run.get("classification") != "out_of_sample_validated":
+        raise ValueError("Executable strategy freeze requires identical-methodology Discovery, Validation and Research Confirmation whole-strategy economics")
+    if not _chronology_pass(candidate["id"],str(run["strategy_config_hash"]),"research_confirmation"):
+        raise ValueError("Executable strategy chronology is incomplete")
+    required=("economic_quality_pass","execution_quality_pass","risk_quality_pass","return_concentration_pass","statistical_credibility_pass","chronology_pass")
+    failed=[x for x in required if score.get(x) is not True]
+    if failed: raise ValueError("Executable strategy scorecard still fails: " + ", ".join(failed))
+    methodology=_deployment_methodology(candidate,config,str(run["strategy_config_hash"]),str(run["id"]))
+    blockers=[]
+    if str(candidate.get("direction"))=="short":
+        blockers.append("point-in-time borrow/short-availability history is required before short strategy deployment")
+    if blockers: raise ValueError("Executable strategy still has deployment blockers: " + "; ".join(blockers))
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,summary FROM ra_robustness_runs WHERE candidate_id=%s AND status='completed' ORDER BY completed_at DESC NULLS LAST,created_at DESC LIMIT 1 FOR UPDATE",(candidate["id"],))
+            rob=cur.fetchone()
+            if not rob: raise ValueError("A completed whole-strategy robustness run is required before executable strategy freeze")
+            summary=dict(rob.get("summary") or {})
+            assessment=dict(summary.get("promotion_assessment") or {})
+            assessment["deployment_candidate"]=True
+            assessment["deployment_blockers"]=[]
+            assessment["classification"]="deployment_candidate"
+            assessment["decision"]="PROMOTE"
+            summary["promotion_assessment"]=assessment
+            summary["sealed_engine_strategy_aware"]=True
+            summary["deployment_methodology"]=methodology
+            summary["executable_strategy_run_id"]=str(run["id"])
+            summary["executable_strategy_config_hash"]=str(run["strategy_config_hash"])
+            summary["sealed_period_accessed_by_this_analysis"]=False
+            cur.execute("UPDATE ra_robustness_runs SET summary=%s,engine_version=%s WHERE id=%s",(Jsonb(json_safe(summary)),"3.3.0-executable-strategy-freeze",rob["id"]))
+        conn.commit()
+    return methodology
+
 def freeze_strategy(candidate_id: UUID | str, strategy_run_id: UUID | str, notes: str | None=None) -> dict[str,Any]:
     candidate=_load_candidate(candidate_id)
-    freeze_candidate(candidate_id,notes or "Candidate rule frozen with executable strategy methodology.")
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM ra_strategy_economics_runs WHERE id=%s AND candidate_id=%s AND status='completed' AND mode='research'",(strategy_run_id,candidate_id))
-            run=cur.fetchone()
-            if not run:
-                raise ValueError("Strategy freeze requires a completed pre-sealed strategy-economics run")
-            if run["research_stage"]!="research_confirmation" or run["classification"]!="out_of_sample_validated":
-                raise ValueError("Strategy freeze requires the identical methodology to pass Discovery, Validation and Research Confirmation whole-strategy economics")
-            if not _chronology_pass(candidate_id,str(run["strategy_config_hash"]),"research_confirmation"):
-                raise ValueError("Strategy chronology is incomplete; freeze is not permitted")
-            config=StrategyEconomicsConfig.model_validate(run["config"])
-            payload=_strategy_payload(candidate,config)
-            fingerprint=str(run["strategy_config_hash"])
+            row=cur.fetchone()
+        conn.rollback()
+    if not row: raise ValueError("Strategy freeze requires a completed pre-sealed executable-strategy run")
+    run=dict(row)
+    config=StrategyEconomicsConfig.model_validate(run["config"])
+    methodology=_authorize_complete_strategy_freeze(candidate,run,config)
+    # Current Research Ledger freeze is authoritative: it hashes the exact rule plus
+    # the complete deployment methodology injected above. This call cannot succeed
+    # unless the deployment-candidate and strategy-aware-sealed guards are satisfied.
+    complete=freeze_candidate(candidate_id,notes or "Complete executable strategy frozen before sealed evaluation.")
+    fingerprint=str(run["strategy_config_hash"])
+    with connection() as conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT id,strategy_freeze_timestamp,strategy_configuration_hash FROM ra_research_ledger WHERE candidate_id=%s ORDER BY created_at DESC LIMIT 1 FOR UPDATE",(candidate_id,))
             ledger=cur.fetchone()
-            if not ledger:
-                raise RuntimeError("Research Ledger entry missing")
-            if ledger["strategy_freeze_timestamp"]:
-                if ledger["strategy_configuration_hash"]!=fingerprint:
-                    raise ValueError("A different executable strategy methodology is already frozen for this candidate")
-            else:
-                cur.execute("""UPDATE ra_research_ledger SET strategy_economics_run_id=%s,strategy_configuration=%s,
-                               strategy_configuration_hash=%s,strategy_freeze_timestamp=now(),candidate_retention_status='strategy_frozen',
-                               notes=COALESCE(%s,notes) WHERE id=%s RETURNING *""",
-                            (strategy_run_id,Jsonb(json_safe(payload)),fingerprint,notes,ledger["id"]))
-                ledger=cur.fetchone()
+            if not ledger: raise RuntimeError("Research Ledger entry missing")
+            if ledger["strategy_freeze_timestamp"] and ledger["strategy_configuration_hash"]!=fingerprint:
+                raise ValueError("A different executable methodology is already frozen")
+            cur.execute("""UPDATE ra_research_ledger SET strategy_economics_run_id=%s,strategy_configuration=%s,
+                           strategy_configuration_hash=%s,strategy_freeze_timestamp=COALESCE(strategy_freeze_timestamp,now()),
+                           candidate_retention_status='frozen_complete_strategy_pre_sealed',classification='frozen_complete_strategy_pre_sealed',
+                           notes=COALESCE(%s,notes) WHERE id=%s RETURNING *""",
+                        (strategy_run_id,Jsonb(json_safe(methodology)),fingerprint,notes,ledger["id"]))
+            ledger=cur.fetchone()
         conn.commit()
-    return json_safe({"candidate_id":candidate_id,"strategy_run_id":strategy_run_id,"strategy_config_hash":fingerprint,"ledger":dict(ledger)})
+    return json_safe({"candidate_id":candidate_id,"strategy_run_id":strategy_run_id,"strategy_config_hash":fingerprint,"complete_strategy_freeze":complete,"ledger":dict(ledger)})
 
 
 def assert_strategy_frozen(candidate_id: UUID | str, strategy_hash: str | None=None) -> dict[str,Any]:
@@ -1080,6 +1146,7 @@ def assert_strategy_frozen(candidate_id: UUID | str, strategy_hash: str | None=N
         conn.rollback()
     if not row:
         raise ValueError("Executable strategy must be frozen in the Research Ledger before sealed evaluation")
+    freeze_candidate_row=assert_candidate_frozen(candidate_id)
     if strategy_hash and row["strategy_configuration_hash"]!=strategy_hash:
         raise ValueError("Sealed evaluation methodology differs from the frozen executable strategy")
     return dict(row)
