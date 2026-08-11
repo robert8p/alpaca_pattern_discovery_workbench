@@ -19,7 +19,7 @@ from app.research_ledger import freeze_candidate, sync_candidate_ledger
 from app.research_policy import SEALED_START_DATE
 from app.utils import finite_or_none, json_safe
 
-STRATEGY_ECONOMICS_VERSION = "1.0.0"
+STRATEGY_ECONOMICS_VERSION = "executable-portfolio-v1"
 _SAFE_STRENGTH_FIELDS = {
     "ret_1m_pct", "ret_5m_pct", "ret_15m_pct", "ret_30m_pct", "ret_60m_pct",
     "relative_volume_20bar", "relative_trade_count_20bar", "activity_impact_change_ratio",
