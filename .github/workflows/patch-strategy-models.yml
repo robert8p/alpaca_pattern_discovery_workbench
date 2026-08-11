@@ -1,4 +1,4 @@
-name: patch-strategy-engine
+name: patch-strategy-ui
 on:
   push:
     branches: [whole-strategy-economics-v1]
@@ -12,11 +12,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: whole-strategy-economics-v1
-      - name: Patch strategy engine
+      - name: Patch strategy UI
         run: |
-          python scripts/patch_strategy_engine_tmp.py
+          python scripts/patch_strategy_ui_tmp.py
           git config user.name 'Whole Strategy Research Builder'
           git config user.email 'whole-strategy-research@users.noreply.github.com'
-          git add app/strategy_economics.py
-          git diff --cached --quiet || git commit -m 'Harden whole-strategy economics chronology and risk metrics'
+          git add app/templates/index.html .github/workflows/ci.yml scripts/release_audit.py
+          git diff --cached --quiet || git commit -m 'Add whole-strategy economics UI and release checks'
           git push origin HEAD:whole-strategy-economics-v1
