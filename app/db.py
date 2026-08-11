@@ -51,12 +51,7 @@ def validate_database_target() -> None:
 
 
 def _configure_connection(conn: Connection) -> None:
-    """Reset leaked session state and confirm that the endpoint is a writable primary.
-
-    Supabase documents that pooled backend connections can retain a session-level
-    default_transaction_read_only setting. Resetting it at checkout prevents a
-    contaminated backend from making this application intermittently read-only.
-    """
+    """Reset leaked session state and confirm that the endpoint is a writable primary."""
     previous_autocommit = conn.autocommit
     conn.autocommit = True
     try:
@@ -90,10 +85,11 @@ def get_pool() -> ConnectionPool:
     if _pool is None:
         settings = get_settings()
         validate_database_target()
+        min_size = min(settings.database_pool_min_size, settings.database_pool_max_size)
         _pool = ConnectionPool(
             conninfo=settings.database_url,
-            min_size=1,
-            max_size=8,
+            min_size=min_size,
+            max_size=settings.database_pool_max_size,
             kwargs={"row_factory": dict_row, "autocommit": False},
             configure=_configure_connection,
             open=True,
@@ -106,8 +102,6 @@ def get_pool() -> ConnectionPool:
 def connection() -> Iterator[Connection]:
     with get_pool().connection() as conn:
         try:
-            # Transaction-local and safe with pooled connections. This must be the
-            # first command in the transaction.
             with conn.cursor() as cur:
                 cur.execute("SET TRANSACTION READ WRITE")
         except ReadOnlySqlTransaction as exc:
@@ -130,16 +124,14 @@ def database_diagnostics() -> dict[str, Any]:
                 SELECT current_database() AS database_name,
                        current_user AS database_user,
                        pg_is_in_recovery() AS is_replica,
+                       current_setting('default_transaction_read_only') AS default_read_only,
                        current_setting('transaction_read_only') AS transaction_read_only,
-                       current_setting('default_transaction_read_only') AS default_transaction_read_only,
-                       to_regclass('public.rd_bars') AS rd_bars,
-                       to_regclass('public.ra_jobs') AS ra_jobs,
-                       now() AS checked_at
+                       current_setting('server_version') AS server_version
                 """
             )
-            row = dict(cur.fetchone())
+            state = dict(cur.fetchone())
         conn.rollback()
-    return {**target, **row}
+    return {**target, **state}
 
 
 def _schema_state(cur: Any) -> dict[str, bool]:
@@ -152,51 +144,20 @@ def _schema_state(cur: Any) -> dict[str, bool]:
             to_regprocedure('public.ra_ensure_feature_partitions(date,date)') IS NOT NULL AS partition_fn_ok,
             EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='ra_candidate_rules'
-                  AND column_name='entry_stride_minutes'
+                WHERE table_schema='public' AND table_name='ra_candidate_rules' AND column_name='entry_sampling_mode'
             ) AS methodology_ok,
             to_regclass('public.ra_discovery_samples') IS NOT NULL AS discovery_samples_ok,
             to_regclass('public.ra_discovery_sample_chunks') IS NOT NULL AS sample_chunks_ok,
-            to_regclass('public.ra_discovery_task_chunks') IS NOT NULL AS task_chunks_ok,
-            to_regclass('public.ra_discovery_partials') IS NOT NULL AS partials_ok,
-            to_regclass('public.ra_sealed_chunks') IS NOT NULL AS sealed_chunks_ok,
             EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='ra_discovery_sample_chunks'
-                  AND column_name='sample_stride_minutes'
-            ) AND EXISTS (
-                SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='ra_discovery_samples'
-                  AND column_name='fwd_return_60m_pct'
+                  AND column_name='sample_bucket'
             ) AS v2_sample_layout_ok,
             EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='ra_candidate_rules'
-                  AND column_name='statistics_method'
-            ) AS v2_candidate_columns_ok,
-            (SELECT count(*) = 5 FROM information_schema.columns
-             WHERE table_schema='public' AND table_name='ra_discovery_runs'
-               AND column_name = ANY(ARRAY[
-                   'campaign_name','hypothesis_ids','variant_count','defined_variant_count','campaign_definition_version'
-               ]))
-            AND (SELECT count(*) = 18 FROM information_schema.columns
-             WHERE table_schema='public' AND table_name='ra_candidate_rules'
-               AND column_name = ANY(ARRAY[
-                   'hypothesis_ids','hypothesis_version','variants_tested_campaign','variants_defined_campaign',
-                   'multiple_testing_method','multiple_testing_adjusted_p','discovery_p25_pct','discovery_p75_pct',
-                   'discovery_p95_pct','discovery_best_pct','validation_p25_pct','validation_p75_pct',
-                   'validation_p95_pct','validation_best_pct','discovery_status','sealed_feature_set_id',
-                   'statistics_method','rule_definition_version'
-               ]))
-            AND (SELECT count(*) = 27 FROM information_schema.columns
-             WHERE table_schema='public' AND table_name='ra_discovery_samples'
-               AND column_name = ANY(ARRAY[
-                   'close','price_group','ret_1m_pct','ret_15m_pct','ret_60m_pct','ret_from_session_open_pct',
-                   'relative_trade_count_20bar','rolling_realised_volatility_30bar','rolling_range_30bar_pct',
-                   'same_minute_relative_volume','previous_day_range_pct','previous_day_realised_volatility',
-                   'activity_adjusted_return_5m','prior_activity_adjusted_return_5m','activity_impact_change_ratio',
-                   'prior_relative_volume_20bar','prior_relative_trade_count_20bar','relative_volume_change_ratio',
-                   'relative_trade_count_change_ratio','range_vs_previous_day_ratio','volatility_vs_previous_day_ratio',
+                WHERE table_schema='public' AND table_name='ra_discovery_samples'
+                  AND column_name=ANY(ARRAY[
+                   'relative_trade_count_20bar','activity_impact_change_ratio',
                    'opening_range_high','opening_range_low','opening_range_position','touched_session_high',
                    'touched_session_low','fwd_return_60m_pct'
                ]))
@@ -255,19 +216,14 @@ def _apply_v110_methodology_migration(cur: Any) -> None:
     cur.execute("ALTER TABLE ra_candidate_rules ADD COLUMN IF NOT EXISTS rule_definition_version text NOT NULL DEFAULT 'legacy'")
 
 
-
-
 def _drop_incompatible_v2_discovery_tables(cur: Any) -> None:
-    """Remove only withdrawn draft-v2 staging tables before recreating them.
-
-    Runs, jobs, feature sets and candidates remain. The next retry resets legacy
-    discovery artefacts under the final engine definition.
-    """
+    """Remove only withdrawn draft-v2 staging tables before recreating them."""
     cur.execute("DROP TABLE IF EXISTS ra_discovery_partials CASCADE")
     cur.execute("DROP TABLE IF EXISTS ra_discovery_task_chunks CASCADE")
     cur.execute("DROP TABLE IF EXISTS ra_discovery_samples CASCADE")
     cur.execute("DROP TABLE IF EXISTS ra_discovery_sample_chunks CASCADE")
     cur.execute("DROP TABLE IF EXISTS ra_sealed_chunks CASCADE")
+
 
 def _apply_v200_discovery_migration(cur: Any) -> None:
     migration_path = Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.0.0.sql"
@@ -318,8 +274,6 @@ def execute_schema() -> None:
 
                 state = _schema_state(cur)
                 if _v1_core_is_compatible(state):
-                    # Apply only targeted, idempotent migrations. Replaying the full
-                    # schema against live feature jobs caused earlier lock inversions.
                     if not state.get("methodology_ok"):
                         _apply_v110_methodology_migration(cur)
                     if (state.get("discovery_samples_ok") or state.get("sample_chunks_ok")) and not state.get("v2_sample_layout_ok"):
@@ -329,9 +283,6 @@ def execute_schema() -> None:
                     _apply_v230_robustness_migration(cur)
                     _apply_v250_full_history_migration(cur)
                 else:
-                    # Fresh install: load the stable v2.3 baseline, then apply the
-                    # additive Phase-1 migration. This keeps schema.sql unchanged
-                    # and makes the v2.5 upgrade path identical on fresh/live DBs.
                     cur.execute(schema_path.read_text(encoding="utf-8"))
                     _apply_v250_full_history_migration(cur)
 
@@ -350,6 +301,7 @@ def execute_schema() -> None:
             f"Configured target: {target['host']}:{target['port']} ({target['mode']})."
         ) from exc
     logger.info("Pattern Discovery Workbench schema %s is ready", SCHEMA_VERSION)
+
 
 def close_pool() -> None:
     global _pool
