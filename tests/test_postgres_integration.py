@@ -89,7 +89,7 @@ def _reset_and_seed() -> None:
 def test_complete_postgres_workflow():
     from app.config import get_settings
     from app.db import close_pool, connection, execute_schema
-    from app.discovery import RULE_DEFINITION_VERSION, run_discovery, run_sealed_evaluation
+    from app.discovery import RULE_DEFINITION_VERSION, run_discovery
     from app.full_history import (
         freeze_candidate, run_historical_feature_backfill, run_market_state_build, run_candidate_wave_build
     )
@@ -98,7 +98,7 @@ def test_complete_postgres_workflow():
     from app.jobs import create_job
     from app.models import (
         CandidateWaveBuildConfig, DiscoveryConfig, FeatureBuildConfig, HistoricalFeatureBackfillConfig,
-        MarketStateBuildConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
+        MarketStateBuildConfig, RobustnessAnalysisConfig, UniverseBuildConfig,
     )
     from app.preflight import database_sql_preflight
     from app.universe import build_universe
@@ -283,15 +283,28 @@ def test_complete_postgres_workflow():
     assert robustness_result["summary"]["base"]["observations"] > 0
     assert robustness_result["verdict"] in {"REJECT","WEAK","PROMISING"}
 
-    freeze_candidate(candidate["id"], "Synthetic integration freeze")
-    sealed_config = SealedEvaluationConfig(
-        candidate_id=candidate["id"],
-        sealed_start="2026-08-04", sealed_end="2026-08-14",
-    )
-    sealed_job = create_job("sealed_evaluation", "Synthetic sealed", sealed_config.model_dump(mode="json"))
-    sealed_result = run_sealed_evaluation(str(sealed_job["id"]), sealed_config)
-    assert sealed_result["observations"] > 0
-    assert sealed_result["net_avg_pct"] > 0
+    # Ordinary signal robustness is no longer sufficient to unlock the true holdout.
+    # The candidate must first become a deployment candidate with a complete frozen
+    # execution/allocation methodology and a strategy-aware sealed evaluator.
+    with pytest.raises(ValueError, match="deployment candidate"):
+        freeze_candidate(candidate["id"], "Synthetic integration freeze")
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*) AS frozen
+                FROM ra_research_ledger
+                WHERE candidate_id=%s AND candidate_freeze_timestamp IS NOT NULL
+                """,
+                (candidate["id"],),
+            )
+            assert cur.fetchone()["frozen"] == 0
+        conn.rollback()
+    with pytest.raises(Exception, match="frozen"):
+        create_job(
+            "sealed_evaluation", "still locked after ordinary robustness",
+            {"candidate_id":str(candidate["id"]),"sealed_start":"2026-08-04","sealed_end":"2026-08-14"},
+        )
     close_pool()
 
 
