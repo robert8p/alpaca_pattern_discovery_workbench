@@ -14,6 +14,8 @@ from app.full_history import (
     assert_candidate_frozen, record_sealed_result, register_research_campaign, run_candidate_wave_build,
     run_historical_feature_backfill, run_market_state_build, sync_candidate_ledger,
 )
+from app.history_backfill import backfill_feature_config
+from app.point_in_time_universe import ensure_point_in_time_universes
 from app.jobs import (
     JobInterrupted, claim_next_job, fail_job, finish_job, interrupt_job,
     make_worker_id, recover_stale_jobs, worker_heartbeat,
@@ -26,7 +28,7 @@ from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "2.5.0"
+VERSION = "2.6.1"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
@@ -62,6 +64,11 @@ def _mark_related(job: dict[str, Any], status: str) -> None:
                 if status == "paused":
                     cur.execute("UPDATE ra_feature_chunks SET status='pending' WHERE feature_set_id IN (SELECT id FROM ra_feature_sets WHERE job_id=%s) AND status='running'", (job["id"],))
                     cur.execute("UPDATE ra_feature_batches SET status='pending' WHERE feature_chunk_id IN (SELECT c.id FROM ra_feature_chunks c JOIN ra_feature_sets f ON f.id=c.feature_set_id WHERE f.job_id=%s) AND status='running'", (job["id"],))
+            elif job["job_type"] == "point_in_time_universe_backfill":
+                cur.execute(
+                    "UPDATE ra_point_in_time_universe_runs SET status=%s,latest_error=CASE WHEN %s='failed' THEN latest_error ELSE NULL END WHERE parent_job_id=%s",
+                    (status, status, job["id"]),
+                )
             elif job["job_type"] == "market_state_build":
                 if status == "paused":
                     cur.execute("UPDATE ra_market_state_chunks SET status='pending' WHERE market_state_run_id IN (SELECT id FROM ra_market_state_runs WHERE job_id=%s) AND status='running'", (job["id"],))
@@ -110,6 +117,10 @@ def _dispatch(job: dict[str, Any]) -> dict[str, Any]:
         return result
     if job["job_type"] == "historical_feature_backfill":
         return run_historical_feature_backfill(job_id, HistoricalFeatureBackfillConfig.model_validate(config))
+    if job["job_type"] == "point_in_time_universe_backfill":
+        model = HistoricalFeatureBackfillConfig.model_validate(config)
+        reference_universe_run_id = backfill_feature_config(model).universe_run_id
+        return ensure_point_in_time_universes(job_id, model, reference_universe_run_id)
     if job["job_type"] == "market_state_build":
         return run_market_state_build(job_id, MarketStateBuildConfig.model_validate(config))
     if job["job_type"] == "candidate_wave_build":
