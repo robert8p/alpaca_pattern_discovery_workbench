@@ -9,15 +9,6 @@ if '/static/strategy.js' not in s:
     s=s.replace(old,new,1)
 p.write_text(s)
 
-p=Path('.github/workflows/ci.yml')
-s=p.read_text()
-old='run: node --check app/static/app.js && node --check app/static/phase1.js'
-new='run: node --check app/static/app.js && node --check app/static/phase1.js && node --check app/static/strategy.js'
-if 'node --check app/static/strategy.js' not in s:
-    if old not in s: raise SystemExit('CI JS syntax marker not found')
-    s=s.replace(old,new,1)
-p.write_text(s)
-
 p=Path('scripts/release_audit.py')
 s=p.read_text()
 old='''    strategy_source = (ROOT / "app/strategy_economics.py").read_text(encoding="utf-8")\n'''
