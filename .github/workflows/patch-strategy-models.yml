@@ -1,6 +1,8 @@
 name: patch-strategy-models
 on:
-  workflow_dispatch:
+  push:
+    branches: [whole-strategy-economics-v1]
+    paths: ['.github/workflows/patch-strategy-models.yml']
 permissions:
   contents: write
 jobs:
