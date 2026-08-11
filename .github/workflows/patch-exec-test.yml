@@ -1,0 +1,21 @@
+name: patch-exec-test
+on:
+  push:
+    branches: [executable-strategy-v27d]
+    paths: ['.github/workflows/patch-exec-test.yml']
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: executable-strategy-v27d
+      - run: |
+          python scripts/patch_exec_test_tmp.py
+          git config user.name 'Executable Strategy Research Builder'
+          git config user.email 'executable-strategy@users.noreply.github.com'
+          git add tests/test_postgres_integration.py tests/test_executable_strategy.py
+          git diff --cached --quiet || git commit -m 'Test executable strategy portfolio economics on PostgreSQL'
+          git push origin HEAD:executable-strategy-v27d
