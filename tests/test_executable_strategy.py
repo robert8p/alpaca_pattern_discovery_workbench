@@ -41,3 +41,9 @@ def test_migration_preserves_complete_strategy_and_sealed_guards():
     m=(Path(__file__).resolve().parents[1]/"sql/migrations/2.7.0.sql").read_text().lower()
     for token in ("ra_strategy_economics_runs","ra_strategy_trades","ra_strategy_equity_points","strategy_configuration_hash","strategy_freeze_timestamp","frozen executable strategy methodology is immutable","sealed whole-strategy evaluation requires the exact frozen strategy methodology"):
         assert token in m
+
+
+def test_worker_propagates_executable_strategy_failure_state():
+    source=(Path(__file__).resolve().parents[1]/"app/worker.py").read_text()
+    assert 'job["job_type"] == "strategy_economics_analysis"' in source
+    assert 'UPDATE ra_strategy_economics_runs SET status=%s' in source

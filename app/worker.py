@@ -80,6 +80,9 @@ def _mark_related(job: dict[str, Any], status: str) -> None:
                     cur.execute("UPDATE ra_candidate_wave_chunks SET status='pending' WHERE candidate_wave_run_id IN (SELECT id FROM ra_candidate_wave_runs WHERE job_id=%s) AND status='running'", (job["id"],))
                 if status in {"cancelled", "failed"}:
                     cur.execute("UPDATE ra_candidate_wave_runs SET status=%s WHERE job_id=%s", (status, job["id"]))
+            elif job["job_type"] == "strategy_economics_analysis":
+                if status in {"cancelled", "failed"}:
+                    cur.execute("UPDATE ra_strategy_economics_runs SET status=%s,completed_at=CASE WHEN %s='cancelled' THEN now() ELSE completed_at END WHERE job_id=%s", (status,status,job["id"]))
             elif job["job_type"] == "discovery_scan":
                 if status == "cancelled":
                     cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (job["id"],))
