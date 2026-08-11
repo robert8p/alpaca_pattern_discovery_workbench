@@ -12,6 +12,31 @@ from app.db import connection
 from app.research_policy import PRESEALED_END_DATE, SEALED_START_DATE
 from app.utils import json_safe
 
+REQUIRED_DEPLOYMENT_METHODOLOGY_FIELDS = (
+    "decision_information_policy",
+    "entry_execution",
+    "exit_execution",
+    "base_round_trip_cost_bps",
+    "spread_assumption",
+    "slippage_assumption",
+    "capital_allocation_method",
+    "position_sizing",
+    "simultaneous_signal_handling",
+    "maximum_gross_exposure",
+    "maximum_net_exposure",
+    "symbol_limit",
+    "sector_limit",
+    "daily_loss_rule",
+    "conflict_handling",
+    "unused_capital_policy",
+    "rebalance_methodology",
+    "liquidity_participation_limit",
+    "borrow_policy",
+    "funding_policy",
+    "stop_policy",
+)
+
+
 def _candidate_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "candidate_id": str(row["id"]),
@@ -35,6 +60,53 @@ def _candidate_snapshot(row: dict[str, Any]) -> dict[str, Any]:
 def _snapshot_hash(snapshot: dict[str, Any]) -> str:
     raw = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _validate_deployment_methodology(methodology: Any) -> dict[str, Any]:
+    if not isinstance(methodology, dict) or not methodology:
+        raise ValueError("A complete deployment methodology must be fixed before the candidate can be frozen for sealed evaluation")
+    missing = [field for field in REQUIRED_DEPLOYMENT_METHODOLOGY_FIELDS if field not in methodology]
+    if missing:
+        raise ValueError("Deployment methodology is incomplete; missing: " + ", ".join(missing))
+    return dict(methodology)
+
+
+def _deployment_freeze_context(candidate_id: str | UUID) -> dict[str, Any]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id,engine_version,summary,completed_at
+                FROM ra_robustness_runs
+                WHERE candidate_id=%s AND status='completed'
+                ORDER BY completed_at DESC NULLS LAST,created_at DESC
+                LIMIT 1
+                """,
+                (candidate_id,),
+            )
+            run = cur.fetchone()
+        conn.rollback()
+    if not run:
+        raise ValueError("A completed whole-strategy robustness run is required before sealed freeze")
+    summary = dict(run.get("summary") or {})
+    assessment = dict(summary.get("promotion_assessment") or {})
+    if assessment.get("deployment_candidate") is not True:
+        raise ValueError("Candidate is not a deployment candidate under the whole-strategy promotion standard")
+    blockers = list(assessment.get("deployment_blockers") or [])
+    if blockers:
+        raise ValueError("Candidate still has deployment blockers: " + "; ".join(str(x) for x in blockers))
+    if summary.get("sealed_engine_strategy_aware") is not True:
+        raise ValueError("Sealed evaluation is locked until the evaluator consumes the frozen complete strategy methodology")
+    methodology = _validate_deployment_methodology(summary.get("deployment_methodology"))
+    return {
+        "robustness_run_id": str(run["id"]),
+        "robustness_engine_version": run.get("engine_version"),
+        "research_objective": summary.get("research_objective"),
+        "research_objective_version": summary.get("research_objective_version"),
+        "promotion_classification": assessment.get("classification"),
+        "sealed_engine_strategy_aware": True,
+        "deployment_methodology": methodology,
+    }
 
 
 def register_research_campaign(discovery_run_id: str | UUID) -> str:
@@ -137,7 +209,7 @@ def sync_candidate_ledger(discovery_run_id: str | UUID) -> int:
 
 
 def freeze_candidate(candidate_id: str | UUID, notes: str | None = None) -> dict[str, Any]:
-    """Freeze the exact rule definition before any true sealed outcome is allowed."""
+    """Freeze the exact signal plus complete deployment methodology before true sealed outcome access."""
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -156,7 +228,12 @@ def freeze_candidate(candidate_id: str | UUID, notes: str | None = None) -> dict
         raise ValueError("Candidate does not exist")
     candidate = dict(row)
     sync_candidate_ledger(candidate["discovery_run_id"])
+    strategy_context = _deployment_freeze_context(candidate_id)
     snapshot = _candidate_snapshot(candidate)
+    snapshot["deployment_methodology"] = strategy_context["deployment_methodology"]
+    snapshot["robustness_freeze_context"] = {
+        key: value for key, value in strategy_context.items() if key != "deployment_methodology"
+    }
     fingerprint = _snapshot_hash(snapshot)
     with connection() as conn:
         with conn.cursor() as cur:
@@ -174,13 +251,13 @@ def freeze_candidate(candidate_id: str | UUID, notes: str | None = None) -> dict
                 raise RuntimeError("Research Ledger row was not created")
             if ledger["candidate_freeze_timestamp"]:
                 if ledger["frozen_candidate_hash"] != fingerprint:
-                    raise RuntimeError("Frozen Research Ledger definition differs from the current candidate")
+                    raise RuntimeError("Frozen Research Ledger definition differs from the current complete strategy")
             else:
                 cur.execute(
                     """
                     UPDATE ra_research_ledger SET complete_candidate_configuration=%s,
                         candidate_freeze_timestamp=now(),frozen_candidate_hash=%s,
-                        candidate_retention_status='frozen',classification='frozen_pre_sealed',
+                        candidate_retention_status='frozen',classification='frozen_complete_strategy_pre_sealed',
                         notes=COALESCE(%s,notes)
                     WHERE id=%s
                     RETURNING *
@@ -208,11 +285,18 @@ def assert_candidate_frozen(candidate_id: str | UUID) -> dict[str, Any]:
             ledger = cur.fetchone()
         conn.rollback()
     if not candidate or not ledger:
-        raise ValueError("Candidate must be frozen in the Research Ledger before sealed evaluation")
+        raise ValueError("Complete strategy must be frozen in the Research Ledger before sealed evaluation")
+    stored = dict(ledger.get("complete_candidate_configuration") or {})
+    methodology = _validate_deployment_methodology(stored.get("deployment_methodology"))
+    freeze_context = dict(stored.get("robustness_freeze_context") or {})
+    if freeze_context.get("sealed_engine_strategy_aware") is not True:
+        raise ValueError("Frozen candidate is not approved for strategy-aware sealed execution")
     snapshot = _candidate_snapshot(dict(candidate))
+    snapshot["deployment_methodology"] = methodology
+    snapshot["robustness_freeze_context"] = freeze_context
     fingerprint = _snapshot_hash(snapshot)
     if fingerprint != ledger["frozen_candidate_hash"]:
-        raise ValueError("Candidate definition changed after the Research Ledger freeze")
+        raise ValueError("Complete strategy definition changed after the Research Ledger freeze")
     return dict(ledger)
 
 
@@ -229,5 +313,3 @@ def record_sealed_result(candidate_id: str | UUID, start: date, end: date, resul
                 (start, end, Jsonb(result), candidate_id),
             )
         conn.commit()
-
-
