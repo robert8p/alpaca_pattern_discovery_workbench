@@ -1,4 +1,4 @@
-name: patch-strategy-ui-safe
+name: patch-strategy-tests
 on:
   push:
     branches: [whole-strategy-economics-v1]
@@ -12,11 +12,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: whole-strategy-economics-v1
-      - name: Patch strategy UI
+      - name: Patch strategy tests
         run: |
-          python scripts/patch_strategy_ui_tmp.py
+          python scripts/patch_strategy_tests_tmp.py
           git config user.name 'Whole Strategy Research Builder'
           git config user.email 'whole-strategy-research@users.noreply.github.com'
-          git add app/templates/index.html scripts/release_audit.py
-          git diff --cached --quiet || git commit -m 'Add whole-strategy economics UI and release checks'
+          git add tests/test_candidate_export.py tests/test_schema_startup.py tests/test_postgres_integration.py
+          git diff --cached --quiet || git commit -m 'Update integration tests for whole-strategy economics'
           git push origin HEAD:whole-strategy-economics-v1
