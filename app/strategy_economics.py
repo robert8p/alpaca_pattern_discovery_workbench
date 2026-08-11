@@ -668,7 +668,7 @@ def _daily_and_portfolio_metrics(run_id: str, capital: float, points: list[dict[
         for x in returns:
             local_wealth*=max(0.0,1+x/100.0); local_peak=max(local_peak,local_wealth); local_dd=min(local_dd,(local_wealth/local_peak-1)*100)
         rolling_20.append({
-            "end_date":window[-1]["trade_date"],"compounded_return_pct":_compound_pct(returns),
+            "end_date":window[-1]["trade_date"].isoformat(),"compounded_return_pct":_compound_pct(returns),
             "mean_market_day_return_pct":mu,"sharpe":mu/sd*(252**0.5) if sd>0 else None,
             "sortino":mu/dsd*(252**0.5) if dsd>0 else None,"profit_factor":_profit_factor(window_trade_returns),
             "maximum_drawdown_pct":local_dd,
@@ -921,11 +921,11 @@ def _record_research_result(candidate: dict[str,Any], run_id: str, config_hash: 
             if not row:
                 raise RuntimeError("Research Ledger entry missing for strategy candidate")
             if mode=="sealed":
-                cur.execute("UPDATE ra_research_ledger SET sealed_strategy_result=%s,classification=%s WHERE id=%s",(Jsonb(summary),classification,row["id"]))
+                cur.execute("UPDATE ra_research_ledger SET sealed_strategy_result=%s,classification=%s WHERE id=%s",(Jsonb(json_safe(summary)),classification,row["id"]))
             else:
                 cur.execute("""UPDATE ra_research_ledger SET strategy_economics_run_id=%s,strategy_configuration=%s,
                                strategy_configuration_hash=%s,strategy_economics_result=%s,classification=%s WHERE id=%s""",
-                            (run_id,Jsonb(config_payload),config_hash,Jsonb(summary),classification,row["id"]))
+                            (run_id,Jsonb(json_safe(config_payload)),config_hash,Jsonb(json_safe(summary)),classification,row["id"]))
         conn.commit()
 
 
@@ -984,7 +984,7 @@ def run_strategy_economics(job_id: str, config: StrategyEconomicsConfig) -> dict
                             cur.execute("""INSERT INTO ra_strategy_stress_results(strategy_run_id,capital_level,entry_delay_minutes,round_trip_cost_bps,metrics)
                                            VALUES (%s,%s,%s,%s,%s) ON CONFLICT (strategy_run_id,capital_level,entry_delay_minutes,round_trip_cost_bps)
                                            DO UPDATE SET metrics=excluded.metrics,created_at=now()""",
-                                        (run_id,float(capital),delay,float(cost),Jsonb(metrics)))
+                                        (run_id,float(capital),delay,float(cost),Jsonb(json_safe(metrics))))
                         conn.commit()
     check_control(job_id)
     set_progress(job_id,"regime and dependence analysis",3,5)
@@ -1005,14 +1005,14 @@ def run_strategy_economics(job_id: str, config: StrategyEconomicsConfig) -> dict
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO ra_strategy_metric_sets(strategy_run_id,capital_level,metric_scope,metrics,scorecard,classification)
                                VALUES (%s,%s,'base',%s,%s,%s)""",
-                            (run_id,float(capital),Jsonb(all_metrics[str(capital)]),Jsonb(scorecard),classification))
+                            (run_id,float(capital),Jsonb(json_safe(all_metrics[str(capital)])),Jsonb(json_safe(scorecard)),classification))
             conn.commit()
         if float(capital)==float(config.capital_levels[0]):
             primary_summary=all_metrics[str(capital)]; primary_scorecard=scorecard; primary_classification=classification
     summary={
         "strategy_run_id":run_id,"strategy_config_hash":config_hash,"engine_version":STRATEGY_ECONOMICS_VERSION,
         "candidate_id":str(candidate["id"]),"mode":config.mode,"research_stage":config.research_stage,
-        "start_date":config.start_date,"end_date":config.end_date,"capital_levels":config.capital_levels,
+        "start_date":config.start_date.isoformat(),"end_date":config.end_date.isoformat(),"capital_levels":config.capital_levels,
         "primary_capital_level":config.capital_levels[0],"primary_metrics":primary_summary,
         "primary_scorecard":primary_scorecard,"chronology_pass":chronology_pass,"all_capital_metrics":all_metrics,
         "stress_results":stress_output if config.mode=="research" else [],
@@ -1031,7 +1031,7 @@ def run_strategy_economics(job_id: str, config: StrategyEconomicsConfig) -> dict
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE ra_strategy_economics_runs SET status='completed',classification=%s,summary=%s,scorecard=%s,regime_coverage_pct=%s,completed_at=now() WHERE id=%s",
-                        (primary_classification,Jsonb(summary),Jsonb(primary_scorecard or {}),summary["regime_coverage_pct"],run_id))
+                        (primary_classification,Jsonb(json_safe(summary)),Jsonb(json_safe(primary_scorecard or {})),summary["regime_coverage_pct"],run_id))
         conn.commit()
     set_progress(job_id,"complete",5,5,result=summary)
     add_event(job_id,"strategy_economics_completed","Whole-strategy economics completed; hit rate is retained only as a diagnostic.",details={"strategy_run_id":run_id,"classification":primary_classification,"strategy_config_hash":config_hash})
@@ -1065,7 +1065,7 @@ def freeze_strategy(candidate_id: UUID | str, strategy_run_id: UUID | str, notes
                 cur.execute("""UPDATE ra_research_ledger SET strategy_economics_run_id=%s,strategy_configuration=%s,
                                strategy_configuration_hash=%s,strategy_freeze_timestamp=now(),candidate_retention_status='strategy_frozen',
                                notes=COALESCE(%s,notes) WHERE id=%s RETURNING *""",
-                            (strategy_run_id,Jsonb(payload),fingerprint,notes,ledger["id"]))
+                            (strategy_run_id,Jsonb(json_safe(payload)),fingerprint,notes,ledger["id"]))
                 ledger=cur.fetchone()
         conn.commit()
     return json_safe({"candidate_id":candidate_id,"strategy_run_id":strategy_run_id,"strategy_config_hash":fingerprint,"ledger":dict(ledger)})

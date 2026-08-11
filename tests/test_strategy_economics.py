@@ -163,3 +163,16 @@ def test_simulation_carries_direction_for_overlap_accounting():
     accepted = [r for r in rows if r["accepted"]]
     assert len(accepted) == 2
     assert all(r["direction"] == "short" for r in accepted)
+
+
+
+def test_strategy_json_payloads_are_safe_for_long_rolling_windows():
+    from app.utils import json_safe
+    import json
+    payload = {
+        "start_date": date(2025, 5, 5),
+        "rolling_20_market_day": [{"end_date": date(2025, 6, 2), "profit_factor": 1.2}],
+    }
+    safe = json_safe(payload)
+    encoded = json.dumps(safe)
+    assert "2025-05-05" in encoded and "2025-06-02" in encoded
