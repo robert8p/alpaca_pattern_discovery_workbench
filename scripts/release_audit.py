@@ -62,9 +62,6 @@ def audit_execute_parameter_counts() -> int:
                 continue
             if not isinstance(node.args[1], (ast.Tuple, ast.List)):
                 continue
-            # Starred elements (for example ``(*common, threshold)``) are
-            # dynamically sized and cannot be counted accurately from the AST.
-            # Generated-query validation covers those paths separately.
             if any(isinstance(element, ast.Starred) for element in node.args[1].elts):
                 continue
             report = inspect_psycopg_placeholders(node.args[0].value)
@@ -79,15 +76,8 @@ def audit_execute_parameter_counts() -> int:
     return checked
 
 
-
-
 def audit_on_conflict_update_targets() -> int:
-    """Reject PostgreSQL UPSERTs that use DO UPDATE without a conflict target.
-
-    PostgreSQL allows a target-less ``ON CONFLICT DO NOTHING``, but ``DO UPDATE``
-    requires either ``(column, ...)`` or ``ON CONSTRAINT name``. This check is
-    deliberately available offline so migration syntax is not dependent on CI.
-    """
+    """Reject PostgreSQL UPSERTs that use DO UPDATE without a conflict target."""
     checked = 0
     errors: list[str] = []
     paths = list((ROOT / "app").glob("*.py")) + [ROOT / "sql" / "schema.sql"]
@@ -109,6 +99,7 @@ def audit_on_conflict_update_targets() -> int:
     if errors:
         raise RuntimeError("Invalid PostgreSQL UPSERT syntax:\n" + "\n".join(errors))
     return checked
+
 
 def audit_raw_write_policy() -> None:
     text = "\n".join(path.read_text(encoding="utf-8") for path in (ROOT / "app").glob("*.py"))
@@ -191,11 +182,11 @@ def audit_blueprint() -> None:
         raise RuntimeError("Both services must pin Python 3.12.7")
 
 
-
 def audit_research_integrity_ui() -> None:
     html = (ROOT / "app/templates/index.html").read_text(encoding="utf-8")
     javascript = (ROOT / "app/static/app.js").read_text(encoding="utf-8")
     phase1_javascript = (ROOT / "app/static/phase1.js").read_text(encoding="utf-8")
+    pti_source = (ROOT / "app/point_in_time_universe.py").read_text(encoding="utf-8")
     for token in (
         'value="dip_repair"', 'value="compression_expansion"', 'value="gap_state"',
         'value="activity_absorption"', 'value="price_efficiency"',
@@ -215,6 +206,13 @@ def audit_research_integrity_ui() -> None:
     for token in ("refreshFullHistory", "/api/full-history/status", "candidate-freeze", "Freeze in Research Ledger", "openFullHistoryView"):
         if token not in phase1_javascript:
             raise RuntimeError(f"Phase-1 browser flow is missing {token}")
+    for token in ("inactive_known", "all_known_warmup_ready", "inactive_survivorship_ready", "Point-in-time historical source is not ready"):
+        if token not in pti_source:
+            raise RuntimeError(f"Point-in-time source gate is missing {token}")
+    for token in ("fh-pti-ready", "All-known 61-day warm-up", "Inactive survivorship supplement", "Source blockers"):
+        if token not in phase1_javascript:
+            raise RuntimeError(f"Point-in-time source readiness UI is missing {token}")
+
 
 def audit_secrets() -> None:
     suspicious = re.compile(r"(?:eyJ[a-zA-Z0-9_-]{30,}|AKIA[0-9A-Z]{16}|postgresql://[^\s:]+:[^@\s]{12,}@)")

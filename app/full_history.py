@@ -9,13 +9,16 @@ from app.history_backfill import (
 )
 from app.market_state import _market_state_insert_sql, run_market_state_build
 from app.candidate_waves import _candidate_wave_query, run_candidate_wave_build
+from app.point_in_time_universe import point_in_time_source_readiness
 from app.research_ledger import (
     assert_candidate_frozen, freeze_candidate, record_sealed_result, register_research_campaign, sync_candidate_ledger,
 )
 from app.research_policy import HISTORY_START_DATE, PRESEALED_END_DATE, SEALED_START_DATE
 from app.utils import json_safe
 
+
 def full_history_status() -> dict[str, Any]:
+    reference_universe_id = None
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM ra_research_controls WHERE singleton=true")
@@ -31,6 +34,19 @@ def full_history_status() -> dict[str, Any]:
             inventory = cur.fetchone()
             cur.execute("SELECT * FROM ra_full_history_backfills ORDER BY created_at DESC LIMIT 1")
             backfill = cur.fetchone()
+            if backfill:
+                reference_universe_id = backfill.get("universe_run_id")
+            if not reference_universe_id:
+                cur.execute(
+                    """
+                    SELECT universe_run_id FROM ra_feature_sets
+                    WHERE status='completed' AND config->>'timeframe'='1Min' AND config->>'feed'='sip'
+                      AND config->>'adjustment'='raw' AND config->>'session'='regular'
+                    ORDER BY created_at DESC LIMIT 1
+                    """
+                )
+                reference = cur.fetchone()
+                reference_universe_id = reference["universe_run_id"] if reference else None
             job = None
             current_chunk = None
             if backfill and backfill.get("job_id"):
@@ -55,11 +71,20 @@ def full_history_status() -> dict[str, Any]:
             cur.execute("SELECT to_regclass('public.ra_market_state_features') market_state_table,to_regclass('public.ra_candidate_wave_stats') wave_table,to_regclass('public.ra_research_ledger') ledger_table")
             infra = cur.fetchone()
         conn.rollback()
+
+    pti_source = None
+    if reference_universe_id:
+        try:
+            pti_source = point_in_time_source_readiness(reference_universe_id, HISTORY_START_DATE, PRESEALED_END_DATE)
+        except Exception as exc:
+            pti_source = {"ready": False, "blockers": [f"Readiness audit failed: {exc}"]}
+
     months_available = len(_month_partitions(HISTORY_START_DATE, PRESEALED_END_DATE))
     return json_safe({
         "phase": "Phase 1 infrastructure",
-        "execution_policy": "Full historical execution remains locked; one-day test only until explicitly enabled.",
+        "execution_policy": "Full historical execution remains locked; one-day test only until point-in-time source readiness is green and explicitly enabled.",
         "historical_source_coverage": dict(inventory) if inventory else None,
+        "point_in_time_source_readiness": pti_source,
         "configured_history_start": HISTORY_START_DATE,
         "presealed_end": PRESEALED_END_DATE,
         "months_available": months_available,

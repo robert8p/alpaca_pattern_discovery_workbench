@@ -13,18 +13,13 @@ from app.models import HistoricalFeatureBackfillConfig, UniverseBuildConfig
 from app.universe import build_universe
 from app.utils import json_safe
 
-PTI_UNIVERSE_VERSION = "1.0.2"
+PTI_UNIVERSE_VERSION = "1.1.0"
 PTI_LOOKBACK_CALENDAR_DAYS = 61
 PTI_SCHEMA_LOCK = "alpaca_pattern_discovery_pti_universe_schema"
 
 
 def ensure_point_in_time_schema() -> None:
-    """Install the additive point-in-time schema if startup predates this module.
-
-    Phase 1 v2.5.0 shipped before the point-in-time universe layer. The live
-    project receives this migration directly, while this idempotent lazy path
-    keeps fresh CI databases and disaster-recovery installs safe as well.
-    """
+    """Install the additive point-in-time schema if startup predates this module."""
     migration = Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.6.0.sql"
     with connection() as conn:
         with conn.cursor() as cur:
@@ -49,12 +44,151 @@ def _reference_universe(reference_universe_run_id: UUID | str) -> dict[str, Any]
     return dict(row)
 
 
+def _covers_range(intervals: list[tuple[date, date]], required_start: date, required_end: date) -> bool:
+    """Return true when completed source-job intervals continuously cover the required calendar range."""
+    cursor = required_start
+    for start, end in sorted(intervals):
+        if end < cursor:
+            continue
+        if start > cursor:
+            return False
+        cursor = max(cursor, end + timedelta(days=1))
+        if cursor > required_end:
+            return True
+    return cursor > required_end
+
+
+def _source_job_intervals(mode: str, source: dict[str, Any]) -> list[dict[str, Any]]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id,name,(config->>'start_date')::date AS start_date,(config->>'end_date')::date AS end_date,
+                       symbol_count,total_tasks,completed_tasks
+                FROM rd_jobs
+                WHERE status='completed'
+                  AND config->'timeframes' @> '["1Min"]'::jsonb
+                  AND config->>'feed'=%s AND config->>'adjustment'=%s
+                  AND config->'session'->>'mode'='all'
+                  AND config->'universe'->>'mode'=%s
+                ORDER BY (config->>'start_date')::date,created_at
+                """,
+                (source.get("feed", "sip"), source.get("adjustment", "raw"), mode),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        conn.rollback()
+    return rows
+
+
+def _spy_trading_dates(source: dict[str, Any], start_date: date, end_date: date) -> list[date]:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT (b.bar_ts AT TIME ZONE 'America/New_York')::date AS trade_date
+                FROM rd_bars b
+                WHERE b.symbol='SPY' AND b.timeframe=%s AND b.feed=%s AND b.adjustment=%s
+                  AND b.session_label='regular'
+                  AND (b.bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
+                ORDER BY trade_date
+                """,
+                (
+                    source.get("timeframe", "1Min"),
+                    source.get("feed", "sip"),
+                    source.get("adjustment", "raw"),
+                    start_date,
+                    end_date,
+                ),
+            )
+            dates = [row["trade_date"] for row in cur.fetchall()]
+        conn.rollback()
+    return dates
+
+
+def point_in_time_source_readiness(
+    reference_universe_run_id: UUID | str,
+    research_start: date,
+    research_end: date,
+) -> dict[str, Any]:
+    """Audit whether raw history is sufficient for a survivorship-aware 61-day PTI universe.
+
+    The existing broad all-active history supplies securities still active later.
+    Two explicit supplements are required before full-history research is allowed:
+    1) all-known history for the entire 61-calendar-day lookback before the first
+       research trading day; and
+    2) inactive-known history across the research period, so later-delisted names
+       are not absent merely because they are inactive now.
+    """
+    ref = _reference_universe(reference_universe_run_id)
+    source = dict(ref.get("source_config") or {})
+    calendar_start = research_start - timedelta(days=PTI_LOOKBACK_CALENDAR_DAYS + 7)
+    trading_dates = _spy_trading_dates(source, calendar_start, research_end)
+    research_dates = [d for d in trading_dates if research_start <= d <= research_end]
+    blockers: list[str] = []
+    if not research_dates:
+        return {
+            "ready": False,
+            "blockers": ["No SPY regular-session trading dates are available inside the requested research period."],
+            "methodology_version": PTI_UNIVERSE_VERSION,
+        }
+
+    first_trade = research_dates[0]
+    last_trade = research_dates[-1]
+    warmup_start = first_trade - timedelta(days=PTI_LOOKBACK_CALENDAR_DAYS)
+    prior_trading_dates = [d for d in trading_dates if warmup_start <= d < first_trade]
+    warmup_end = prior_trading_dates[-1] if prior_trading_dates else first_trade - timedelta(days=1)
+
+    selection = dict(ref.get("selection_config") or {})
+    minimum_trading_days = int(selection.get("minimum_trading_days") or 15)
+    if len(prior_trading_dates) < minimum_trading_days:
+        blockers.append(
+            f"Only {len(prior_trading_dates)} SPY trading dates exist in the 61-day pre-research window; {minimum_trading_days} are required."
+        )
+
+    active_jobs = _source_job_intervals("all_active", source)
+    warmup_jobs = _source_job_intervals("all_known", source)
+    inactive_jobs = _source_job_intervals("inactive_known", source)
+
+    active_intervals = [(row["start_date"], row["end_date"]) for row in active_jobs]
+    warmup_intervals = [(row["start_date"], row["end_date"]) for row in warmup_jobs]
+    inactive_intervals = [(row["start_date"], row["end_date"]) for row in inactive_jobs]
+
+    active_ready = _covers_range(active_intervals, first_trade, last_trade)
+    warmup_ready = _covers_range(warmup_intervals, warmup_start, warmup_end)
+    inactive_ready = _covers_range(inactive_intervals, first_trade, last_trade)
+
+    if not active_ready:
+        blockers.append(f"Completed all-active 1Min SIP/raw/all-session source jobs do not cover {first_trade} through {last_trade}.")
+    if not warmup_ready:
+        blockers.append(f"Completed all-known warm-up jobs do not cover the full 61-day universe lookback {warmup_start} through {warmup_end}.")
+    if not inactive_ready:
+        blockers.append(f"Completed inactive-known survivorship supplement does not cover {first_trade} through {last_trade}.")
+
+    return {
+        "ready": not blockers,
+        "blockers": blockers,
+        "methodology_version": PTI_UNIVERSE_VERSION,
+        "research_start": research_start,
+        "research_end": research_end,
+        "first_research_trade_date": first_trade,
+        "last_research_trade_date": last_trade,
+        "required_warmup_start": warmup_start,
+        "required_warmup_end": warmup_end,
+        "prior_trading_dates": len(prior_trading_dates),
+        "minimum_trading_days": minimum_trading_days,
+        "active_history_ready": active_ready,
+        "all_known_warmup_ready": warmup_ready,
+        "inactive_survivorship_ready": inactive_ready,
+        "active_source_job_ids": [str(row["id"]) for row in active_jobs],
+        "warmup_source_job_ids": [str(row["id"]) for row in warmup_jobs],
+        "inactive_source_job_ids": [str(row["id"]) for row in inactive_jobs],
+    }
+
+
 def snapshot_universe_config(reference_universe_run_id: UUID | str, snapshot_date: date) -> UniverseBuildConfig:
     """Clone the existing liquid-universe methodology using past data only."""
     ref = _reference_universe(reference_universe_run_id)
     selection = dict(ref.get("selection_config") or {})
-    # 61 calendar days mirrors the original June-04 through Aug-03 inclusive
-    # universe window. The snapshot ends on T-1, never on T.
     lookback_end = snapshot_date - timedelta(days=1)
     lookback_start = snapshot_date - timedelta(days=PTI_LOOKBACK_CALENDAR_DAYS)
     selection.update(
@@ -71,6 +205,11 @@ def _ensure_pti_run(job_id: str, config: HistoricalFeatureBackfillConfig, refere
     ensure_point_in_time_schema()
     ref = _reference_universe(reference_universe_run_id)
     cadence = "single_date" if config.scope == "one_day_test" else "monthly"
+    source_config = dict(ref.get("source_config") or {})
+    if config.scope == "full_history":
+        source_config["historical_source_readiness"] = json_safe(
+            point_in_time_source_readiness(reference_universe_run_id, config.start_date, config.end_date)
+        )
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM ra_point_in_time_universe_runs WHERE parent_job_id=%s", (job_id,))
@@ -80,10 +219,10 @@ def _ensure_pti_run(job_id: str, config: HistoricalFeatureBackfillConfig, refere
                 cur.execute(
                     """
                     UPDATE ra_point_in_time_universe_runs SET status='running',latest_error=NULL,
-                        requested_start=%s,requested_end=%s,methodology_version=%s,completed_at=NULL,
+                        requested_start=%s,requested_end=%s,methodology_version=%s,source_config=%s,completed_at=NULL,
                         started_at=COALESCE(started_at,now()) WHERE id=%s
                     """,
-                    (config.start_date, config.end_date, PTI_UNIVERSE_VERSION, run_id),
+                    (config.start_date, config.end_date, PTI_UNIVERSE_VERSION, Jsonb(source_config), run_id),
                 )
             else:
                 cur.execute(
@@ -101,7 +240,7 @@ def _ensure_pti_run(job_id: str, config: HistoricalFeatureBackfillConfig, refere
                         config.end_date,
                         cadence,
                         PTI_LOOKBACK_CALENDAR_DAYS,
-                        Jsonb(ref.get("source_config") or {}),
+                        Jsonb(source_config),
                         Jsonb(ref.get("selection_config") or {}),
                         PTI_UNIVERSE_VERSION,
                     ),
@@ -118,36 +257,14 @@ def _snapshot_dates(config: HistoricalFeatureBackfillConfig, reference_universe_
     source = dict(ref.get("source_config") or {})
     selection = dict(ref.get("selection_config") or {})
     minimum_trading_days = int(selection.get("minimum_trading_days") or 15)
-    with connection() as conn:
-        with conn.cursor() as cur:
-            # Use SPY only as a trading-calendar proxy. Eligibility still comes
-            # from each stock's own bars inside build_universe(). Crucially, we
-            # count warm-up dates only from the requested broad-history start,
-            # not SPY's older standalone history.
-            cur.execute(
-                """
-                SELECT DISTINCT (b.bar_ts AT TIME ZONE 'America/New_York')::date AS trade_date
-                FROM rd_bars b
-                WHERE b.symbol='SPY' AND b.timeframe=%s AND b.feed=%s AND b.adjustment=%s
-                  AND b.session_label='regular'
-                  AND (b.bar_ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s
-                ORDER BY trade_date
-                """,
-                (
-                    source.get("timeframe", "1Min"),
-                    source.get("feed", "sip"),
-                    source.get("adjustment", "raw"),
-                    config.start_date,
-                    config.end_date,
-                ),
-            )
-            trading_dates = [row["trade_date"] for row in cur.fetchall()]
-        conn.rollback()
-    if not trading_dates:
+    readiness = point_in_time_source_readiness(reference_universe_run_id, config.start_date, config.end_date)
+    if not readiness["ready"]:
         return []
+    trading_dates = _spy_trading_dates(source, readiness["required_warmup_start"], config.end_date)
+    research_dates = [d for d in trading_dates if config.start_date <= d <= config.end_date]
 
     eligible_dates: list[date] = []
-    for candidate in trading_dates:
+    for candidate in research_dates:
         prior_count = sum(
             1
             for prior in trading_dates
@@ -158,10 +275,6 @@ def _snapshot_dates(config: HistoricalFeatureBackfillConfig, reference_universe_
     if not eligible_dates:
         return []
 
-    # The first eligible date is an explicit bootstrap snapshot so late-May
-    # history is not silently discarded just because the monthly snapshot at
-    # the start of May lacked the required 15 prior trading days. Thereafter we
-    # use the first eligible trading date of each month.
     snapshots = [eligible_dates[0]]
     seen_months = {(eligible_dates[0].year, eligible_dates[0].month)}
     for d in eligible_dates[1:]:
@@ -303,15 +416,11 @@ def ensure_point_in_time_universes(
     config: HistoricalFeatureBackfillConfig,
     reference_universe_run_id: UUID | str,
 ) -> dict[str, Any]:
-    """Create immutable-as-of monthly universe snapshots before feature work.
-
-    Each snapshot invokes the exact existing UniverseBuildConfig methodology but
-    sets its source window to end on T-1. The first snapshot is the earliest date
-    with the required historical liquidity warm-up; monthly snapshots follow.
-    Existing snapshots can safely extend their effective end date when a completed
-    historical job is grown to a later month; the frozen membership itself is never
-    recomputed unless that snapshot failed.
-    """
+    """Create immutable-as-of monthly universe snapshots before feature work."""
+    if config.scope == "full_history":
+        readiness = point_in_time_source_readiness(reference_universe_run_id, config.start_date, config.end_date)
+        if not readiness["ready"]:
+            raise RuntimeError("Point-in-time historical source is not ready: " + " | ".join(readiness["blockers"]))
     run_id = _ensure_pti_run(job_id, config, reference_universe_run_id)
     _plan_snapshots(run_id, config, reference_universe_run_id)
     with connection() as conn:
@@ -322,6 +431,8 @@ def ensure_point_in_time_universes(
             )
             snapshots = [dict(row) for row in cur.fetchall()]
         conn.rollback()
+    if not snapshots:
+        raise RuntimeError("No point-in-time universe snapshots were planned for the requested period.")
     built: list[dict[str, Any]] = []
     try:
         for snapshot in snapshots:
