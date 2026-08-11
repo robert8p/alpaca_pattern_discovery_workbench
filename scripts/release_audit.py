@@ -22,9 +22,9 @@ from app.db import APP_VERSION, SCHEMA_VERSION
 from app.preflight import local_sql_preflight
 from app.sql_validation import SqlBindingError, inspect_psycopg_placeholders
 
-EXPECTED_APP_VERSION = "2.5.0"
+EXPECTED_APP_VERSION = "2.7.0"
 EXPECTED_DISCOVERY_VERSION = "2.2.0"
-EXPECTED_SCHEMA_VERSION = "2.5.0"
+EXPECTED_SCHEMA_VERSION = "2.7.0"
 
 
 def audit_sql_literals() -> int:
@@ -130,6 +130,9 @@ def audit_schema() -> None:
     migration_pack = (ROOT / "sql/migrations/2.2.0.sql").read_text(encoding="utf-8")
     migration_robustness = (ROOT / "sql/migrations/2.3.0.sql").read_text(encoding="utf-8")
     migration_phase1 = (ROOT / "sql/migrations/2.5.0.sql").read_text(encoding="utf-8")
+    migration_pti = (ROOT / "sql/migrations/2.6.0.sql").read_text(encoding="utf-8")
+    migration_pti_hotfix = (ROOT / "sql/migrations/2.6.1.sql").read_text(encoding="utf-8")
+    migration_strategy = (ROOT / "sql/migrations/2.7.0.sql").read_text(encoding="utf-8")
     v2_required = (
         "ra_discovery_samples", "ra_discovery_sample_chunks", "ra_discovery_task_chunks",
         "ra_discovery_partials", "ra_sealed_chunks", "sample_stride_minutes",
@@ -167,9 +170,22 @@ def audit_schema() -> None:
     for token in phase1_required:
         if token not in migration_phase1:
             raise RuntimeError(f"Phase-1 full-history migration is missing {token}")
+    pti_required = ("ra_point_in_time_universe_runs", "ra_point_in_time_universe_snapshots", "ra_feature_chunk_universes", "ra_point_in_time_universe_snapshot_guard")
+    for token in pti_required:
+        if token not in migration_pti and token not in migration_pti_hotfix:
+            raise RuntimeError(f"Point-in-time migration is missing {token}")
+    strategy_required = (
+        "ra_strategy_economics_runs", "ra_strategy_trades", "ra_strategy_equity_points", "ra_strategy_daily_metrics",
+        "ra_strategy_metric_sets", "ra_strategy_stress_results", "ra_strategy_regime_results", "ra_strategy_combination_specs",
+        "strategy_configuration_hash", "strategy_freeze_timestamp", "ra_research_ledger_strategy_guard",
+    )
+    for token in strategy_required:
+        if token not in migration_strategy:
+            raise RuntimeError(f"Whole-strategy migration is missing {token}")
     db_source = (ROOT / "app/db.py").read_text(encoding="utf-8")
-    if "_apply_v250_full_history_migration(cur)" not in db_source:
-        raise RuntimeError("Fresh/live schema paths do not apply the Phase-1 migration")
+    for token in ("_apply_v250_full_history_migration(cur)", "_apply_v260_point_in_time_migration(cur)", "_apply_v261_point_in_time_hotfix(cur)", "_apply_v270_strategy_economics_migration(cur)"):
+        if token not in db_source:
+            raise RuntimeError(f"Fresh/live schema paths do not apply required migration: {token}")
     if "CREATE TABLE IF NOT EXISTS rd_" in schema:
         raise RuntimeError("Schema creates raw rd_ tables")
 
@@ -187,6 +203,7 @@ def audit_research_integrity_ui() -> None:
     javascript = (ROOT / "app/static/app.js").read_text(encoding="utf-8")
     phase1_javascript = (ROOT / "app/static/phase1.js").read_text(encoding="utf-8")
     pti_source = (ROOT / "app/point_in_time_universe.py").read_text(encoding="utf-8")
+    strategy_source = (ROOT / "app/strategy_economics.py").read_text(encoding="utf-8")
     for token in (
         'value="dip_repair"', 'value="compression_expansion"', 'value="gap_state"',
         'value="activity_absorption"', 'value="price_efficiency"',
@@ -212,6 +229,9 @@ def audit_research_integrity_ui() -> None:
     for token in ("fh-pti-ready", "All-known 61-day warm-up", "Inactive survivorship supplement", "Source blockers"):
         if token not in phase1_javascript:
             raise RuntimeError(f"Point-in-time source readiness UI is missing {token}")
+    for token in ("net_expected_value_pct", "maximum_drawdown_pct", "same_timestamp_outcome_icc", "strategy_config_hash", "assert_strategy_frozen"):
+        if token not in strategy_source:
+            raise RuntimeError(f"Whole-strategy economics engine is missing {token}")
 
 
 def audit_secrets() -> None:

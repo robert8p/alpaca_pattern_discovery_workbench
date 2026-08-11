@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.db import close_pool, connection, execute_schema
 from app.discovery import _ensure_discovery_run, run_discovery, run_sealed_evaluation
 from app.robustness import run_robustness
+from app.strategy_economics import run_strategy_economics
 from app.features import build_feature_set
 from app.full_history import (
     assert_candidate_frozen, record_sealed_result, register_research_campaign, run_candidate_wave_build,
@@ -22,13 +23,13 @@ from app.jobs import (
 )
 from app.models import (
     CandidateWaveBuildConfig, DiscoveryConfig, FeatureBuildConfig, HistoricalFeatureBackfillConfig,
-    MarketStateBuildConfig, QualityScanConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
+    MarketStateBuildConfig, QualityScanConfig, RobustnessAnalysisConfig, SealedEvaluationConfig, StrategyEconomicsConfig, UniverseBuildConfig,
 )
 from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "2.5.0"
+VERSION = "2.7.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
@@ -79,6 +80,9 @@ def _mark_related(job: dict[str, Any], status: str) -> None:
                     cur.execute("UPDATE ra_candidate_wave_chunks SET status='pending' WHERE candidate_wave_run_id IN (SELECT id FROM ra_candidate_wave_runs WHERE job_id=%s) AND status='running'", (job["id"],))
                 if status in {"cancelled", "failed"}:
                     cur.execute("UPDATE ra_candidate_wave_runs SET status=%s WHERE job_id=%s", (status, job["id"]))
+            elif job["job_type"] == "strategy_economics_analysis":
+                if status in {"cancelled", "failed"}:
+                    cur.execute("UPDATE ra_strategy_economics_runs SET status=%s,completed_at=CASE WHEN %s='cancelled' THEN now() ELSE completed_at END WHERE job_id=%s", (status, status, job["id"]))
             elif job["job_type"] == "discovery_scan":
                 if status == "cancelled":
                     cur.execute("UPDATE ra_discovery_runs SET status='cancelled',completed_at=now() WHERE job_id=%s", (job["id"],))
@@ -125,6 +129,10 @@ def _dispatch(job: dict[str, Any]) -> dict[str, Any]:
         return run_market_state_build(job_id, MarketStateBuildConfig.model_validate(config))
     if job["job_type"] == "candidate_wave_build":
         return run_candidate_wave_build(job_id, CandidateWaveBuildConfig.model_validate(config))
+    if job["job_type"] == "strategy_economics_analysis":
+        return run_strategy_economics(job_id, StrategyEconomicsConfig.model_validate(config))
+    if job["job_type"] == "strategy_combination_analysis":
+        raise ValueError("Combined-strategy analysis remains locked until at least two independently validated standalone strategy runs are eligible and the combination methodology is frozen.")
     raise ValueError(f"Unsupported job type: {job['job_type']}")
 
 

@@ -19,16 +19,17 @@ from app.db import close_pool, connection, database_diagnostics, database_target
 from app.features import estimate_feature_build
 from app.exports import build_candidate_export_bundle, export_filename
 from app.jobs import create_job
+from app.strategy_economics import assert_strategy_frozen, freeze_strategy, run_strategy_economics, strategy_config_hash
 from app.full_history import assert_candidate_frozen, freeze_candidate, full_history_status
 from app.preflight import database_sql_preflight, local_sql_preflight
 from app.models import (
     CandidateFreezeRequest, CandidateWaveBuildConfig, DiscoveryConfig, FeatureBuildConfig, FeatureEstimateRequest,
     HistoricalFeatureBackfillConfig, JobCreateRequest, MarketStateBuildConfig, QualityScanConfig,
-    RobustnessAnalysisConfig, SealedEvaluationConfig, UniverseBuildConfig,
+    RobustnessAnalysisConfig, SealedEvaluationConfig, StrategyEconomicsConfig, UniverseBuildConfig,
 )
 from app.utils import json_safe
 
-VERSION = "2.5.0"
+VERSION = "2.7.0"
 logger = logging.getLogger(__name__)
 settings = get_settings()
 security = HTTPBasic()
@@ -159,11 +160,15 @@ def queue_job(payload: JobCreateRequest, _: str = Depends(require_auth)) -> dict
         "robustness_analysis": RobustnessAnalysisConfig,
         "sealed_evaluation": SealedEvaluationConfig,
         "historical_feature_backfill": HistoricalFeatureBackfillConfig,
+        "point_in_time_universe_backfill": HistoricalFeatureBackfillConfig,
         "market_state_build": MarketStateBuildConfig,
         "candidate_wave_build": CandidateWaveBuildConfig,
+        "strategy_economics_analysis": StrategyEconomicsConfig,
     }
+    if payload.job_type not in validators:
+        raise HTTPException(400, "This job type is not yet executable from the generic API")
     model = validators[payload.job_type].model_validate(payload.config)
-    if payload.job_type in {"discovery_scan", "robustness_analysis", "sealed_evaluation", "market_state_build", "candidate_wave_build"}:
+    if payload.job_type in {"discovery_scan", "robustness_analysis", "sealed_evaluation", "market_state_build", "candidate_wave_build", "strategy_economics_analysis"}:
         try:
             database_sql_preflight()
         except Exception as exc:
@@ -446,7 +451,10 @@ def candidates(discovery_run_id: str | None = None, status_filter: str | None = 
                 SELECT c.*,rr.id AS robustness_run_id,rr.verdict AS robustness_verdict,rr.summary AS robustness_summary,
                        rr.mode AS robustness_mode,rr.target_feature_set_id AS robustness_target_feature_set_id,
                        rr.completed_at AS robustness_completed_at,
-                       rl.candidate_freeze_timestamp AS research_freeze_timestamp,rl.frozen_candidate_hash AS research_frozen_hash
+                       rl.candidate_freeze_timestamp AS research_freeze_timestamp,rl.frozen_candidate_hash AS research_frozen_hash,
+                       sr.id AS strategy_run_id,sr.classification AS strategy_classification,sr.strategy_config_hash,
+                       sr.summary AS strategy_summary,sr.completed_at AS strategy_completed_at,
+                       rl.strategy_freeze_timestamp,rl.strategy_configuration_hash
                 FROM ra_candidate_rules c
                 LEFT JOIN LATERAL (
                     SELECT * FROM ra_robustness_runs r
@@ -454,10 +462,16 @@ def candidates(discovery_run_id: str | None = None, status_filter: str | None = 
                     ORDER BY r.completed_at DESC NULLS LAST,r.created_at DESC LIMIT 1
                 ) rr ON TRUE
                 LEFT JOIN LATERAL (
-                    SELECT candidate_freeze_timestamp,frozen_candidate_hash FROM ra_research_ledger l
-                    WHERE l.candidate_id=c.id AND l.candidate_freeze_timestamp IS NOT NULL
-                    ORDER BY l.candidate_freeze_timestamp DESC LIMIT 1
+                    SELECT candidate_freeze_timestamp,frozen_candidate_hash,strategy_freeze_timestamp,strategy_configuration_hash
+                    FROM ra_research_ledger l
+                    WHERE l.candidate_id=c.id
+                    ORDER BY l.created_at DESC LIMIT 1
                 ) rl ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT * FROM ra_strategy_economics_runs s
+                    WHERE s.candidate_id=c.id AND s.status='completed' AND s.mode='research'
+                    ORDER BY s.completed_at DESC NULLS LAST,s.created_at DESC LIMIT 1
+                ) sr ON TRUE
                 WHERE {where_sql}
                 ORDER BY c.rank_score DESC NULLS LAST,c.created_at DESC LIMIT %s
             """, tuple(params))
@@ -587,6 +601,59 @@ def candidate_robustness(candidate_id: str, _: str = Depends(require_auth)) -> l
     return json_safe(rows)
 
 
+@app.post("/api/candidates/{candidate_id}/strategy-economics", status_code=201)
+def queue_strategy_economics(candidate_id: str, payload: dict[str, Any], _: str = Depends(require_auth)) -> dict[str, Any]:
+    config = StrategyEconomicsConfig.model_validate({"candidate_id": parse_uuid(candidate_id), **payload})
+    if config.mode == "sealed":
+        try:
+            assert_strategy_frozen(config.candidate_id, config.strategy_config_hash)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    try:
+        database_sql_preflight()
+    except Exception as exc:
+        raise HTTPException(503, f"Analysis SQL preflight failed: {exc}") from exc
+    return json_safe(create_job("strategy_economics_analysis", f"Strategy economics · {str(config.candidate_id)[:8]} · {config.research_stage}", config.model_dump(mode="json")))
+
+
+@app.get("/api/candidates/{candidate_id}/strategy-economics")
+def candidate_strategy_economics(candidate_id: str, _: str = Depends(require_auth)) -> list[dict[str, Any]]:
+    cid = parse_uuid(candidate_id)
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ra_strategy_economics_runs WHERE candidate_id=%s ORDER BY created_at DESC", (cid,))
+            rows = cur.fetchall()
+        conn.rollback()
+    return json_safe(rows)
+
+
+@app.get("/api/strategy-economics/{strategy_run_id}")
+def strategy_economics_detail(strategy_run_id: str, _: str = Depends(require_auth)) -> dict[str, Any]:
+    rid = parse_uuid(strategy_run_id)
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ra_strategy_economics_runs WHERE id=%s", (rid,))
+            run = cur.fetchone()
+            if not run:
+                raise HTTPException(404, "Strategy economics run not found")
+            cur.execute("SELECT * FROM ra_strategy_metric_sets WHERE strategy_run_id=%s ORDER BY capital_level,metric_scope", (rid,))
+            metrics = cur.fetchall()
+            cur.execute("SELECT * FROM ra_strategy_stress_results WHERE strategy_run_id=%s ORDER BY capital_level,entry_delay_minutes,round_trip_cost_bps", (rid,))
+            stress = cur.fetchall()
+            cur.execute("SELECT * FROM ra_strategy_regime_results WHERE strategy_run_id=%s ORDER BY capital_level,regime_type,regime_value", (rid,))
+            regimes = cur.fetchall()
+        conn.rollback()
+    return json_safe({"run": run, "metric_sets": metrics, "stress_results": stress, "regime_results": regimes})
+
+
+@app.post("/api/research-ledger/candidates/{candidate_id}/freeze-strategy/{strategy_run_id}")
+def freeze_research_strategy(candidate_id: str, strategy_run_id: str, payload: CandidateFreezeRequest, _: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        return freeze_strategy(parse_uuid(candidate_id), parse_uuid(strategy_run_id), payload.notes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/discovery-coverage")
 def discovery_coverage(_: str = Depends(require_auth)) -> dict[str, Any]:
     from app.discovery import FAMILIES
@@ -637,8 +704,10 @@ def get_research_ledger(limit: int = 200, _: str = Depends(require_auth)) -> lis
                     candidate_family,candidate_id,discovery_start,discovery_end,validation_start,validation_end,
                     research_confirmation_start,research_confirmation_end,sealed_test_start,sealed_test_end,
                     number_candidates_tested,candidate_retention_status,candidate_freeze_timestamp,frozen_candidate_hash,
-                    classification,notes,failure_reason,created_at,updated_at,
-                    CASE WHEN sealed_test_result IS NULL THEN false ELSE true END AS sealed_result_recorded
+                    strategy_economics_run_id,strategy_configuration_hash,strategy_freeze_timestamp,classification,
+                    notes,failure_reason,created_at,updated_at,
+                    CASE WHEN sealed_test_result IS NULL THEN false ELSE true END AS sealed_result_recorded,
+                    CASE WHEN sealed_strategy_result IS NULL THEN false ELSE true END AS sealed_strategy_result_recorded
                 FROM ra_research_ledger ORDER BY created_at DESC LIMIT %s
                 """,
                 (min(max(limit,1),1000),),
@@ -661,9 +730,10 @@ def queue_sealed(candidate_id: str, payload: dict[str, Any], _: str = Depends(re
     config = SealedEvaluationConfig.model_validate({"candidate_id": parse_uuid(candidate_id), **payload})
     try:
         assert_candidate_frozen(config.candidate_id)
+        assert_strategy_frozen(config.candidate_id)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    return json_safe(create_job("sealed_evaluation", f"Sealed evaluation · {str(config.candidate_id)[:8]}", config.model_dump(mode="json")))
+    return json_safe(create_job("sealed_evaluation", f"Legacy signal-only sealed evaluation · {str(config.candidate_id)[:8]}", config.model_dump(mode="json")))
 
 
 @app.get("/api/dependencies")
