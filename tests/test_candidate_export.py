@@ -49,12 +49,12 @@ def fixture_data():
 
 def test_candidate_export_contains_analysis_package():
     candidates, runs, tasks, features, universes, symbols = fixture_data()
-    payload = build_candidate_export_bundle(candidates=candidates, discovery_runs=runs, discovery_tasks=tasks, feature_sets=features, universes=universes, universe_symbols=symbols, filters={"status_filter": None}, app_version="2.5.0", exported_at=datetime(2026,8,7,11,0,tzinfo=UTC))
+    payload = build_candidate_export_bundle(candidates=candidates, discovery_runs=runs, discovery_tasks=tasks, feature_sets=features, universes=universes, universe_symbols=symbols, filters={"status_filter": None}, app_version="2.7.0", exported_at=datetime(2026,8,7,11,0,tzinfo=UTC))
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         assert set(archive.namelist()) == {"manifest.json","candidates.csv","candidates.json","discovery_runs.json","discovery_tasks.csv","feature_sets.json","universes.json","universe_symbols.csv","SUMMARY.md","README.txt","ANALYSIS_PROMPT.txt","robustness_runs.json","robustness_results.json"}
         manifest=json.loads(archive.read("manifest.json"))
         assert manifest["candidate_count"] == 1
-        assert manifest["app_version"] == "2.5.0"
+        assert manifest["app_version"] == "2.7.0"
         assert manifest["export_format_version"] == "1.1"
         rows=list(csv.DictReader(io.StringIO(archive.read("candidates.csv").decode("utf-8-sig"))))
         assert rows[0]["discovery_run_name"] == "Initial interpretable rule scan"
@@ -92,9 +92,9 @@ def test_export_endpoint_is_read_only_and_versions_are_consistent():
     main=(root/'app/main.py').read_text()
     worker=(root/'app/worker.py').read_text()
     db=(root/'app/db.py').read_text()
-    assert 'VERSION = "2.5.0"' in main
-    assert 'VERSION = "2.5.0"' in worker
-    assert 'APP_VERSION = "2.5.0"' in db
+    assert 'VERSION = "2.7.0"' in main
+    assert 'VERSION = "2.7.0"' in worker
+    assert 'APP_VERSION = "2.7.0"' in db
     start=main.index('@app.get("/api/candidates/export")')
     end=main.index('@app.post("/api/candidates/{candidate_id}/actions/{action}")')
     block=main[start:end].lower()
@@ -156,5 +156,5 @@ def test_export_endpoint_returns_browser_attachment(monkeypatch):
     with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["candidate_count"] == 1
-        assert manifest["app_version"] == "2.5.0"
+        assert manifest["app_version"] == "2.7.0"
         assert manifest["export_format_version"] == "1.1"
