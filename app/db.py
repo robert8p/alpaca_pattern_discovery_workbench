@@ -304,8 +304,8 @@ def _apply_v260_point_in_time_migration(cur: Any) -> None:
     cur.execute((Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.6.0.sql").read_text(encoding="utf-8"))
 
 
-def _apply_v261_point_in_time_hotfix(cur: Any) -> None:
-    cur.execute((Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.6.1.sql").read_text(encoding="utf-8"))
+def _apply_v262_point_in_time_availability_migration(cur: Any) -> None:
+    cur.execute((Path(__file__).resolve().parent.parent / "sql" / "migrations" / "2.6.2.sql").read_text(encoding="utf-8"))
 
 
 def _apply_v270_executable_strategy_migration(cur: Any) -> None:
@@ -352,7 +352,7 @@ def execute_schema() -> None:
                     _apply_v230_robustness_migration(cur)
                     _apply_v250_full_history_migration(cur)
                     _apply_v260_point_in_time_migration(cur)
-                    _apply_v261_point_in_time_hotfix(cur)
+                    _apply_v262_point_in_time_availability_migration(cur)
                     _apply_v270_executable_strategy_migration(cur)
                 else:
                     # Fresh install: load the stable v2.3 baseline, then apply the
@@ -361,7 +361,7 @@ def execute_schema() -> None:
                     cur.execute(schema_path.read_text(encoding="utf-8"))
                     _apply_v250_full_history_migration(cur)
                     _apply_v260_point_in_time_migration(cur)
-                    _apply_v261_point_in_time_hotfix(cur)
+                    _apply_v262_point_in_time_availability_migration(cur)
                     _apply_v270_executable_strategy_migration(cur)
 
                 if not _schema_is_compatible(cur):

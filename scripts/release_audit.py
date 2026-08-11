@@ -131,7 +131,7 @@ def audit_schema() -> None:
     migration_robustness = (ROOT / "sql/migrations/2.3.0.sql").read_text(encoding="utf-8")
     migration_phase1 = (ROOT / "sql/migrations/2.5.0.sql").read_text(encoding="utf-8")
     migration_pti = (ROOT / "sql/migrations/2.6.0.sql").read_text(encoding="utf-8")
-    migration_pti_hotfix = (ROOT / "sql/migrations/2.6.1.sql").read_text(encoding="utf-8")
+    migration_pti_hotfix = (ROOT / "sql/migrations/2.6.2.sql").read_text(encoding="utf-8")
     migration_exec = (ROOT / "sql/migrations/2.7.0.sql").read_text(encoding="utf-8")
     v2_required = (
         "ra_discovery_samples", "ra_discovery_sample_chunks", "ra_discovery_task_chunks",
@@ -171,7 +171,7 @@ def audit_schema() -> None:
         if token not in migration_phase1:
             raise RuntimeError(f"Phase-1 full-history migration is missing {token}")
     db_source = (ROOT / "app/db.py").read_text(encoding="utf-8")
-    for token in ("_apply_v250_full_history_migration(cur)","_apply_v260_point_in_time_migration(cur)","_apply_v261_point_in_time_hotfix(cur)","_apply_v270_executable_strategy_migration(cur)"):
+    for token in ("_apply_v250_full_history_migration(cur)","_apply_v260_point_in_time_migration(cur)","_apply_v262_point_in_time_availability_migration(cur)","_apply_v270_executable_strategy_migration(cur)"):
         if token not in db_source: raise RuntimeError(f"Startup migration path missing {token}")
     for token in ("ra_point_in_time_universe_runs","ra_feature_chunk_universes"):
         if token not in migration_pti and token not in migration_pti_hotfix: raise RuntimeError(f"PTI migration missing {token}")
