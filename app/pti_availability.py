@@ -13,6 +13,10 @@ OUTSIDE_LIMIT_REASON = "outside maximum-symbol limit"
 def _pti_snapshot_for_child_job(job_id: str) -> dict[str, Any] | None:
     with connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.ra_point_in_time_universe_snapshots') AS table_name")
+            if not cur.fetchone()["table_name"]:
+                conn.rollback()
+                return None
             cur.execute(
                 """
                 SELECT s.id,s.snapshot_date
@@ -48,11 +52,12 @@ def _reference_trade_date(snapshot_date, config: UniverseBuildConfig):
 def apply_point_in_time_availability_filter(job_id: str, universe_run_id: str, config: UniverseBuildConfig) -> dict[str, Any] | None:
     """Refill a PTI universe using only securities that traded in the last completed market session.
 
-    Normal universe builds are untouched: if `job_id` is not linked to a PTI
-    snapshot this returns None. For PTI builds, the underlying liquidity, price,
-    fund and symbol-exclusion methodology is preserved. The only additional
-    point-in-time rule is availability: a structurally eligible symbol must have
-    a regular-session bar on the last completed SPY trading date before T.
+    Normal universe builds are untouched: if the optional PTI schema is absent,
+    or if `job_id` is not linked to a PTI snapshot, this returns None. For PTI
+    builds, the underlying liquidity, price, fund and symbol-exclusion methodology
+    is preserved. The only additional point-in-time rule is availability: a
+    structurally eligible symbol must have a regular-session bar on the last
+    completed SPY trading date before T.
     """
     snapshot = _pti_snapshot_for_child_job(job_id)
     if not snapshot:
