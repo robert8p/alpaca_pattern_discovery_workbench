@@ -7,7 +7,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.db import close_pool, connection, execute_schema
-from app.discovery import _ensure_discovery_run, run_discovery, run_sealed_evaluation
+from app.discovery_v3 import _ensure_discovery_run, run_discovery, run_sealed_evaluation
 from app.robustness_v3 import run_robustness
 from app.features import build_feature_set
 from app.full_history import (
@@ -28,7 +28,7 @@ from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
