@@ -204,6 +204,7 @@ def audit_research_integrity_ui() -> None:
     phase1_javascript = (ROOT / "app/static/phase1.js").read_text(encoding="utf-8")
     pti_source = (ROOT / "app/point_in_time_universe.py").read_text(encoding="utf-8")
     strategy_source = (ROOT / "app/strategy_economics.py").read_text(encoding="utf-8")
+    strategy_javascript = (ROOT / "app/static/strategy.js").read_text(encoding="utf-8")
     for token in (
         'value="dip_repair"', 'value="compression_expansion"', 'value="gap_state"',
         'value="activity_absorption"', 'value="price_efficiency"',
@@ -232,6 +233,11 @@ def audit_research_integrity_ui() -> None:
     for token in ("net_expected_value_pct", "maximum_drawdown_pct", "same_timestamp_outcome_icc", "strategy_config_hash", "assert_strategy_frozen"):
         if token not in strategy_source:
             raise RuntimeError(f"Whole-strategy economics engine is missing {token}")
+    if '/static/strategy.js' not in html:
+        raise RuntimeError("Whole-strategy economics browser extension is not loaded")
+    for token in ("Whole-strategy economics", "Hit rate remains a diagnostic only", "strategy-economics", "Freeze executable strategy"):
+        if token not in strategy_javascript:
+            raise RuntimeError(f"Whole-strategy economics UI is missing {token}")
 
 
 def audit_secrets() -> None:
