@@ -86,7 +86,7 @@ def _release_repaired_pti_when_quiet() -> bool:
                     attempts=GREATEST(attempts-1,0),claimed_by=NULL,heartbeat_at=now(),
                     error=NULL,completed_at=NULL,
                     result=COALESCE(result,'{}'::jsonb)||jsonb_build_object(
-                        'chunked_liquidity_fix_commit',%s,
+                        'chunked_liquidity_fix_commit',%s::text,
                         'chunked_liquidity_fix_attempt_credit_restored_at',now(),
                         'chunked_liquidity_fix_retry_policy','single automatic retry after quiet-slot release'
                     )
