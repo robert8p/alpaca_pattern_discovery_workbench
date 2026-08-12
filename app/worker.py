@@ -16,7 +16,7 @@ from app.full_history import (
     run_historical_feature_backfill, run_market_state_build, sync_candidate_ledger,
 )
 from app.history_backfill import backfill_feature_config
-from app.point_in_time_universe import ensure_point_in_time_universes
+from app.point_in_time_universe_v2 import ensure_point_in_time_universes
 from app.jobs import (
     JobInterrupted, claim_next_job, fail_job, finish_job, interrupt_job,
     make_worker_id, recover_stale_jobs, worker_heartbeat,
@@ -29,7 +29,7 @@ from app.quality import run_quality_scan
 from app.preflight import local_sql_preflight
 from app.universe import build_universe
 
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
