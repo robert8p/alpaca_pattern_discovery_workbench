@@ -33,6 +33,71 @@ VERSION = "2.7.0"
 logger = logging.getLogger(__name__)
 stop_event = asyncio.Event()
 
+PTI_CHUNKFIX_JOB_NAME = "PTI universe-only broad history 2025-05-04 to 2026-08-03"
+PTI_CHUNKFIX_COMMIT = "68f2b5ef9546f53953fe56b412ce21eb2598468c"
+
+
+def _release_repaired_pti_when_quiet() -> bool:
+    """Release exactly one infrastructure retry for the repaired broad PIT build.
+
+    The parent stays paused while unrelated >30-second work is active on the
+    Rapid database. The marker written into result makes the attempt-credit
+    restoration one-shot: a later research/implementation failure cannot loop
+    itself back into the queue automatically.
+    """
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id,status,attempts,result
+                FROM ra_jobs
+                WHERE job_type='point_in_time_universe_backfill' AND name=%s
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (PTI_CHUNKFIX_JOB_NAME,),
+            )
+            row = cur.fetchone()
+            if not row or row["status"] not in {"paused", "failed"}:
+                conn.rollback()
+                return False
+            result = dict(row.get("result") or {})
+            if result.get("chunked_liquidity_fix_attempt_credit_restored_at"):
+                conn.rollback()
+                return False
+            cur.execute(
+                """
+                SELECT count(*) AS active
+                FROM pg_stat_activity
+                WHERE datname=current_database() AND state='active'
+                  AND pid<>pg_backend_pid()
+                  AND query_start < now()-interval '30 seconds'
+                """
+            )
+            active = int(cur.fetchone()["active"] or 0)
+            if active:
+                conn.rollback()
+                return False
+            cur.execute(
+                """
+                UPDATE ra_jobs
+                SET status='queued',phase='queued_after_chunked_liquidity_fix',
+                    attempts=GREATEST(attempts-1,0),claimed_by=NULL,heartbeat_at=now(),
+                    error=NULL,completed_at=NULL,
+                    result=COALESCE(result,'{}'::jsonb)||jsonb_build_object(
+                        'chunked_liquidity_fix_commit',%s,
+                        'chunked_liquidity_fix_attempt_credit_restored_at',now(),
+                        'chunked_liquidity_fix_retry_policy','single automatic retry after quiet-slot release'
+                    )
+                WHERE id=%s
+                """,
+                (PTI_CHUNKFIX_COMMIT, row["id"]),
+            )
+        conn.commit()
+    logger.info("Released repaired broad PIT job %s into a quiet database slot", row["id"])
+    return True
+
 
 def _mark_related(job: dict[str, Any], status: str) -> None:
     with connection() as conn:
@@ -156,6 +221,8 @@ async def run_worker() -> None:
         job: dict[str, Any] | None = None
         try:
             job = claim_next_job(worker_id)
+            if not job and _release_repaired_pti_when_quiet():
+                job = claim_next_job(worker_id)
             if not job:
                 worker_heartbeat(worker_id, VERSION, "idle")
                 try:
