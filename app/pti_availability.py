@@ -76,7 +76,8 @@ def apply_point_in_time_availability_filter(job_id: str, universe_run_id: str, c
                     FROM rd_bars b
                     WHERE b.timeframe=%s AND b.feed=%s AND b.adjustment=%s
                       AND b.session_label='regular'
-                      AND (b.bar_ts AT TIME ZONE 'America/New_York')::date=%s
+                      AND b.bar_ts >= (%s::date::timestamp AT TIME ZONE 'America/New_York')
+                      AND b.bar_ts < (((%s::date + 1)::timestamp) AT TIME ZONE 'America/New_York')
                 ), base AS MATERIALIZED (
                     SELECT u.symbol,u.included AS old_included,u.rank_by_liquidity
                     FROM ra_analysis_universe u
@@ -110,7 +111,7 @@ def apply_point_in_time_availability_filter(job_id: str, universe_run_id: str, c
                 FROM changed
                 """,
                 (
-                    config.timeframe, config.feed, config.adjustment, reference_date,
+                    config.timeframe, config.feed, config.adjustment, reference_date, reference_date,
                     universe_run_id, OUTSIDE_LIMIT_REASON, max_symbols,
                     NOT_TRADING_REASON, OUTSIDE_LIMIT_REASON, universe_run_id,
                 ),
