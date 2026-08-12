@@ -108,6 +108,12 @@ def _universe_sql(config: UniverseBuildConfig, run_id: UUID | str) -> tuple[str,
 
 def build_universe(job_id: str, config: UniverseBuildConfig) -> dict[str, Any]:
     timeout = get_settings().database_statement_timeout_seconds
+    # Historical point-in-time universe snapshots aggregate a much broader
+    # all-known + inactive-known source than ordinary universe builds. Keep the
+    # standard limit everywhere else, but give these frozen PIT snapshots enough
+    # wall time to finish rather than repeatedly consuming job attempts.
+    if config.name.startswith("PTI liquid universe"):
+        timeout = max(timeout, 1800)
     set_progress(job_id, "creating universe run", 0, 4)
     with connection() as conn:
         with conn.cursor() as cur:
