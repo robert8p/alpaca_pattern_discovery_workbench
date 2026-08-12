@@ -16,7 +16,7 @@ from app.full_history import (
     run_historical_feature_backfill, run_market_state_build, sync_candidate_ledger,
 )
 from app.history_backfill import backfill_feature_config
-from app.point_in_time_universe import ensure_point_in_time_universes
+from app.point_in_time_universe_v2 import ensure_point_in_time_universes
 from app.jobs import (
     JobInterrupted, claim_next_job, fail_job, finish_job, interrupt_job,
     make_worker_id, recover_stale_jobs, worker_heartbeat,
