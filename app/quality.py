@@ -62,7 +62,7 @@ def run_quality_scan(job_id: str, config: QualityScanConfig) -> dict[str, Any]:
                   AND bar_ts >= %s AND bar_ts < %s
                 GROUP BY session_label ORDER BY session_label
                 """,
-                (config.timeframe, config.feed, config.adjustment, config.session, config.session, start, end),
+                common,
             )
             inventory = cur.fetchall()
         conn.rollback()
@@ -188,8 +188,7 @@ def run_quality_scan(job_id: str, config: QualityScanConfig) -> dict[str, Any]:
                 INSERT INTO ra_quality_reports(job_id,name,source_config,summary,session_inventory,daily_coverage,completeness_bands,anomalies)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT(job_id) DO UPDATE SET name=excluded.name,source_config=excluded.source_config,
-                    summary=excluded.summary,session_inventory=excluded.session_inventory,
-                    daily_coverage=excluded.daily_coverage,completeness_bands=excluded.completeness_bands,
+                    summary=excluded.summary,session_inventory=excluded.session_inventory,daily_coverage=excluded.daily_coverage,completeness_bands=excluded.completeness_bands,
                     anomalies=excluded.anomalies,created_at=now()
                 RETURNING id
                 """,
