@@ -1,5 +1,13 @@
 # Alpaca Pattern Discovery Workbench 2.3.0
 
+> **Retired runtime (6 September 2026).** The live web and worker services are
+> database-free retirement stubs. Immutable research artefacts, frozen candidate
+> specifications, lineage, and compact result tables were preserved in the
+> canonical investment database. Large derived feature and discovery-cache panels
+> were intentionally not duplicated because they are reproducible from canonical
+> raw evidence and the preserved recipes. This repository remains the reproducible
+> source for the retired research programme.
+
 A button-driven research companion to the Alpaca Rapid Discovery Loader. It reads the existing `rd_` market-data tables and writes only to versioned `ra_` research tables in the same Supabase database.
 
 

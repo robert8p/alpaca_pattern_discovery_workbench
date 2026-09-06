@@ -5,7 +5,7 @@ services:
     region: frankfurt
     plan: free
     buildCommand: "python --version && python -m pip install --upgrade pip && python -m pip install --only-binary=:all: -r requirements.txt"
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn app.retired_main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
@@ -18,7 +18,7 @@ services:
       - key: APP_PASSWORD
         sync: false
       - key: AUTO_MIGRATE
-        value: "true"
+        value: "false"
       - key: DATABASE_STATEMENT_TIMEOUT_SECONDS
         value: "600"
       - key: FEATURE_BATCH_WALL_TIMEOUT_SECONDS
@@ -50,7 +50,7 @@ services:
     region: frankfurt
     plan: starter
     buildCommand: "python --version && python -m pip install --upgrade pip && python -m pip install --only-binary=:all: -r requirements.txt"
-    startCommand: python -m app.worker
+    startCommand: python -m app.retired_worker
     autoDeployTrigger: commit
     envVars:
       - key: PYTHON_VERSION
@@ -58,7 +58,7 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: AUTO_MIGRATE
-        value: "true"
+        value: "false"
       - key: WORKER_POLL_SECONDS
         value: "3"
       - key: WORKER_STALE_SECONDS
